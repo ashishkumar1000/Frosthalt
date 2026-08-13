@@ -1,4 +1,4 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli), with macOS support added via [`react-native-macos`](https://microsoft.github.io/react-native-macos/).
 
 # Getting Started
 
@@ -20,7 +20,7 @@ yarn start
 
 ## Step 2: Build and run your app
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android, iOS, or macOS app:
 
 ### Android
 
@@ -58,7 +58,37 @@ npm run ios
 yarn ios
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+### macOS
+
+Like iOS, the macOS target needs its CocoaPods dependencies installed (this only needs to be run on first clone or after updating native deps). The macOS Podfile lives in the `macos/` folder, so point `pod install` at it:
+
+```sh
+bundle exec pod install --project-directory=macos
+```
+
+Then, with Metro still running from Step 1, build and launch the macOS app:
+
+```sh
+npx react-native run-macos
+```
+
+The first run may take a while since it involves building the entire project and all dependencies.
+
+Alternatively, you can open the workspace directly in Xcode and run it from there:
+
+```sh
+xed -b macos
+```
+
+Or build without launching:
+
+```sh
+npx react-native build-macos
+```
+
+> **Note**: Be sure to keep the `react-native` and `react-native-macos` versions on the same minor version to avoid compatibility issues. For more details, see the [react-native-macos Getting Started guide](https://microsoft.github.io/react-native-macos/docs/getting-started).
+
+If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, macOS app window, or your connected device.
 
 This is one way to run your app — you can also build it directly from Android Studio or Xcode.
 
@@ -72,6 +102,7 @@ When you want to forcefully reload, for example to reset the state of your app, 
 
 - **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
 - **iOS**: Press <kbd>R</kbd> in iOS Simulator.
+- **macOS**: Select **"Reload"** from the **Dev Menu**, accessed via <kbd>Cmd ⌘</kbd> + <kbd>D</kbd> in the app window.
 
 ## Congratulations! :tada:
 
@@ -95,3 +126,5 @@ To learn more about React Native, take a look at the following resources:
 - [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
 - [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
 - [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+- [react-native-macos Getting Started](https://microsoft.github.io/react-native-macos/docs/getting-started) - setup and running instructions for the macOS target.
+- [`microsoft/react-native-macos`](https://github.com/microsoft/react-native-macos) - the Open Source; GitHub **repository** for React Native macOS.
