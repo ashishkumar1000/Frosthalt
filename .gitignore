@@ -5,3 +5,67 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Xcode
+ios/build/
+macos/build/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.xccheckout
+*.moved-aside
+DerivedData
+*.hmap
+*.ipa
+*.xcuserstate
+project.xcworkspace
+ios/.xcode.env.local
+macos/.xcode.env.local
+
+# CocoaPods
+ios/Pods/
+macos/Pods/
+
+# Android / IntelliJ
+android/build/
+android/app/build/
+android/.gradle/
+android/local.properties
+*.iml
+*.hprof
+*.cxx/
+*.keystore
+!android/app/debug.keystore
+
+# node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# pnpm
+.pnpm-store/
+
+# Ruby / Bundler (CocoaPods dependency)
+vendor/bundle/
+.bundle/
+
+# fastlane
+**/fastlane/report.xml
+**/fastlane/Preview.html
+**/fastlane/screenshots
+**/fastlane/test_output
+
+# Bundle artifact
+*.jsbundle
+
+# Metro
+.metro-health-check*
+
+# Testing
+/coverage
