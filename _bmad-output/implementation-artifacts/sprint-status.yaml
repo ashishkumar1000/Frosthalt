@@ -1,0 +1,88 @@
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created, ready for development
+#   - in-progress: Developer actively working on implementation
+#   - review: Implementation complete, ready for review
+#   - done: Story completed
+
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when its first story starts (via build's sprint sync)
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates the next story after the previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; the status view surfaces open ones
+generated: 08-14-2026 00:19
+last_updated: 08-14-2026 20:01
+project: Frosthalt
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+development_status:
+  epic-1: in-progress
+  1-1-scaffold-the-react-native-macos-app-with-new-architecture-an: done
+  1-2-design-token-system-and-shared-visual-primitives: review
+  1-3-sidebar-navigation-and-status-header-shell: backlog
+  1-4-configstore-turbomodule-and-config-shape: backlog
+  1-5-shellrunner-turbomodule-and-hosts-file-contract: backlog
+  1-6-staged-then-apply-serialized-pipeline-proven-on-one-domain: backlog
+  1-7-drift-detection-and-user-initiated-restore-section: backlog
+  epic-1-retrospective: optional
+
+  epic-2: backlog
+  2-1-blocklist-surface-with-always-on-checkbox: backlog
+  2-2-add-domain-field-with-live-normalisation: backlog
+  2-3-effective-blocklist-computation-and-apply-integration: backlog
+  2-4-remove-domain-confirm-alert: backlog
+  2-5-domain-count-in-the-status-header: backlog
+  2-6-read-only-hosts-viewer-with-drift-warning: backlog
+  epic-2-retrospective: optional
+
+  epic-3: backlog
+  3-1-set-password-salt-free-sha-256: backlog
+  3-2-password-gate-sheet-reusable: backlog
+  3-3-danger-zone-section-and-change-password: backlog
+  3-4-panic-unblock-password-gated: backlog
+  epic-3-retrospective: optional
+
+  epic-4: backlog
+  4-1-timer-surface-with-duration-presets-and-domain-selection: backlog
+  4-2-start-focus-session-block-persist-epoch-end-time: backlog
+  4-3-live-countdown-hybrid-ring-scoped-slice: backlog
+  4-4-countdown-in-the-status-header: backlog
+  4-5-auto-unblock-on-expiry-unless-also-always-on: backlog
+  4-6-end-early-password-gated: backlog
+  4-7-closed-mid-session-persistence-and-re-arm-on-launch: backlog
+  epic-4-retrospective: optional
+
+  epic-5: backlog
+  5-1-schedule-surface-with-enable-toggle-and-summary: backlog
+  5-2-schedule-editor-sheet: backlog
+  5-3-active-window-blocking-schedule-in-effective-blocklist: backlog
+  5-4-live-schedule-transitions-while-app-running: backlog
+  5-5-schedule-enable-disable-and-removal-confirm-alert-not-passwo: backlog
+  epic-5-retrospective: optional
+
+  epic-6: backlog
+  6-1-menubar-turbomodule-nsstatusitem-nsmenu: backlog
+  6-2-menu-bar-badge-mirror-and-countdown: backlog
+  6-3-menu-bar-quick-start-show-window-and-quit-actions: backlog
+  6-4-window-size-position-persistence-and-restoration: backlog
+  6-5-quit-with-confirm-and-close-to-menu-bar-keyboard-bindings: backlog
+  epic-6-retrospective: optional
