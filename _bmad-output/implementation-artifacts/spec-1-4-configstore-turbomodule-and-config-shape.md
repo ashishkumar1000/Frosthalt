@@ -82,7 +82,7 @@ context:
 - [x] `__tests__/configStore.test.ts` -- `jest.mock` the spec + test every I/O Matrix row -- AC 3 resilience + round-trip, Jest-verifiable without a native runtime.
 - [x] `macos/Frosthalt-macOS/ConfigStore.swift` -- Swift adapter: path resolution, atomic write (temp + rename), missing-dir create, `{ok, error?, data?}` returns -- AC 1/3 native logic.
 - [x] `macos/Frosthalt-macOS/NativeConfigStore.mm` -- Obj-C++ TurboModule: `RCT_EXPORT_MODULE(NativeConfigStore)` (Obj-C++ class named `NativeConfigStoreModule` to avoid colliding with the Swift `@objc(NativeConfigStore)` class at the Obj-C runtime; JS-visible module name stays `NativeConfigStore`), conform to the codegen spec protocol (`NativeConfigStoreSpecSpec`), delegate to Swift via `Frosthalt-Swift.h` -- AC 1/4, AD-2.
-- [ ] `macos/Frosthalt.xcodeproj/project.pbxproj` -- add the new `.mm`/`.swift` to the macOS target in Xcode (the actual project file is `Frosthalt.xcodeproj`, not `Frosthalt-macOS.xcodeproj`; Xcode auto-creates the bridging header when the first `.swift` is added) -- **manual Xcode step, outside the node sandbox**; required for the native files to compile and link into the app.
+- [x] `macos/Frosthalt.xcodeproj/project.pbxproj` -- add the new `.mm`/`.swift` to the macOS target in Xcode (the actual project file is `Frosthalt.xcodeproj`, not `Frosthalt-macOS.xcodeproj`; Xcode auto-creates the bridging header when the first `.swift` is added) -- **manual Xcode step, outside the node sandbox**; required for the native files to compile and link into the app. Done: the `.mm`/`.swift`/bridging headers were added to the macOS target and a clean `pod install && pnpm macos` builds + links.
 
 **Acceptance Criteria:**
 - Given a clean checkout, when `cd macos && pod install` then `pnpm macos` run, then the app builds — codegen generates the `NativeConfigStore` spec header and the Swift/Obj-C++ compile and link.
@@ -92,6 +92,8 @@ context:
 
 ## Spec Change Log
 
+- 2026-08-16 — Native round-trip verified on-device; documented the two required native hooks (`getModuleProvider:` in AppDelegate for registration, `getTurboModule:` in the module class for JSI binding) under Design Notes; marked the manual Xcode step done.
+
 ## Design Notes
 
 - **Why native is a dumb string adapter and TS owns shape + resilience:** keeps the native module isolated (AD-11 — it imports nothing and knows no domain shape); the TS port owns `JSON.parse`/`stringify` and the missing/corrupt→empty rule (AC 3), which is exactly what makes the story Jest-testable by mocking the spec. The Zustand config mirror + Apply orchestration that *calls* this port is Story 1.6.
@@ -100,6 +102,10 @@ context:
 - **`codegenConfig` in `package.json`** (not a `react-native.config.js`) is the documented app-level codegen path (RN docs); one less config file.
 - **`menuBarEnabled` defaults to `false`** — the menu-bar status item is wired in Epic 6; off until then. Minor, revisit in Epic 6.
 - **Native build verification can't run in the node sandbox** (pod install + `pnpm macos` need the macOS toolchain + network). The sandbox-runnable bar is the JS layer (`tsc` + `jest` with the mock); the native compile is a manual check.
+- **Two native hooks an app TurboModule needs on react-native-macos 0.81 (bridgeless):** codegen from `codegenConfig` only generates the spec headers + the `*SpecJSI` C++ wrapper — it does NOT register the app's own module with the `RCTTurboModuleManager`, and there is no `RCT_EXPORT_MODULE` bridge fallback. Two hooks close the gap, both verified during the 1.4 round-trip:
+  1. **`getModuleProvider:` in `AppDelegate`** (registration). On the bridgeless RN 0.81 path the manager resolves a name via `RCTInstance` → `RCTReactNativeFactory` → the `RCTAppDelegate` delegate's `getModuleProvider:`. Autolinking's generated `RCTModuleProviders` map lists only real dependencies, so an app module is invisible there → `TurboModuleRegistry.getEnforcing(<name>)` throws "could not be found ... registered in the native binary". The fix is a `getModuleProvider:` override that returns a fresh instance of the module class for its name (`AppDelegate.mm` resolves the class at runtime via `NSClassFromString` because the `.mm`'s class interface is private — no public header to import). Add a branch per module name; this is the template for ShellRunner (1.5) and MenuBar (Epic 6).
+  2. **`getTurboModule:` in the hand-written module class** (JSI method binding). The codegen `*SpecBase` class only implements `setEventEmitterCallback:` — it does NOT supply `getTurboModule:`. The manager's `provideTurboModule:` asks `respondsToSelector:@selector(getTurboModule:)` and, without it, never constructs the `*SpecJSI` wrapper whose constructor populates `methodMap_` with the `readConfig`/`writeConfig` host functions. Symptom: `getEnforcing` finds the module object but its methods are `undefined` ("X is not a function"). The fix is the standard codegen TurboModule pattern — the hand-written impl implements `getTurboModule:` returning `std::make_shared<…SpecJSI>(params)`. Every hand-written TurboModule impl must do this.
+- **Round-trip verified on-device:** with both hooks in place, a clean-machine `readConfig()` returns `DEFAULT_CONFIG`, `writeConfig(DEFAULT_CONFIG)` writes `~/Library/Application Support/Frosthalt/config.json` (84 bytes), and a follow-up `readConfig()` round-trips (the app is not sandboxed, so writes hit the real Application Support dir). Relaunch note: `open`/`react-native run-macos` only *focuses* an already-running app — `pkill -f "Frosthalt.app/Contents/MacOS/Frosthalt"` before `pnpm macos` so the freshly-built binary actually starts.
 
 ## Verification
 

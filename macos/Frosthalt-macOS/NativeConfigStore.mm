@@ -34,6 +34,8 @@
 // @objc(NativeConfigStore) class declared in ConfigStore.swift.
 #import "Frosthalt-Swift.h"
 
+#include <memory> // std::make_shared / std::shared_ptr for getTurboModule:
+
 @interface NativeConfigStoreModule : NativeConfigStoreSpecSpecBase <NativeConfigStoreSpecSpec>
 @end
 
@@ -42,6 +44,20 @@
 // Registers this class under the JS module name `NativeConfigStore`, matching
 // `TurboModuleRegistry.getEnforcing<Spec>('NativeConfigStore')` on the JS side.
 RCT_EXPORT_MODULE(NativeConfigStore)
+
+// Returns the codegen-generated C++ JSI wrapper for this spec. The TurboModule
+// manager calls this (via `respondsToSelector:@selector(getTurboModule:)`) when
+// JS requires the module; the wrapper's constructor populates its `methodMap_`
+// with `readConfig`/`writeConfig` host functions (see
+// FrosthaltSpecs-generated.mm), which is what binds those names to callable JS
+// functions. WITHOUT this, `getEnforcing` finds the module object but its
+// methods are `undefined` ("X is not a function"). The codegen `*SpecBase`
+// class does NOT supply this — every hand-written TurboModule impl must.
+- (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
+    (const facebook::react::ObjCTurboModule::InitParams &)params
+{
+  return std::make_shared<facebook::react::NativeConfigStoreSpecSpecJSI>(params);
+}
 
 // Lazily-instantiated Swift business-logic adapter. We don't hold state across
 // calls beyond this one instance; ConfigStore is stateless file I/O.
