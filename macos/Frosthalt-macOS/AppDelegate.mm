@@ -78,6 +78,12 @@
   if (strcmp(name, "NativeConfigStore") == 0) {
     Class cls = NSClassFromString(@"NativeConfigStoreModule");
     return cls ? (id<RCTModuleProvider>)[cls new] : nil;
+  } else if (strcmp(name, "NativeShellRunner") == 0) {
+    // Story 1.5 — the privileged ShellRunner TurboModule. Without this branch
+    // `TurboModuleRegistry.getEnforcing('NativeShellRunner')` throws at JS
+    // import time (verified on 1.4). Same pattern as NativeConfigStore above.
+    Class cls = NSClassFromString(@"NativeShellRunnerModule");
+    return cls ? (id<RCTModuleProvider>)[cls new] : nil;
   }
   return nil;
 }

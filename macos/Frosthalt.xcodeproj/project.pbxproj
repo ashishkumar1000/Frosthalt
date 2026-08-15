@@ -16,6 +16,8 @@
 		8B3B118C9B505700B2D9FA70 /* libPods-Frosthalt-macOS.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 38EC9FF90028887F31EDD36F /* libPods-Frosthalt-macOS.a */; };
 		FF97D5F13030E92B002B4D9A /* ConfigStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF97D5EF3030E92B002B4D9A /* ConfigStore.swift */; };
 		FF97D5F23030E92B002B4D9A /* NativeConfigStore.mm in Sources */ = {isa = PBXBuildFile; fileRef = FF97D5F03030E92B002B4D9A /* NativeConfigStore.mm */; };
+		FFAA000300000000000000A3 /* ShellRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAA000100000000000000A1 /* ShellRunner.swift */; };
+		FFAA000400000000000000A4 /* NativeShellRunner.mm in Sources */ = {isa = PBXBuildFile; fileRef = FFAA000200000000000000A2 /* NativeShellRunner.mm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -37,6 +39,8 @@
 		FF97D5EE3030E8B9002B4D9A /* Frosthalt-macOS-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Frosthalt-macOS-Bridging-Header.h"; sourceTree = "<group>"; };
 		FF97D5EF3030E92B002B4D9A /* ConfigStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigStore.swift; sourceTree = "<group>"; };
 		FF97D5F03030E92B002B4D9A /* NativeConfigStore.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NativeConfigStore.mm; sourceTree = "<group>"; };
+		FFAA000100000000000000A1 /* ShellRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellRunner.swift; sourceTree = "<group>"; };
+		FFAA000200000000000000A2 /* NativeShellRunner.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NativeShellRunner.mm; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -72,6 +76,8 @@
 			children = (
 				FF97D5EF3030E92B002B4D9A /* ConfigStore.swift */,
 				FF97D5F03030E92B002B4D9A /* NativeConfigStore.mm */,
+				FFAA000100000000000000A1 /* ShellRunner.swift */,
+				FFAA000200000000000000A2 /* NativeShellRunner.mm */,
 				5142014B2437B4B30078DB4F /* AppDelegate.h */,
 				5142014C2437B4B30078DB4F /* AppDelegate.mm */,
 				514201512437B4B40078DB4F /* Assets.xcassets */,
@@ -341,6 +347,8 @@
 				514201582437B4B40078DB4F /* main.m in Sources */,
 				FF97D5F13030E92B002B4D9A /* ConfigStore.swift in Sources */,
 				FF97D5F23030E92B002B4D9A /* NativeConfigStore.mm in Sources */,
+				FFAA000300000000000000A3 /* ShellRunner.swift in Sources */,
+				FFAA000400000000000000A4 /* NativeShellRunner.mm in Sources */,
 				5142014D2437B4B30078DB4F /* AppDelegate.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

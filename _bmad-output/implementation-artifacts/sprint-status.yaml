@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-14-2026 00:19
-last_updated: 08-15-2026 00:00
+last_updated: 08-16-2026 00:00
 project: Frosthalt
 project_key: NOKEY
 tracking_system: file-system
@@ -39,8 +39,8 @@ development_status:
   1-1-scaffold-the-react-native-macos-app-with-new-architecture-an: done
   1-2-design-token-system-and-shared-visual-primitives: review
   1-3-sidebar-navigation-and-status-header-shell: review
-  1-4-configstore-turbomodule-and-config-shape: review
-  1-5-shellrunner-turbomodule-and-hosts-file-contract: backlog
+  1-4-configstore-turbomodule-and-config-shape: done
+  1-5-shellrunner-turbomodule-and-hosts-file-contract: done
   1-6-staged-then-apply-serialized-pipeline-proven-on-one-domain: backlog
   1-7-drift-detection-and-user-initiated-restore-section: backlog
   epic-1-retrospective: optional
