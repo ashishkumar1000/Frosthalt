@@ -8,7 +8,13 @@
     "lint": "eslint .",
     "macos": "react-native run-macos",
     "start": "react-native start",
-    "test": "jest"
+    "test": "jest",
+    "typecheck": "tsc --noEmit"
+  },
+  "codegenConfig": {
+    "name": "FrosthaltSpecs",
+    "type": "modules",
+    "jsSrcsDir": "src/native/specs"
   },
   "dependencies": {
     "@react-native/new-app-screen": "0.81.2",
