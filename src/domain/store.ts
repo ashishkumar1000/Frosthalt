@@ -21,16 +21,29 @@
  * Actions:
  *   - `stageDomainAdd(raw)` — normalise + add a domain (alwaysOn true) to the
  *     staged draft; returns `{ ok: false, error: "invalid-domain" }` without
- *     staging on non-hostname input (no Apply, no prompt).
+ *     staging on non-hostname input (no Apply, no prompt). Clean-revert (Story
+ *     2.4): if the resulting draft equals `committed.domains` (order-agnostic)
+ *     `staged` is cleared to `null` — the deferred-equality fix for the
+ *     remove+re-add net-zero path (see `stageDomainRemove`).
  *   - `stageAlwaysOnToggle(hostname)` — flip `alwaysOn` for the matching domain
  *     in the staged draft (built on `staged ?? committed.domains`). Produces a
  *     NEW `staged` array reference (spread) so the apply-queue's mid-run-edit
  *     detection still works. Clean-revert: if the resulting draft equals
- *     `committed.domains` (same hostnames + alwaysOn, order) `staged` is cleared
- *     to `null` so a net-no-op toggle fires no redundant admin prompt — mirroring
+ *     `committed.domains` (order-agnostic) `staged` is cleared to `null` so a
+ *     net-no-op toggle fires no redundant admin prompt — mirroring
  *     `stageDomainAdd`'s no-redundant-Apply principle. Returns
  *     `{ ok: false, error: "not-found" }` without staging when `hostname` is not
  *     in the draft.
+ *   - `stageDomainRemove(hostname)` — remove the domain with the given hostname
+ *     from the staged draft (built on `staged ?? committed.domains`). Produces a
+ *     NEW `staged` array reference (filter) so the apply-queue's mid-run-edit
+ *     detection still works. Clean-revert (order-agnostic) when the resulting
+ *     draft equals `committed.domains`. Takes the STORED apex
+ *     (`domain.hostname`, already normalised) and compares raw — does NOT
+ *     re-normalise, matching `stageAlwaysOnToggle`'s convention. Returns
+ *     `{ ok: false, error: "not-found" }` without staging when `hostname` is not
+ *     in the draft (defensive — the UI only triggers remove from a rendered
+ *     row). Removal is STAGED (Apply commits, not password-gated).
  *   - `cancelStaged()` — discard staged back to last-committed.
  *   - `apply()` — enqueue a serialized Apply run; returns its envelope.
  *
@@ -77,6 +90,22 @@ export interface DomainState {
    * hostname is not in the draft.
    */
   stageAlwaysOnToggle: (hostname: string) => WriteResult;
+  /**
+   * Remove the domain with the given hostname from the staged draft (built on
+   * `staged ?? committed.domains`). Always produces a NEW staged array
+   * reference when it mutates (filter), so the apply-queue's mid-run-edit
+   * detection (`s.staged === stagedSnapshot`) still works. Clean-revert: if the
+   * resulting draft equals `committed.domains` (order-agnostic) `staged` is
+   * cleared to `null` so a net-no-op remove (e.g. removing the only staged
+   * addition) fires no redundant admin prompt. Returns
+   * `{ ok: false, error: "not-found" }` without staging when the hostname is not
+   * in the draft.
+   *
+   * NOTE: takes the STORED apex (`domain.hostname`, already normalised) and
+   * compares raw — it does NOT re-normalise, matching `stageAlwaysOnToggle`'s
+   * convention (store.ts:128). Re-normalising would be dead code.
+   */
+  stageDomainRemove: (hostname: string) => WriteResult;
   cancelStaged: () => void;
   apply: () => Promise<WriteResult>;
   /**
@@ -116,7 +145,22 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
       // Apply would fire an admin prompt to write an identical config.
       return { ok: true };
     }
-    set({ staged: [...base, { hostname: apex, alwaysOn: true }] });
+    const next = [...base, { hostname: apex, alwaysOn: true }];
+    // Clean-revert (Story 2.4 — the deferred-equality fix): if the resulting
+    // draft equals `committed.domains` (order-agnostic), clear `staged` to
+    // `null`. This is the fix for the latent equality gap that `stageDomainRemove`
+    // makes reachable: remove a domain then re-add it -> a reordered
+    // value-equal draft that, without this check, is retained while
+    // `stagedChangeCount` reports 0 -> "0 changes staged" + a pulsing Apply on
+    // a net-zero draft. The shared order-agnostic `draftEqualsCommitted`
+    // clears it, restoring `staged != null ⟹ stagedChangeCount >= 1`.
+    // No 2.2 behaviour shifts: this only fires on the remove+re-add net-zero
+    // (unreachable in 2.2 — a clean duplicate add is a true no-op above).
+    if (draftEqualsCommitted(next, get().committed.domains)) {
+      set({ staged: null });
+      return { ok: true };
+    }
+    set({ staged: next });
     return { ok: true };
   },
 
@@ -143,6 +187,37 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     // `stageDomainAdd`'s no-redundant-Apply principle — a net-no-op toggle
     // (e.g. toggle a domain off then on) must NOT leave a dirty draft that
     // would force an admin prompt to write an identical `/etc/hosts`.
+    if (draftEqualsCommitted(next, get().committed.domains)) {
+      set({ staged: null });
+      return { ok: true };
+    }
+    set({ staged: next });
+    return { ok: true };
+  },
+
+  stageDomainRemove: (hostname) => {
+    // Build on the current draft (or committed, if clean). Removal is
+    // optimistic: the row vanishes immediately (the UI filters it out of the
+    // rendered `staged ?? committed.domains`); Apply commits; Cancel reverts.
+    // Same staged-then-Apply model as add/toggle. NOT password-gated (Epic 3).
+    const base = get().staged ?? get().committed.domains;
+    const idx = base.findIndex((d) => d.hostname === hostname);
+    if (idx === -1) {
+      // Unknown hostname (not in the draft). No staging, no Apply, no prompt.
+      // Defensive — the UI only triggers remove from a rendered row, so this
+      // is unreachable in practice.
+      return { ok: false, error: 'not-found' };
+    }
+    // Produce a NEW array reference (filter) so the apply-queue's mid-run-edit
+    // detection (`s.staged === stagedSnapshot`) still works: a remove that
+    // lands while an Apply is in flight is always a different reference from
+    // the snapshot the running Apply captured.
+    const next = base.filter((d, i) => i !== idx);
+    // Clean-revert: if the resulting draft equals committed.domains (order-
+    // agnostic), clear `staged` to `null`. This mirrors the toggle/add
+    // no-redundant-Apply principle — e.g. removing the ONLY staged addition
+    // nets back to committed, so no admin prompt should fire on the next
+    // Apply for an identical config.
     if (draftEqualsCommitted(next, get().committed.domains)) {
       set({ staged: null });
       return { ok: true };
@@ -272,18 +347,39 @@ function enqueue(run: () => Promise<WriteResult>): Promise<WriteResult> {
 }
 
 /**
- * Structural equality of two `Domain[]` drafts by `(hostname, alwaysOn)` in
- * order. Used by `stageAlwaysOnToggle`'s clean-revert: when the post-toggle
- * draft matches `committed.domains`, `staged` is cleared to `null` so a
- * net-no-op toggle fires no redundant admin prompt. Reference identity is NOT
- * checked — a freshly-spread draft that is value-equal to committed is the
- * whole point (the toggle produced a new ref but the same value).
+ * Structural equality of two `Domain[]` drafts by `(hostname, alwaysOn)`,
+ * ORDER-AGNOSTIC (hostname-set equality). Used by the staging actions'
+ * clean-revert (`stageAlwaysOnToggle` / `stageDomainRemove` / `stageDomainAdd`):
+ * when the post-edit draft matches `committed.domains`, `staged` is cleared to
+ * `null` so a net-no-op edit fires no redundant admin prompt. Reference
+ * identity is NOT checked — a freshly-spread draft that is value-equal to
+ * committed is the whole point (the edit produced a new ref but the same
+ * value).
+ *
+ * Order-agnostic since Story 2.4: `hostname` is the PK (unique, deduped at
+ * add), so length-equal + per-hostname `(hostname, alwaysOn)` match implies
+ * set equality. This aligns with the already-order-agnostic
+ * `stagedChangeCount` sibling and preserves
+ * `staged != null ⟹ stagedChangeCount >= 1` once `stageDomainRemove` makes
+ * reordered value-equal drafts reachable (remove a middle domain, then re-add
+ * it -> a reordered net-zero draft). Does NOT call `normaliseDomain` — raw
+ * apex compare, matching `stageAlwaysOnToggle`/`stageDomainRemove`'s
+ * convention. No existing test relies on order-sensitivity (the clean-revert
+ * tests use same-order value-equal drafts).
  */
 function draftEqualsCommitted(a: Domain[], b: Domain[]): boolean {
   if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i].hostname !== b[i].hostname) return false;
-    if (a[i].alwaysOn !== b[i].alwaysOn) return false;
+  // Index `b` by hostname so each `a` entry can be matched in O(1), regardless
+  // of order. Hostname is the PK (unique), so a per-hostname match is set
+  // equality once lengths are equal.
+  const bByHost = new Map<string, boolean>();
+  for (const d of b) {
+    bByHost.set(d.hostname, d.alwaysOn);
+  }
+  for (const d of a) {
+    const match = bByHost.get(d.hostname);
+    if (match === undefined) return false;
+    if (match !== d.alwaysOn) return false;
   }
   return true;
 }

@@ -49,7 +49,7 @@ development_status:
   2-1-blocklist-surface-with-always-on-checkbox: done
   2-2-add-domain-field-with-live-normalisation: review
   2-3-effective-blocklist-computation-and-apply-integration: review
-  2-4-remove-domain-confirm-alert: backlog
+  2-4-remove-domain-confirm-alert: review
   2-5-domain-count-in-the-status-header: backlog
   2-6-read-only-hosts-viewer-with-drift-warning: backlog
   epic-2-retrospective: optional

@@ -35,6 +35,7 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 }));
 
 import { useDomainStore } from '../src/domain/store';
+import { stagedChangeCount } from '../src/domain/stagedChangeCount';
 import { DEFAULT_CONFIG } from '../src/config/types';
 import type { WriteResult } from '../src/hosts/shellRunner';
 
@@ -411,6 +412,244 @@ test('stageAlwaysOnToggle on an already-committed clean state: toggling is a rea
   expect(useDomainStore.getState().staged).toStrictEqual([
     { hostname: 'example.com', alwaysOn: false },
   ]);
+});
+
+// ===========================================================================
+// Story 2.4 — stageDomainRemove (staged removal + clean-revert) and the
+// deferred-equality fix (order-agnostic draftEqualsCommitted + stageDomainAdd
+// clean-revert). Mirrors the stageAlwaysOnToggle tests above.
+// ===========================================================================
+
+test('stageDomainRemove removes a committed domain and stages a new draft (count 1 via stagedChangeCount)', () => {
+  // committed has two domains; removing one stages a draft missing it.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'example.com', alwaysOn: true },
+        { hostname: 'social.com', alwaysOn: false },
+      ],
+    },
+    staged: null,
+  });
+
+  const result = useDomainStore.getState().stageDomainRemove('example.com');
+
+  expect(result).toStrictEqual({ ok: true });
+  // The staged draft no longer contains example.com; committed is untouched.
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'social.com', alwaysOn: false },
+  ]);
+  expect(useDomainStore.getState().committed.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+    { hostname: 'social.com', alwaysOn: false },
+  ]);
+  // The story's central invariant — `staged != null ⟹ stagedChangeCount >= 1`
+  // — directly verified (the spec's Code Map requires "count 1 via
+  // stagedChangeCount"). One removed domain -> 1 change.
+  expect(
+    stagedChangeCount(
+      useDomainStore.getState().staged!,
+      useDomainStore.getState().committed.domains,
+    ),
+  ).toBe(1);
+});
+
+test('stageDomainRemove removes from a multi-edit staged draft', () => {
+  // committed has one domain; a staged draft adds a second + toggles the first.
+  // Removing the staged addition must build on the draft, not committed.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    staged: [
+      { hostname: 'example.com', alwaysOn: false }, // toggled
+      { hostname: 'social.com', alwaysOn: true }, // added
+    ],
+  });
+
+  const result = useDomainStore.getState().stageDomainRemove('social.com');
+
+  expect(result).toStrictEqual({ ok: true });
+  // The draft now reflects the toggle only; the added row is gone.
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: false },
+  ]);
+  // The count reflects the remaining change (the toggle): committed=
+  // [example:true], staged=[example:false] -> 1 toggled. Pinned via
+  // stagedChangeCount per the spec's Code Map (not just inferred from staged).
+  expect(
+    stagedChangeCount(
+      useDomainStore.getState().staged!,
+      useDomainStore.getState().committed.domains,
+    ),
+  ).toBe(1);
+});
+
+test('stageDomainRemove clean-revert: removing the only staged addition reverts staged to null', () => {
+  // committed is empty; staged adds one domain. Removing that added domain
+  // nets back to committed -> staged clean-reverts to null (no redundant Apply).
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, domains: [] },
+    staged: [{ hostname: 'newsite.com', alwaysOn: true }],
+  });
+
+  const result = useDomainStore.getState().stageDomainRemove('newsite.com');
+
+  expect(result).toStrictEqual({ ok: true });
+  // Net = committed (empty) -> staged reverts to null.
+  expect(useDomainStore.getState().staged).toBeNull();
+});
+
+test('stageDomainRemove produces a NEW staged array reference on each remove', () => {
+  // The apply-queue's retain-newer-draft invariant relies on a newer draft
+  // being a DIFFERENT array reference from the snapshot a running Apply
+  // captured. Removing must filter (new ref), not mutate in place. committed
+  // has three domains so successive removes keep the draft non-null (no
+  // clean-revert) and we can compare two distinct staged references.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'a.com', alwaysOn: true },
+        { hostname: 'b.com', alwaysOn: true },
+        { hostname: 'c.com', alwaysOn: true },
+      ],
+    },
+    staged: null,
+  });
+
+  useDomainStore.getState().stageDomainRemove('a.com');
+  const ref1 = useDomainStore.getState().staged;
+  expect(ref1).not.toBeNull();
+
+  useDomainStore.getState().stageDomainRemove('b.com');
+  const ref2 = useDomainStore.getState().staged;
+  // NEW array reference, not in-place mutation.
+  expect(ref2).not.toBe(ref1);
+  expect(ref2).toStrictEqual([{ hostname: 'c.com', alwaysOn: true }]);
+});
+
+test('stageDomainRemove on an unknown hostname returns not-found and leaves staged unchanged', () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    staged: null,
+  });
+
+  const before = useDomainStore.getState().staged;
+  const result = useDomainStore.getState().stageDomainRemove('ghost.com');
+
+  expect(result).toStrictEqual({ ok: false, error: 'not-found' });
+  expect(useDomainStore.getState().staged).toBe(before);
+  expect(useDomainStore.getState().staged).toBeNull();
+});
+
+test('stageDomainRemove on an unknown hostname with a staged draft leaves the draft unchanged', () => {
+  const draft = [{ hostname: 'example.com', alwaysOn: false }];
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    staged: draft,
+  });
+
+  const result = useDomainStore.getState().stageDomainRemove('ghost.com');
+
+  expect(result).toStrictEqual({ ok: false, error: 'not-found' });
+  // The staged draft reference is unchanged (no new array, no mutation).
+  expect(useDomainStore.getState().staged).toBe(draft);
+});
+
+// ---------------------------------------------------------------------------
+// The deferred-equality fix (Story 2.4): stageDomainAdd clean-revert +
+// order-agnostic draftEqualsCommitted. Remove makes remove+re-add reachable,
+// producing a reordered value-equal draft. Without the fix, stageDomainAdd
+// retains it while stagedChangeCount reports 0 -> "0 changes staged" + a
+// pulsing Apply on a net-zero draft. The shared order-agnostic
+// draftEqualsCommitted clears staged to null.
+// ---------------------------------------------------------------------------
+
+test('stageDomainAdd clean-revert: remove + re-add (reorder net-zero) reverts staged to null', () => {
+  // committed [a,b,c]; remove b -> staged [a,c] (1 change); re-add b ->
+  // stageDomainAdd appends b -> [a,c,b], which value-equals committed as a SET
+  // -> order-agnostic draftEqualsCommitted -> staged clean-reverts to null.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'a.com', alwaysOn: true },
+        { hostname: 'b.com', alwaysOn: true },
+        { hostname: 'c.com', alwaysOn: true },
+      ],
+    },
+    staged: null,
+  });
+
+  const r1 = useDomainStore.getState().stageDomainRemove('b.com');
+  expect(r1).toStrictEqual({ ok: true });
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'a.com', alwaysOn: true },
+    { hostname: 'c.com', alwaysOn: true },
+  ]);
+
+  // Re-add b. The append produces [a,c,b] — a reordered value-equal draft.
+  // The order-agnostic clean-revert must clear staged to null.
+  const r2 = useDomainStore.getState().stageDomainAdd('b.com');
+  expect(r2).toStrictEqual({ ok: true });
+  expect(useDomainStore.getState().staged).toBeNull();
+});
+
+test('stageDomainAdd clean-revert does NOT fire when the re-add leaves a real change', () => {
+  // committed [a,b]; remove a -> staged [b] (1 change); re-add c (a NEW domain)
+  // -> [b,c], which does NOT equal committed [a,b] as a set -> stays staged.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'a.com', alwaysOn: true },
+        { hostname: 'b.com', alwaysOn: true },
+      ],
+    },
+    staged: null,
+  });
+
+  useDomainStore.getState().stageDomainRemove('a.com');
+  useDomainStore.getState().stageDomainAdd('c.com');
+
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'b.com', alwaysOn: true },
+    { hostname: 'c.com', alwaysOn: true },
+  ]);
+});
+
+test('order-agnostic reorder clean-revert via stageAlwaysOnToggle (committed [a,b,c], toggle a off, remove b, re-add b, toggle a on -> null)', () => {
+  // A multi-action net-zero that reorders the draft: confirms the
+  // order-agnostic draftEqualsCommitted clears staged across mixed actions.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'a.com', alwaysOn: true },
+        { hostname: 'b.com', alwaysOn: true },
+        { hostname: 'c.com', alwaysOn: true },
+      ],
+    },
+    staged: null,
+  });
+
+  useDomainStore.getState().stageAlwaysOnToggle('a.com'); // off -> [a:false,b,c]
+  useDomainStore.getState().stageDomainRemove('b.com'); // -> [a:false,c]
+  useDomainStore.getState().stageDomainAdd('b.com'); // -> [a:false,c,b] (reordered)
+  // Toggle a back on -> [a:true,c,b] value-equals committed [a,b,c] as a set ->
+  // order-agnostic draftEqualsCommitted -> staged reverts to null.
+  useDomainStore.getState().stageAlwaysOnToggle('a.com');
+
+  expect(useDomainStore.getState().staged).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

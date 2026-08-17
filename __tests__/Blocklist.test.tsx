@@ -42,7 +42,7 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
-import { AccessibilityInfo } from 'react-native';
+import { AccessibilityInfo, Alert } from 'react-native';
 import type { TextInput as TextInputType } from 'react-native';
 import { Blocklist } from '../src/components/Blocklist';
 import { useDomainStore } from '../src/domain/store';
@@ -777,4 +777,151 @@ test('Blocklist forwards onFocusChange to AddDomain (field onFocus/onBlur fire t
   expect(onFocusChange).toHaveBeenCalledWith(false);
 
   expect(onFocusChange).toHaveBeenCalledTimes(2);
+});
+
+// ===========================================================================
+// Story 2.4 — remove confirm-alert (Alert.alert) + stageDomainRemove wiring.
+// The confirm gates the STAGING: clicking remove opens the native macOS sheet;
+// only the Remove button's onPress calls stageDomainRemove. Cancel/Esc -> no
+// staging. `Alert.alert` is spied (not the whole `react-native` module) so the
+// rest of the render (PlatformColor via tokens, Pressable, etc.) is untouched.
+// ===========================================================================
+
+// `Alert.alert` is spied on (not the whole `react-native` module) so the rest
+// of the render (PlatformColor via tokens, Pressable, etc.) is untouched. The
+// spy captures the alert args and exposes the button `onPress` callbacks so a
+// test can invoke the Remove button's onPress -> stageDomainRemove. Active for
+// the whole file; tests that don't trigger remove simply never call it.
+const alertSpy = jest.spyOn(Alert, 'alert');
+
+/** Locate a row's remove control by `accessibilityLabel: 'Remove <host>'`. */
+function findRemoveButton(
+  root: ReactTestRenderer.ReactTestInstance,
+  hostname: string,
+): ReactTestRenderer.ReactTestInstance | undefined {
+  return root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityRole === 'button' &&
+      node.props.accessibilityLabel === `Remove ${hostname}`,
+  )[0];
+}
+
+test('Blocklist passes onRemove to each DomainRow (remove control renders with the hostname label)', () => {
+  seedState({
+    domains: [
+      { hostname: 'example.com', alwaysOn: true },
+      { hostname: 'social.com', alwaysOn: false },
+    ],
+  });
+
+  const testRenderer = renderBlocklist();
+  // One remove control per row, labelled with the stored apex.
+  expect(findRemoveButton(testRenderer.root, 'example.com')).toBeDefined();
+  expect(findRemoveButton(testRenderer.root, 'social.com')).toBeDefined();
+});
+
+test('clicking remove opens Alert.alert with title "Remove <host>?" + Cancel/Remove buttons', () => {
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+  });
+  alertSpy.mockClear();
+
+  const testRenderer = renderBlocklist();
+  const remove = findRemoveButton(testRenderer.root, 'example.com');
+  expect(remove).toBeDefined();
+
+  ReactTestRenderer.act(() => {
+    remove!.props.onPress();
+  });
+
+  expect(alertSpy).toHaveBeenCalledTimes(1);
+  const call = alertSpy.mock.calls[0];
+  const title = call[0];
+  const message = call[1];
+  const buttons = call[2] as Array<{
+    text: string;
+    style?: string;
+    onPress?: () => void;
+    isPreferred?: boolean;
+  }>;
+  expect(title).toBe('Remove example.com?');
+  expect(message).toBe(
+    'Removing it from your blocklist. This takes effect when you Apply.',
+  );
+  // Two buttons: Cancel (cancel style) + Remove (destructive style).
+  expect(buttons).toHaveLength(2);
+  expect(buttons[0]).toMatchObject({ text: 'Cancel', style: 'cancel' });
+  expect(buttons[1]).toMatchObject({ text: 'Remove', style: 'destructive' });
+  // Remove is NOT isPreferred — Cancel is the safe Esc/cancel target.
+  expect(buttons[1].isPreferred).toBeFalsy();
+  // Cancel has no onPress (no staging); Remove carries the onPress.
+  expect(typeof buttons[1].onPress).toBe('function');
+});
+
+test('confirming Remove calls stageDomainRemove with the hostname', () => {
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+  });
+  const removeSpy = jest.spyOn(useDomainStore.getState(), 'stageDomainRemove');
+  alertSpy.mockClear();
+
+  const testRenderer = renderBlocklist();
+  ReactTestRenderer.act(() => {
+    findRemoveButton(testRenderer.root, 'example.com')!.props.onPress();
+  });
+
+  // The Remove button's onPress -> stageDomainRemove(hostname).
+  const buttons = alertSpy.mock.calls[0][2] as Array<{
+    text: string;
+    style?: string;
+    onPress?: () => void;
+  }>;
+  expect(removeSpy).not.toHaveBeenCalled();
+  ReactTestRenderer.act(() => {
+    buttons[1].onPress!();
+  });
+  expect(removeSpy).toHaveBeenCalledTimes(1);
+  expect(removeSpy).toHaveBeenCalledWith('example.com');
+  removeSpy.mockRestore();
+});
+
+test('cancelling the alert does NOT call stageDomainRemove (no staging)', () => {
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+  });
+  const removeSpy = jest.spyOn(useDomainStore.getState(), 'stageDomainRemove');
+  alertSpy.mockClear();
+
+  const testRenderer = renderBlocklist();
+  ReactTestRenderer.act(() => {
+    findRemoveButton(testRenderer.root, 'example.com')!.props.onPress();
+  });
+
+  // Cancel has no onPress (no staging). Simulate the cancel path by NOT
+  // invoking any button onPress — staging must not have happened.
+  const buttons = alertSpy.mock.calls[0][2] as Array<{
+    text: string;
+    style?: string;
+    onPress?: () => void;
+  }>;
+  expect(buttons[0].onPress).toBeUndefined();
+  expect(removeSpy).not.toHaveBeenCalled();
+  // staged is untouched.
+  expect(useDomainStore.getState().staged).toBeNull();
+  removeSpy.mockRestore();
+});
+
+test('the remove control is disabled while an Apply run is in flight', () => {
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+    applyStatus: 'running',
+  });
+
+  const testRenderer = renderBlocklist();
+  const remove = findRemoveButton(testRenderer.root, 'example.com');
+  expect(remove).toBeDefined();
+  expect(remove!.props.disabled).toBe(true);
+  expect(remove!.props.accessibilityState).toEqual({ disabled: true });
 });

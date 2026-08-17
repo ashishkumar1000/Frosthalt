@@ -29,6 +29,7 @@
 import React, { useEffect } from 'react';
 import {
   AccessibilityInfo,
+  Alert,
   Pressable,
   StyleSheet,
   Text,
@@ -74,6 +75,7 @@ export function Blocklist({
   const staged = useDomainStore((s) => s.staged);
   const applyStatus = useDomainStore((s) => s.applyStatus);
   const stageAlwaysOnToggle = useDomainStore((s) => s.stageAlwaysOnToggle);
+  const stageDomainRemove = useDomainStore((s) => s.stageDomainRemove);
   const apply = useDomainStore((s) => s.apply);
   const cancelStaged = useDomainStore((s) => s.cancelStaged);
 
@@ -94,6 +96,28 @@ export function Blocklist({
     : 0;
   const changesHint =
     changeCount === 1 ? '1 change staged' : `${changeCount} changes staged`;
+
+  // Story 2.4 — remove confirm-alert. The confirm gates the STAGING, not the
+  // commit: clicking remove opens the native macOS sheet (`Alert.alert`); only
+  // the Remove button's `onPress` calls `stageDomainRemove`. Cancel/Esc -> no
+  // staging. The native alert captures keyboard focus (so the Shell's
+  // Return->Apply gate is inert while it is open) and honours Esc via the
+  // cancel-style button — no Shell change. Remove is `style: 'destructive'`
+  // but NOT `isPreferred` — Cancel is the safe Esc/cancel target.
+  const handleRemove = (hostname: string) => {
+    Alert.alert(
+      `Remove ${hostname}?`,
+      'Removing it from your blocklist. This takes effect when you Apply.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Remove',
+          style: 'destructive',
+          onPress: () => stageDomainRemove(hostname),
+        },
+      ],
+    );
+  };
 
   // Mount announce: "Blocklist, N domains, M always-on". N is the rendered
   // list length (staged or committed), M is the always-on count from the same
@@ -128,6 +152,7 @@ export function Blocklist({
                 key={d.hostname}
                 domain={d}
                 onToggleAlwaysOn={stageAlwaysOnToggle}
+                onRemove={handleRemove}
                 disabled={running}
               />
             ))}
