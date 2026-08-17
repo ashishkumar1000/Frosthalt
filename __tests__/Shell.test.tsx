@@ -2,11 +2,36 @@
  * @format
  */
 
+// Shell now imports the Blocklist surface (Story 2.1), which pulls in the
+// domain store -> configStore -> NativeConfigStoreSpec TurboModule. The
+// TurboModule is not registered in the jest node env, so the spec's
+// `TurboModuleRegistry.getEnforcing(...)` throws at module load. Mock both
+// native specs (the store.test.ts:21-35 / Blocklist.test.tsx seam) so the
+// transitive import resolves. The Shell tests themselves do not exercise the
+// store — they assert sidebar nav, keyboard handling, and the status header.
+jest.mock('../src/native/specs/NativeConfigStoreSpec', () => ({
+  __esModule: true,
+  default: {
+    readConfig: jest.fn(),
+    writeConfig: jest.fn(),
+  },
+}));
+
+jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
+  __esModule: true,
+  default: {
+    writeHosts: jest.fn(),
+    readHostsSection: jest.fn(),
+  },
+}));
+
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import { AccessibilityInfo } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { Shell } from '../src/components/Shell';
+import { useDomainStore } from '../src/domain/store';
+import { DEFAULT_CONFIG } from '../src/config/types';
 
 // The react-native jest preset auto-mocks `announceForAccessibility`
 // as a `jest.fn()`, but the TypeScript type from react-native-macos's types is
@@ -236,6 +261,12 @@ test('⌘3 selects row 2 (Schedule) and announces "Schedule, 0 domains"', async 
 test('a plain number key without ⌘ does not navigate', async () => {
   announceForAccessibility.mockClear();
   const testRenderer = renderShell();
+  // The Blocklist surface (row 0 is active on mount) fires its own mount
+  // announce ("Blocklist, N domains, M always-on") on render — clear it AFTER
+  // render so this test isolates the Shell's keyDown announce behaviour
+  // (which is what this matrix row is about: a plain key must NOT make the
+  // Shell announce).
+  announceForAccessibility.mockClear();
   const container = findKeyDownContainer(testRenderer.root);
 
   await ReactTestRenderer.act(() => {
@@ -253,6 +284,9 @@ test('a plain number key without ⌘ does not navigate', async () => {
 test('⌘ with a key outside 1-4 does not navigate', async () => {
   announceForAccessibility.mockClear();
   const testRenderer = renderShell();
+  // Clear the Blocklist mount announce after render so the assertion isolates
+  // the Shell's keyDown announce behaviour (see the plain-number test above).
+  announceForAccessibility.mockClear();
   const container = findKeyDownContainer(testRenderer.root);
 
   await ReactTestRenderer.act(() => {
@@ -302,4 +336,61 @@ test('the shell root is focusable and declares ⌘1-⌘4 as handled key events',
     { key: '3', metaKey: true },
     { key: '4', metaKey: true },
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// Story 2.1 integration: the Shell renders the Blocklist surface content
+// (title + domain rows + checkboxes) for surface 0, not the placeholder.
+// `Blocklist.test.tsx` renders <Blocklist/> directly and bypasses the Shell;
+// this pins the Shell -> Blocklist wiring at Shell.tsx:95 so reverting that
+// one line to <SurfacePlaceholder/> fails here. Also covers the
+// navigate-away-then-back remount path, not just the initial mount.
+// ---------------------------------------------------------------------------
+
+test('Shell renders the Blocklist surface content (not the placeholder) on surface 0', async () => {
+  // Seed the store with one committed domain so a row + checkbox render.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [{ hostname: 'example.com', alwaysOn: true }],
+      },
+    });
+  });
+
+  const testRenderer = renderShell();
+  const text = extractText(testRenderer.toJSON());
+  // The Blocklist surface title + the committed hostname are present.
+  expect(text).toContain('Blocklist');
+  expect(text).toContain('example.com');
+  // A checkbox for the domain row is present — the placeholder renders none.
+  const checkboxes = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityRole === 'checkbox',
+  );
+  expect(checkboxes.length).toBeGreaterThanOrEqual(1);
+
+  // Navigate away to Timer (surface 1) then back to Blocklist (surface 0)
+  // via ⌘2 then ⌘1 — the Blocklist surface must remount and re-render its
+  // content (pins the navigate-away-and-back path, not just the mount).
+  const container = findKeyDownContainer(testRenderer.root);
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '2' } });
+  });
+  expect(extractText(testRenderer.toJSON())).toContain('No timer running');
+
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '1' } });
+  });
+  const textAfterReturn = extractText(testRenderer.toJSON());
+  expect(textAfterReturn).toContain('Blocklist');
+  expect(textAfterReturn).toContain('example.com');
+
+  // Restore the empty baseline so this seed does not leak into other suites
+  // that share the module-level store instance.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
 });

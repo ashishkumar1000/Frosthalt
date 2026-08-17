@@ -147,6 +147,249 @@ test('stageDomainAdd stacks additional domains on top of the current draft', () 
 });
 
 // ---------------------------------------------------------------------------
+// stageAlwaysOnToggle (Story 2.1)
+// ---------------------------------------------------------------------------
+
+test('stageAlwaysOnToggle flips alwaysOn false->true on a committed domain and stages a new draft', () => {
+  // Seed committed with one alwaysOn:false domain so toggling is a real change.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: false }],
+    },
+    staged: null,
+  });
+
+  const result = useDomainStore.getState().stageAlwaysOnToggle('example.com');
+
+  expect(result).toStrictEqual({ ok: true });
+  // The staged draft carries the flipped alwaysOn value.
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  // Committed is untouched — toggle is a STAGED edit, Apply commits.
+  expect(useDomainStore.getState().committed.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: false },
+  ]);
+});
+
+test('stageAlwaysOnToggle flips alwaysOn true->false on a committed domain', () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    staged: null,
+  });
+
+  const result = useDomainStore.getState().stageAlwaysOnToggle('example.com');
+
+  expect(result).toStrictEqual({ ok: true });
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: false },
+  ]);
+});
+
+test('stageAlwaysOnToggle builds on the staged draft when one exists', () => {
+  // committed has two domains; a staged draft already flips the first. Toggling
+  // the second must build on the draft, not on committed.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'example.com', alwaysOn: true },
+        { hostname: 'social.com', alwaysOn: false },
+      ],
+    },
+    staged: [
+      { hostname: 'example.com', alwaysOn: false }, // already toggled
+      { hostname: 'social.com', alwaysOn: false },
+    ],
+  });
+
+  const result = useDomainStore.getState().stageAlwaysOnToggle('social.com');
+
+  expect(result).toStrictEqual({ ok: true });
+  // The draft now reflects BOTH toggles; committed is still the original.
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: false },
+    { hostname: 'social.com', alwaysOn: true },
+  ]);
+  expect(useDomainStore.getState().committed.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+    { hostname: 'social.com', alwaysOn: false },
+  ]);
+});
+
+test('stageAlwaysOnToggle produces a NEW staged array reference (preserves mid-run-edit detection)', () => {
+  // The apply-queue's retain-newer-draft invariant relies on a newer draft
+  // being a DIFFERENT array reference from the snapshot a running Apply
+  // captured. Toggling must spread, not mutate in place.
+  // Seed committed with two domains. Toggling the first then the second
+  // produces two successive staged drafts; the second must be a DIFFERENT
+  // array reference from the first (spread, not in-place mutation) — this is
+  // what the apply-queue's retain-newer-draft invariant relies on. Toggling
+  // the same domain twice would clean-revert to null, so two domains are
+  // needed to keep the draft non-null across both toggles.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'example.com', alwaysOn: false },
+        { hostname: 'social.com', alwaysOn: false },
+      ],
+    },
+    staged: null,
+  });
+
+  useDomainStore.getState().stageAlwaysOnToggle('example.com');
+  const ref1 = useDomainStore.getState().staged;
+  expect(ref1).not.toBeNull();
+
+  useDomainStore.getState().stageAlwaysOnToggle('social.com');
+  const ref2 = useDomainStore.getState().staged;
+  expect(ref2).not.toBe(ref1); // NEW array reference, not in-place mutation
+  expect(ref2).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+    { hostname: 'social.com', alwaysOn: true },
+  ]);
+});
+
+test('stageAlwaysOnToggle clean-revert: toggling a domain off then on reverts staged to null (no redundant Apply)', () => {
+  // committed has example.com alwaysOn:true. Toggle off -> staged draft with
+  // false. Toggle on -> draft equals committed -> staged reverts to null.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    staged: null,
+  });
+
+  const r1 = useDomainStore.getState().stageAlwaysOnToggle('example.com');
+  expect(r1).toStrictEqual({ ok: true });
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: false },
+  ]);
+
+  const r2 = useDomainStore.getState().stageAlwaysOnToggle('example.com');
+  expect(r2).toStrictEqual({ ok: true });
+  // Net = committed -> staged reverts to null. No redundant admin prompt on
+  // the next Apply.
+  expect(useDomainStore.getState().staged).toBeNull();
+});
+
+test('stageAlwaysOnToggle clean-revert: toggling back to committed among multiple edits reverts the WHOLE draft to null', () => {
+  // committed has two alwaysOn:true domains. Toggle BOTH off then BOTH on —
+  // after the fourth toggle the draft equals committed and staged reverts to
+  // null, even though the draft touched more than one domain.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'example.com', alwaysOn: true },
+        { hostname: 'social.com', alwaysOn: true },
+      ],
+    },
+    staged: null,
+  });
+
+  useDomainStore.getState().stageAlwaysOnToggle('example.com'); // off
+  useDomainStore.getState().stageAlwaysOnToggle('social.com'); // off
+  expect(useDomainStore.getState().staged).not.toBeNull();
+
+  useDomainStore.getState().stageAlwaysOnToggle('example.com'); // back on
+  useDomainStore.getState().stageAlwaysOnToggle('social.com'); // back on
+
+  // The whole draft nets to committed -> staged reverts to null.
+  expect(useDomainStore.getState().staged).toBeNull();
+});
+
+test('stageAlwaysOnToggle does NOT clean-revert when other edits keep the draft dirty', () => {
+  // committed has two alwaysOn:true domains. Toggle example.com off, then
+  // back on — social.com is untouched, but example.com's net is no-op, so
+  // the draft still equals committed here... actually it equals committed
+  // (both true). To exercise the "still dirty" branch, toggle example.com
+  // off, social.com off, then example.com back on: the draft is now
+  // [example:true, social:false] which differs from committed -> stays.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'example.com', alwaysOn: true },
+        { hostname: 'social.com', alwaysOn: true },
+      ],
+    },
+    staged: null,
+  });
+
+  useDomainStore.getState().stageAlwaysOnToggle('example.com'); // off
+  useDomainStore.getState().stageAlwaysOnToggle('social.com'); // off
+  useDomainStore.getState().stageAlwaysOnToggle('example.com'); // back on
+
+  // social.com is still off -> draft differs from committed -> stays staged.
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+    { hostname: 'social.com', alwaysOn: false },
+  ]);
+});
+
+test('stageAlwaysOnToggle on an unknown hostname returns not-found and leaves staged unchanged', () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    staged: null,
+  });
+
+  const before = useDomainStore.getState().staged;
+  const result = useDomainStore.getState().stageAlwaysOnToggle('ghost.com');
+
+  expect(result).toStrictEqual({ ok: false, error: 'not-found' });
+  expect(useDomainStore.getState().staged).toBe(before);
+  expect(useDomainStore.getState().staged).toBeNull();
+});
+
+test('stageAlwaysOnToggle on an unknown hostname with a staged draft leaves the draft unchanged', () => {
+  const draft = [
+    { hostname: 'example.com', alwaysOn: false },
+  ];
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    staged: draft,
+  });
+
+  const result = useDomainStore.getState().stageAlwaysOnToggle('ghost.com');
+
+  expect(result).toStrictEqual({ ok: false, error: 'not-found' });
+  // The staged draft reference is unchanged (no new array, no mutation).
+  expect(useDomainStore.getState().staged).toBe(draft);
+});
+
+test('stageAlwaysOnToggle on an already-committed clean state: toggling is a real change (staged becomes non-null)', () => {
+  // Edge: when staged is null and the user toggles, the result is a dirty
+  // draft (the toggle always flips). This confirms clean-revert does NOT fire
+  // on the FIRST toggle — only when the draft NETS back to committed.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    staged: null,
+  });
+
+  useDomainStore.getState().stageAlwaysOnToggle('example.com');
+
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: false },
+  ]);
+});
+
+// ---------------------------------------------------------------------------
 // cancelStaged
 // ---------------------------------------------------------------------------
 

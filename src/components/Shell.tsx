@@ -23,6 +23,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Sidebar } from './Sidebar';
 import { StatusHeader } from './StatusHeader';
 import { SurfacePlaceholder, SURFACE_NAMES, type SurfaceIndex } from './surfaces';
+import { Blocklist } from './Blocklist';
 
 /** ⌘1-⌘4 are the four surfaces; keys outside this set are ignored. */
 const KEY_DOWN_EVENTS: HandledKeyEvent[] = [
@@ -91,7 +92,7 @@ export function Shell(): React.ReactElement {
           onSelect={selectRow}
           rowRefs={rowRefs}
         />
-        <SurfacePlaceholder surface={surface} />
+        {surface === 0 ? <Blocklist /> : <SurfacePlaceholder surface={surface} />}
       </View>
     </View>
   );

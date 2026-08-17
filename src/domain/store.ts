@@ -22,6 +22,15 @@
  *   - `stageDomainAdd(raw)` — normalise + add a domain (alwaysOn true) to the
  *     staged draft; returns `{ ok: false, error: "invalid-domain" }` without
  *     staging on non-hostname input (no Apply, no prompt).
+ *   - `stageAlwaysOnToggle(hostname)` — flip `alwaysOn` for the matching domain
+ *     in the staged draft (built on `staged ?? committed.domains`). Produces a
+ *     NEW `staged` array reference (spread) so the apply-queue's mid-run-edit
+ *     detection still works. Clean-revert: if the resulting draft equals
+ *     `committed.domains` (same hostnames + alwaysOn, order) `staged` is cleared
+ *     to `null` so a net-no-op toggle fires no redundant admin prompt — mirroring
+ *     `stageDomainAdd`'s no-redundant-Apply principle. Returns
+ *     `{ ok: false, error: "not-found" }` without staging when `hostname` is not
+ *     in the draft.
  *   - `cancelStaged()` — discard staged back to last-committed.
  *   - `apply()` — enqueue a serialized Apply run; returns its envelope.
  *
@@ -57,6 +66,17 @@ export interface DomainState {
    */
   drift: DriftResult | null;
   stageDomainAdd: (raw: string) => WriteResult;
+  /**
+   * Flip `alwaysOn` for the domain with the given hostname in the staged draft
+   * (built on `staged ?? committed.domains`). Always produces a NEW staged
+   * array reference when it mutates (spread), so the apply-queue's
+   * mid-run-edit detection (`s.staged === stagedSnapshot`) still works. On a
+   * net-no-op toggle (the resulting draft equals `committed.domains`) `staged`
+   * is cleared to `null` so no redundant admin prompt fires on the next Apply.
+   * Returns `{ ok: false, error: "not-found" }` without staging when the
+   * hostname is not in the draft.
+   */
+  stageAlwaysOnToggle: (hostname: string) => WriteResult;
   cancelStaged: () => void;
   apply: () => Promise<WriteResult>;
   /**
@@ -97,6 +117,37 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
       return { ok: true };
     }
     set({ staged: [...base, { hostname: apex, alwaysOn: true }] });
+    return { ok: true };
+  },
+
+  stageAlwaysOnToggle: (hostname) => {
+    // Build on the current draft (or committed, if clean). Toggling is
+    // optimistic: the user sees the pending toggle immediately; Apply commits;
+    // Cancel reverts. Same staged-then-Apply model as 1.6.
+    const base = get().staged ?? get().committed.domains;
+    const idx = base.findIndex((d) => d.hostname === hostname);
+    if (idx === -1) {
+      // Unknown hostname (not in the draft). No staging, no Apply, no prompt.
+      return { ok: false, error: 'not-found' };
+    }
+    // Produce a NEW array reference (spread + map) so the apply-queue's
+    // mid-run-edit detection (`s.staged === stagedSnapshot`) still works: a
+    // toggle that lands while an Apply is in flight is always a different
+    // reference from the snapshot the running Apply captured, so the success
+    // handler retains it rather than clobbering it.
+    const next = base.map((d, i) =>
+      i === idx ? { ...d, alwaysOn: !d.alwaysOn } : d,
+    );
+    // Clean-revert: if the resulting draft equals committed.domains (same
+    // hostnames + alwaysOn, order), clear `staged` to `null`. This mirrors
+    // `stageDomainAdd`'s no-redundant-Apply principle — a net-no-op toggle
+    // (e.g. toggle a domain off then on) must NOT leave a dirty draft that
+    // would force an admin prompt to write an identical `/etc/hosts`.
+    if (draftEqualsCommitted(next, get().committed.domains)) {
+      set({ staged: null });
+      return { ok: true };
+    }
+    set({ staged: next });
     return { ok: true };
   },
 
@@ -218,4 +269,21 @@ function enqueue(run: () => Promise<WriteResult>): Promise<WriteResult> {
     () => ({ ok: false }) as WriteResult,
   );
   return next;
+}
+
+/**
+ * Structural equality of two `Domain[]` drafts by `(hostname, alwaysOn)` in
+ * order. Used by `stageAlwaysOnToggle`'s clean-revert: when the post-toggle
+ * draft matches `committed.domains`, `staged` is cleared to `null` so a
+ * net-no-op toggle fires no redundant admin prompt. Reference identity is NOT
+ * checked — a freshly-spread draft that is value-equal to committed is the
+ * whole point (the toggle produced a new ref but the same value).
+ */
+function draftEqualsCommitted(a: Domain[], b: Domain[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].hostname !== b[i].hostname) return false;
+    if (a[i].alwaysOn !== b[i].alwaysOn) return false;
+  }
+  return true;
 }
