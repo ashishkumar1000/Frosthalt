@@ -105,4 +105,16 @@ RCT_EXPORT_MODULE(NativeShellRunner)
   [self.swiftImpl writeHosts:lines resolve:resolve reject:reject];
 }
 
+// readHostsSection -> NSDictionary (codegen maps the sync `ReadSectionResult`
+// object return type to NSDictionary * — the same mapping ConfigStore.readConfig
+// uses). The Swift impl returns a `[String: Any]` dict that bridges cleanly to
+// NSDictionary: { ok:true, section:[lines] } | { ok:true, section:NSNull() } |
+// { ok:false, error:"hosts-unreadable" | "markers-mismatch" }. This is an
+// UNPRIVILEGED sync read (`/etc/hosts` is world-readable) — no osascript, no
+// background queue (parallel to NativeConfigStore.mm:81 `readConfig`).
+- (NSDictionary *)readHostsSection
+{
+  return [self.swiftImpl readHostsSection];
+}
+
 @end

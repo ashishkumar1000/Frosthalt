@@ -137,6 +137,105 @@ final class ShellRunner: NSObject {
     qos: .userInitiated
   )
 
+  // MARK: - readHostsSection (Story 1.7 — unprivileged, sync section extraction)
+
+  /// Reads the managed `# BEGIN/END FROSTHALT` section of /etc/hosts
+  /// UNPRIVILEGED + SYNCHRONOUSLY. /etc/hosts is world-readable (0644), so this
+  /// needs NO `osascript` — it is a plain `String(contentsOfFile:)` read on the
+  /// calling JSI thread, exactly mirroring `ConfigStore.readConfig`'s sync read
+  /// pattern (a tiny file, microseconds). No `backgroundQueue`.
+  ///
+  /// Extraction reuses the SAME marker regexes as the privileged `writeHosts`
+  /// pre-scan (`beginMarkerRegex` / `endMarkerRegex`) and the SAME unprivileged
+  /// read as `markerCounts` — the marker format's single source of truth stays
+  /// native. The JS side NEVER parses markers: this returns the body lines
+  /// (strictly between the markers, excluding the marker lines) opaquely, and
+  /// the JS `computeDrift` comparator does array equality.
+  ///
+  /// Returns a `[String: Any]` dict that bridges to the JS `ReadSectionResult`:
+  ///   - { ok:true,  section:[String] }  markers found, body captured (file order)
+  ///   - { ok:true,  section:NSNull() }  no markers (managed section absent)
+  ///   - { ok:false, error:"hosts-unreadable" }  /etc/hosts itself unreadable
+  ///   - { ok:false, error:"markers-mismatch" }  markers corrupt (unpaired /
+  ///     duplicated / end-before-begin) — refused before any comparison so a
+  ///     corrupt hosts is never silently treated as an in-sync empty body
+  ///
+  /// The marker-mismatch contract is identical to `writeHosts`'s pre-scan: the
+  /// only accepted states are zero markers (absent) or exactly one clean pair;
+  /// everything else is `markers-mismatch`.
+  @objc
+  func readHostsSection() -> [String: Any] {
+    // Unprivileged read — /etc/hosts is world-readable. Same read as
+    // `markerCounts`, but inlined here so the absent/corrupt/present triage and
+    // the body extraction share one file read (no double-read race window).
+    let contents: String
+    do {
+      contents = try String(contentsOfFile: "/etc/hosts", encoding: .utf8)
+    } catch {
+      return ["ok": false, "error": "hosts-unreadable"]
+    }
+
+    // Scan every line (omittingEmptySubsequences: false so an empty body between
+    // the markers is captured as an empty array, not collapsed to nothing).
+    let lines = contents.split(
+      separator: "\n",
+      omittingEmptySubsequences: false
+    ).map(String.init)
+
+    var beginCount = 0
+    var endCount = 0
+    var beginIndex: Int? = nil
+    var endIndex: Int? = nil
+
+    for (i, raw) in lines.enumerated() {
+      let r = NSRange(location: 0, length: raw.utf16.count)
+      if ShellRunner.beginMarkerRegex.firstMatch(
+        in: raw, options: [], range: r
+      ) != nil {
+        beginCount += 1
+        // The FIRST begin marker anchors the section.
+        if beginIndex == nil { beginIndex = i }
+      } else if ShellRunner.endMarkerRegex.firstMatch(
+        in: raw, options: [], range: r
+      ) != nil {
+        endCount += 1
+        // The matching end is the FIRST end marker AFTER the first begin. An end
+        // before any begin leaves `endIndex` nil (caught below as mismatch).
+        if beginIndex != nil && endIndex == nil { endIndex = i }
+      }
+    }
+
+    // Clean-pair contract (identical to writeHosts's pre-scan): zero markers
+    // (absent) or exactly one clean pair. Anything else (unpaired, duplicated,
+    // or an end-before-begin that left `endIndex` nil despite (1,1) counts) is
+    // markers-mismatch — refused before any comparison.
+    let cleanPair =
+      (beginCount == 0 && endCount == 0) || (beginCount == 1 && endCount == 1)
+    if !cleanPair {
+      return ["ok": false, "error": "markers-mismatch"]
+    }
+
+    // No markers -> absent (NSNull bridges to JS null, distinct from an empty
+    // body array).
+    if beginCount == 0 {
+      return ["ok": true, "section": NSNull()]
+    }
+
+    // One clean pair: extract the body strictly between the markers. A missing
+    // or reversed pair (endIndex nil / endIndex <= beginIndex) is a corrupt
+    // section — surfaces as markers-mismatch, never an in-sync empty body.
+    guard
+      let b = beginIndex,
+      let e = endIndex,
+      e > b
+    else {
+      return ["ok": false, "error": "markers-mismatch"]
+    }
+
+    let body = Array(lines[(b + 1)..<e])
+    return ["ok": true, "section": body]
+  }
+
   // MARK: - writeHosts (the single privileged method)
 
   /// Rewrites the managed `# BEGIN/END FROSTHALT` section of /etc/hosts with

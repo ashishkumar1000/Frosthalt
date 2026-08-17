@@ -38,6 +38,10 @@ import type { Config, Domain } from '../config/types';
 import { readConfig } from '../config/configStore';
 import { normaliseDomain } from './normalise';
 import { runApply } from './apply';
+import { effectiveHostsLines } from './effectiveBlocklist';
+import { computeDrift } from './drift';
+import type { DriftResult } from './drift';
+import { readHostsSection, writeHosts } from '../hosts/shellRunner';
 import type { WriteResult } from '../hosts/shellRunner';
 
 export type ApplyStatus = 'idle' | 'running';
@@ -47,9 +51,27 @@ export interface DomainState {
   staged: Domain[] | null;
   applyStatus: ApplyStatus;
   lastResult: WriteResult | null;
+  /**
+   * The last drift result, or `null` when drift has not been checked yet
+   * (unchecked). Set by `checkDrift` (and re-set on a successful Restore).
+   */
+  drift: DriftResult | null;
   stageDomainAdd: (raw: string) => WriteResult;
   cancelStaged: () => void;
   apply: () => Promise<WriteResult>;
+  /**
+   * Sync: read the managed section (`readHostsSection`) + compare to committed
+   * (`computeDrift`) + set `drift`. Returns the result. No admin prompt.
+   */
+  checkDrift: () => DriftResult;
+  /**
+   * Async: re-run the privileged `writeHosts` path with
+   * `effectiveHostsLines(committed)` — ONE admin prompt — through the shared
+   * serialized queue (never concurrent with an Apply; one prompt at a time).
+   * On success re-checks drift -> in-sync; on denied drift remains. Restore
+   * writes HOSTS only (config.json is canonical and unchanged by drift).
+   */
+  restoreSection: () => Promise<WriteResult>;
 }
 
 export const useDomainStore = create<DomainState>()((set, get) => ({
@@ -57,6 +79,7 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
   staged: null,
   applyStatus: 'idle',
   lastResult: null,
+  drift: null,
 
   stageDomainAdd: (raw) => {
     const apex = normaliseDomain(raw);
@@ -120,6 +143,51 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
         // Admin-denied or config-write failure: retain staged for retry. The
         // queue advances past this run only once it has settled; the next
         // queued Apply re-attempts `writeHosts` idempotently.
+        set({ applyStatus: 'idle', lastResult: result });
+      }
+      return result;
+    });
+  },
+
+  checkDrift: () => {
+    // Sync: read the managed section (unprivileged, no admin prompt) + compare
+    // to committed + set `drift`. Returns the result so the caller (the UI) can
+    // branch on it immediately. No port throws (`readHostsSection` catches a
+    // native throw into a `{ok:false,error}` envelope), so this never throws.
+    const read = readHostsSection();
+    const result = computeDrift(get().committed, read);
+    set({ drift: result });
+    return result;
+  },
+
+  restoreSection: () => {
+    // Restore writes HOSTS only (config.json is canonical and unchanged by
+    // drift), so there is no staged snapshot and no config write — just
+    // `writeHosts(effectiveHostsLines(committed))`. Routing through the shared
+    // serialized queue guarantees Restore never runs concurrent with an Apply
+    // (one osascript prompt at a time).
+    //
+    // committed is re-read INSIDE the enqueue callback (at run time), NOT
+    // captured at call time. If an Apply was queued ahead of this Restore and
+    // committed new domains while we waited, Restore must reconcile hosts to
+    // the CURRENT committed — not the stale call-time snapshot, which would
+    // clobber the Apply's just-written hosts and falsely report in-sync while
+    // store.committed is new and /etc/hosts holds the old lines.
+    return enqueue(async () => {
+      set({ applyStatus: 'running' });
+      const committed = get().committed;
+      const lines = effectiveHostsLines(committed);
+      const result = await writeHosts(lines);
+      if (result.ok) {
+        // Success: re-check drift -> should be in-sync. The read + compare are
+        // sync, so the drift state is updated before the promise resolves.
+        const read = readHostsSection();
+        const drift = computeDrift(committed, read);
+        set({ applyStatus: 'idle', lastResult: result, drift });
+      } else {
+        // Denied (or hard OS error): /etc/hosts unchanged, drift remains. The
+        // warning stays; no auto-re-add loop (spec: Never). `lastResult` is set
+        // so the UI status line reflects the denial.
         set({ applyStatus: 'idle', lastResult: result });
       }
       return result;

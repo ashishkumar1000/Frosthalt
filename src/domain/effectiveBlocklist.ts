@@ -19,7 +19,7 @@
  */
 
 import type { Config } from '../config/types';
-import { normaliseDomain } from './normalise';
+import { normaliseDomain, toHostsLines } from './normalise';
 
 /**
  * Returns the normalised, deduped list of apex hostnames currently in the
@@ -53,4 +53,19 @@ export function effectiveBlocklist(config: Config): string[] {
   // discipline. Intentionally empty for 1.6.
 
   return out;
+}
+
+/**
+ * The full managed-section hosts payload derived from `config`: every apex in
+ * the effective blocklist expanded via `toHostsLines` (apex + `www.` on
+ * `0.0.0.0` + `::`, in effective-blocklist order). This is exactly the line set
+ * that `writeHosts` writes and that `computeDrift` compares the read section's
+ * body against (Story 1.7).
+ *
+ * DRY helper reused by `runApply`, `computeDrift`, and `restoreSection` so the
+ * three never drift on how the expected lines are produced. Pure — a thin
+ * `effectiveBlocklist(config).flatMap(toHostsLines)`.
+ */
+export function effectiveHostsLines(config: Config): string[] {
+  return effectiveBlocklist(config).flatMap(toHostsLines);
 }

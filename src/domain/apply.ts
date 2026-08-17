@@ -4,9 +4,10 @@
  * Strict order, one atomic run at a time (the queue is the store's, not here):
  *
  *   1. commit staged -> `config.json`            (ConfigStore.writeConfig)
- *   2. compute the effective blocklist            (effectiveBlocklist)
- *   3. produce apex + `www.` lines (`0.0.0.0`+`::`)  (toHostsLines)
- *   4. rewrite the managed `/etc/hosts` section    (ShellRunner.writeHosts)
+ *   2. compute the effective hosts lines          (effectiveHostsLines =
+ *      effectiveBlocklist(config).flatMap(toHostsLines) — apex + `www.` on
+ *      `0.0.0.0` + `::`, in effective-blocklist order)
+ *   3. rewrite the managed `/etc/hosts` section  (ShellRunner.writeHosts)
  *
  * Because `config.json` is written BEFORE `/etc/hosts` (the strict order), a
  * denied admin prompt leaves `config.json` ahead of `/etc/hosts`. That drift is
@@ -24,8 +25,7 @@
 import type { Config, Domain } from '../config/types';
 import { writeConfig } from '../config/configStore';
 import { writeHosts } from '../hosts/shellRunner';
-import { effectiveBlocklist } from './effectiveBlocklist';
-import { toHostsLines } from './normalise';
+import { effectiveHostsLines } from './effectiveBlocklist';
 import type { WriteResult } from '../hosts/shellRunner';
 
 /** The snapshot the store hands to `runApply`. */
@@ -68,18 +68,15 @@ export async function runApply({
     return { ok: false, error: `config-write:${cfg.error ?? 'unknown'}` };
   }
 
-  // 2. Compute the effective blocklist from the just-committed config.
-  const effective = effectiveBlocklist(nextConfig);
+  // 2. Compute the effective hosts lines from the just-committed config:
+  //    the effective blocklist (alwaysOn domains, normalised + deduped)
+  //    expanded via `toHostsLines` (apex + `www.` on `0.0.0.0` + `::`, in
+  //    effective-blocklist order). This is the single DRY helper shared
+  //    with `computeDrift` and `restoreSection` (Story 1.7) so the three
+  //    never drift on how the expected lines are produced.
+  const lines = effectiveHostsLines(nextConfig);
 
-  // 3. Produce the managed hosts lines (apex + `www.` on `0.0.0.0` + `::`).
-  const lines: string[] = [];
-  for (const apex of effective) {
-    for (const line of toHostsLines(apex)) {
-      lines.push(line);
-    }
-  }
-
-  // 4. Rewrite the managed /etc/hosts section (one admin prompt; idempotent
+  // 3. Rewrite the managed /etc/hosts section (one admin prompt; idempotent
   //    full-section rewrite per the 1.5 contract). An empty `lines` writes the
   //    markers with no domain lines -> unblocks all. `runApply` never rejects:
   //    `writeHosts` is the shellRunner port, which catches any native throw /

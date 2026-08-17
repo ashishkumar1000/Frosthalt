@@ -8,13 +8,15 @@
  * glue in `macos/Frosthalt-macOS/NativeShellRunner.mm` conforms to.
  *
  * ShellRunner is the ONLY module in the app that elevates (AD-3). It owns the
- * privileged write to `/etc/hosts` + the hosts-line contract enforcement. This
- * spec is intentionally WRITE-ONLY: `readHostsSection` / `restoreSection` are
- * deferred to Story 1.7 (drift / Restore section). The single method here is
- * `writeHosts(lines)`, which runs exactly one
+ * privileged write to `/etc/hosts` + the hosts-line contract enforcement. It
+ * also owns the UNPRIVILEGED read of the managed section (`readHostsSection`,
+ * added in Story 1.7 — `/etc/hosts` is world-readable, so no `osascript`). The
+ * two methods here are `writeHosts(lines)` (privileged, async — runs exactly one
  * `osascript ... with administrator privileges` per call, batching backup ->
  * full managed-section rewrite -> restore owner/mode -> DNS flush, off the main
- * thread, resolving a JS Promise (AD-3 / AD-4 / NFR-8).
+ * thread, resolving a JS Promise) and `readHostsSection()` (unprivileged,
+ * synchronous — mirrors `ConfigStore.readConfig`'s sync read pattern; a tiny
+ * world-readable file, microseconds) (AD-3 / AD-4 / NFR-8).
  *
  * The `lines` argument is the ALREADY-NORMALISED hosts payload — apex + `www.`
  * on `0.0.0.0` + `::`, lowercase (AD-4). Producing those lines from a domain
@@ -58,6 +60,43 @@ export type WriteResult = {
   error?: string;
 };
 
+/**
+ * Uniform result envelope for `readHostsSection` (Story 1.7).
+ *
+ * `readHostsSection` is SYNCHRONOUS and UNPRIVILEGED (no `osascript` —
+ * `/etc/hosts` is world-readable `0644`), mirroring `ConfigStore.readConfig`'s
+ * sync read pattern. It extracts the body lines of the managed
+ * `# BEGIN FROSTHALT` ... `# END FROSTHALT` section (excluding the marker lines
+ * themselves) without elevating.
+ *
+ * - `ok` is always present.
+ * - `section`:
+ *   - `string[]` — markers found, body lines captured (the lines strictly
+ *     between the begin and end markers, in file order). Compared opaquely
+ *     (array equality) by the JS `computeDrift` comparator — the JS side NEVER
+ *     parses markers.
+ *   - `null` — no markers found (the managed section is absent). Distinct from
+ *     an empty body: an absent section has NO markers; a present-but-empty
+ *     section has markers with zero lines between them.
+ *   - Absent on `ok === false` (the field is only meaningful when `ok === true`).
+ * - `error` is present only when `ok === false`:
+ *   - `"hosts-unreadable"` — `/etc/hosts` itself could not be read.
+ *   - `"markers-mismatch"` — the managed-section markers are corrupt (unpaired
+ *     or duplicated, or end-before-begin). Refused before any comparison so a
+ *     corrupt hosts is never silently treated as an in-sync empty body.
+ *
+ * Declared as a `type` alias (not an interface) for codegen compatibility, same
+ * as `WriteResult`. Codegen maps a sync object return type to an `NSDictionary *`
+ * TurboModule method (see NativeShellRunner.mm's `readHostsSection`). `section`
+ * is `string[] | null`: the native side returns an `NSArray` of `NSString`s for
+ * the present case and `NSNull()` for the absent case (bridging `null` over JSI).
+ */
+export type ReadSectionResult = {
+  ok: boolean;
+  section?: string[] | null;
+  error?: string;
+};
+
 export interface Spec extends TurboModule {
   /**
    * Rewrites the managed `# BEGIN FROSTHALT` ... `# END FROSTHALT` section of
@@ -86,6 +125,39 @@ export interface Spec extends TurboModule {
    * -> unblocks all. Resolves `{ ok: true }`.
    */
   writeHosts(lines: string[]): Promise<WriteResult>;
+
+  /**
+   * Reads the managed `# BEGIN FROSTHALT` ... `# END FROSTHALT` section of
+   * `/etc/hosts` UNPRIVILEGED + SYNCHRONOUSLY (Story 1.7).
+   *
+   * `/etc/hosts` is world-readable (`0644`), so this needs NO `osascript`
+   * elevation — it is a plain `String(contentsOfFile: "/etc/hosts")` read on
+   * the calling JSI thread, exactly mirroring `ConfigStore.readConfig`'s sync
+   * read pattern (a tiny file, microseconds). No `backgroundQueue`.
+   *
+   * Extraction reuses the same unprivileged read + the same marker regexes that
+   * the privileged `writeHosts` pre-scan uses (`ShellRunner.swift`'s
+   * `markerCounts` + `beginMarkerRegex`/`endMarkerRegex`) — the marker format's
+   * single source of truth stays native. The JS side NEVER parses markers: this
+   * method returns the body lines (between the markers) opaquely, and the JS
+   * `computeDrift` comparator does array equality.
+   *
+   * Returns a `ReadSectionResult` synchronously (codegen maps a sync object
+   * return to an `NSDictionary *` method, not a resolve/reject-block async
+   * method):
+   *   - `{ ok: true, section: [...lines] }`  markers found, body captured
+   *     (excluding the marker lines, in file order)
+   *   - `{ ok: true, section: null }`        no markers (managed section absent)
+   *   - `{ ok: false, error: "hosts-unreadable" }` /etc/hosts itself unreadable
+   *   - `{ ok: false, error: "markers-mismatch" }` markers corrupt (unpaired /
+   *     duplicated / end-before-begin) — refused before any comparison so a
+   *     corrupt hosts is never silently treated as an in-sync empty body
+   *
+   * The marker-mismatch contract is identical to `writeHosts`'s pre-scan: the
+   * only accepted states are zero markers (absent) or exactly one clean pair;
+   * everything else is `markers-mismatch`.
+   */
+  readHostsSection(): ReadSectionResult;
 }
 
 /**

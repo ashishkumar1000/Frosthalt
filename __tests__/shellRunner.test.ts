@@ -27,6 +27,7 @@
 jest.mock('../src/native/specs/NativeShellRunnerSpec', () => {
   const mock = {
     writeHosts: jest.fn(),
+    readHostsSection: jest.fn(),
   };
   return {
     __esModule: true,
@@ -34,19 +35,21 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => {
   };
 });
 
-import { writeHosts } from '../src/hosts/shellRunner';
+import { writeHosts, readHostsSection } from '../src/hosts/shellRunner';
 
 // The mock's default export is the native module handle. Cast through
 // `unknown` because the real default is typed as the codegen `Spec` (which a
 // jest.fn() does not structurally satisfy), and we need to drive it per test.
 type NativeMock = {
   writeHosts: jest.Mock;
+  readHostsSection: jest.Mock;
 };
 const native = require('../src/native/specs/NativeShellRunnerSpec')
   .default as unknown as NativeMock;
 
 beforeEach(() => {
   native.writeHosts.mockReset();
+  native.readHostsSection.mockReset();
 });
 
 // ---------------------------------------------------------------------------
@@ -244,8 +247,146 @@ test('writeHosts coerces an envelope with a non-boolean ok to { ok:false, error:
 // Compile-time check that the port's return type is the WriteResult envelope.
 // If the port ever stopped returning `Promise<WriteResult>`, this line would be
 // a compile error — pinning the contract at the type level.
-import type { WriteResult } from '../src/hosts/shellRunner';
+import type { WriteResult, ReadSectionResult } from '../src/hosts/shellRunner';
 const _writeHostsReturnsWriteResult = (
   r: Promise<WriteResult>,
 ): WriteResult | Promise<WriteResult> => r;
 void _writeHostsReturnsWriteResult;
+
+// ---------------------------------------------------------------------------
+// Story 1.7 — readHostsSection (the unprivileged, sync read port).
+//
+// Mirrors the writeHosts tests above: the port is a thin SYNC pass-through, so
+// these assert (1) it forwards nothing (no args) and (2) the native
+// `ReadSectionResult` envelope is returned unchanged. The shape-guard tests
+// mirror writeHosts's `bad-envelope` coercion, extended for the `section` field
+// (null | string[] when ok:true).
+// ---------------------------------------------------------------------------
+
+test('readHostsSection returns the native envelope verbatim when markers are found (ok:true, section:[lines])', () => {
+  const section = [
+    '0.0.0.0 example.com',
+    ':: example.com',
+    '0.0.0.0 www.example.com',
+    ':: www.example.com',
+  ];
+  native.readHostsSection.mockReturnValue({ ok: true, section });
+
+  const result = readHostsSection();
+
+  expect(result).toStrictEqual({ ok: true, section });
+  expect(native.readHostsSection).toHaveBeenCalledTimes(1);
+});
+
+test('readHostsSection forwards the absent case (ok:true, section:null) verbatim', () => {
+  // The native side returns NSNull() for an absent section, which bridges to
+  // JS null. The port must pass it through (distinct from an empty body array).
+  native.readHostsSection.mockReturnValue({ ok: true, section: null });
+
+  const result = readHostsSection();
+
+  expect(result).toStrictEqual({ ok: true, section: null });
+});
+
+test('readHostsSection forwards an empty body (ok:true, section:[]) verbatim — present but empty section', () => {
+  // Markers found, zero lines between them. Distinct from absent (null): an
+  // empty body is a present section enforcing nothing.
+  native.readHostsSection.mockReturnValue({ ok: true, section: [] });
+
+  const result = readHostsSection();
+
+  expect(result).toStrictEqual({ ok: true, section: [] });
+});
+
+test('readHostsSection surfaces { ok:false, error:"hosts-unreadable" } verbatim', () => {
+  native.readHostsSection.mockReturnValue({ ok: false, error: 'hosts-unreadable' });
+
+  const result = readHostsSection();
+
+  expect(result).toStrictEqual({ ok: false, error: 'hosts-unreadable' });
+});
+
+test('readHostsSection surfaces { ok:false, error:"markers-mismatch" } verbatim', () => {
+  native.readHostsSection.mockReturnValue({ ok: false, error: 'markers-mismatch' });
+
+  const result = readHostsSection();
+
+  expect(result).toStrictEqual({ ok: false, error: 'markers-mismatch' });
+});
+
+test('readHostsSection returns { ok:false, error } instead of throwing when the native call throws', () => {
+  // The native contract is "never throw" — a throw is a wiring/JSI failure. The
+  // port catches it and reports { ok:false, error } (parallel to readConfig).
+  native.readHostsSection.mockImplementation(() => {
+    throw new Error('jsi bridge gone');
+  });
+
+  const result = readHostsSection();
+
+  expect(result.ok).toBe(false);
+  expect(typeof result.error).toBe('string');
+  expect(result.error).toContain('jsi bridge gone');
+});
+
+// ---------------------------------------------------------------------------
+// Envelope integrity for readHostsSection — mirrors writeHosts's bad-envelope
+// coercion, extended for the `section` field (null | string[] when ok:true).
+// ---------------------------------------------------------------------------
+
+test('readHostsSection coerces a null native return to { ok:false, error:"bad-envelope" }', () => {
+  native.readHostsSection.mockReturnValue(null);
+  expect(readHostsSection()).toStrictEqual({ ok: false, error: 'bad-envelope' });
+});
+
+test('readHostsSection coerces an undefined native return to { ok:false, error:"bad-envelope" }', () => {
+  native.readHostsSection.mockReturnValue(undefined);
+  expect(readHostsSection()).toStrictEqual({ ok: false, error: 'bad-envelope' });
+});
+
+test('readHostsSection coerces a non-envelope native return (string) to { ok:false, error:"bad-envelope" }', () => {
+  native.readHostsSection.mockReturnValue('not-an-envelope');
+  expect(readHostsSection()).toStrictEqual({ ok: false, error: 'bad-envelope' });
+});
+
+test('readHostsSection coerces an envelope with a non-boolean ok to { ok:false, error:"bad-envelope" }', () => {
+  native.readHostsSection.mockReturnValue({ ok: 'true' });
+  expect(readHostsSection()).toStrictEqual({ ok: false, error: 'bad-envelope' });
+});
+
+test('readHostsSection coerces ok:true with a non-array, non-null section to { ok:false, error:"bad-envelope" }', () => {
+  // A `section` that is neither null nor an array (e.g. a stray string) would
+  // crash the comparator's array equality — guard it.
+  native.readHostsSection.mockReturnValue({ ok: true, section: '0.0.0.0 x' });
+  expect(readHostsSection()).toStrictEqual({ ok: false, error: 'bad-envelope' });
+});
+
+test('readHostsSection coerces ok:true with an undefined section to { ok:false, error:"bad-envelope" }', () => {
+  // `undefined` is neither null (absent) nor a string[] (present body) — per the
+  // guard contract ("section is null-or-string-array when ok:true") it is a
+  // malformed envelope, coerced to bad-envelope rather than forwarded and
+  // silently treated as absent by the comparator.
+  native.readHostsSection.mockReturnValue({ ok: true });
+  // Note: a JS object literal `{ ok: true }` has no `section` key, so reading
+  // `.section` yields undefined — same shape as an explicit `section: undefined`.
+  expect(readHostsSection()).toStrictEqual({ ok: false, error: 'bad-envelope' });
+});
+
+test('readHostsSection coerces ok:true with a non-string array element to { ok:false, error:"bad-envelope" }', () => {
+  // A number/null element inside `section` is not a usable hosts line — guard
+  // it so the comparator's `body[i] !== expected[i]` never compares a non-string.
+  native.readHostsSection.mockReturnValue({ ok: true, section: ['0.0.0.0 x', 42] });
+  expect(readHostsSection()).toStrictEqual({ ok: false, error: 'bad-envelope' });
+});
+
+test('readHostsSection does NOT coerce an ok:false envelope with a stray section field', () => {
+  // On ok:false the `section` field is meaningless; the port must not validate
+  // it (the native side may omit it). The error is forwarded verbatim.
+  native.readHostsSection.mockReturnValue({ ok: false, error: 'markers-mismatch' });
+  expect(readHostsSection()).toStrictEqual({ ok: false, error: 'markers-mismatch' });
+});
+
+// Compile-time pin that readHostsSection returns the ReadSectionResult envelope.
+const _readHostsSectionReturnsReadSectionResult = (
+  r: ReadSectionResult,
+): ReadSectionResult => r;
+void _readHostsSectionReturnsReadSectionResult;

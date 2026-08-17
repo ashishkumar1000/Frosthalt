@@ -30,6 +30,7 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
   __esModule: true,
   default: {
     writeHosts: jest.fn(),
+    readHostsSection: jest.fn(),
   },
 }));
 
@@ -38,7 +39,7 @@ import { DEFAULT_CONFIG } from '../src/config/types';
 import type { WriteResult } from '../src/hosts/shellRunner';
 
 type NativeConfigMock = { readConfig: jest.Mock; writeConfig: jest.Mock };
-type NativeShellMock = { writeHosts: jest.Mock };
+type NativeShellMock = { writeHosts: jest.Mock; readHostsSection: jest.Mock };
 const configNative = require('../src/native/specs/NativeConfigStoreSpec')
   .default as unknown as NativeConfigMock;
 const shellNative = require('../src/native/specs/NativeShellRunnerSpec')
@@ -55,6 +56,7 @@ beforeEach(() => {
   configNative.readConfig.mockReset();
   configNative.writeConfig.mockReset();
   shellNative.writeHosts.mockReset();
+  shellNative.readHostsSection.mockReset();
   // Sensible defaults: a successful config write + hosts write. NOTE: the
   // store calls `readConfig()` exactly once, at module-eval time (before any
   // `beforeEach` runs), so it already saw the native mock's default `undefined`
@@ -66,12 +68,13 @@ beforeEach(() => {
 
   // Reset store state to a clean baseline. The module-private `runChain` is
   // always settled between tests (each test awaits its applies), so only the
-  // store STATE needs resetting.
+  // store STATE needs resetting. `drift` is reset to null (unchecked).
   useDomainStore.setState({
     committed: DEFAULT_CONFIG,
     staged: null,
     applyStatus: 'idle',
     lastResult: null,
+    drift: null,
   });
 });
 
@@ -415,3 +418,306 @@ const _applyReturnsWriteResult = (
   r: Promise<WriteResult>,
 ): WriteResult | Promise<WriteResult> => r;
 void _applyReturnsWriteResult;
+
+// ===========================================================================
+// Story 1.7 — checkDrift + restoreSection
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// checkDrift (sync): readHostsSection -> computeDrift -> set drift -> return
+// ---------------------------------------------------------------------------
+
+test('checkDrift reads the section, computes drift, sets state, and returns the result', () => {
+  // Seed committed with one alwaysOn domain so the expected lines are GOLDEN.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+  });
+  shellNative.readHostsSection.mockReturnValue({
+    ok: true,
+    section: [
+      '0.0.0.0 example.com',
+      ':: example.com',
+      '0.0.0.0 www.example.com',
+      ':: www.example.com',
+    ],
+  });
+
+  const result = useDomainStore.getState().checkDrift();
+
+  expect(shellNative.readHostsSection).toHaveBeenCalledTimes(1);
+  expect(result).toStrictEqual({ drift: false, reason: 'in-sync' });
+  expect(useDomainStore.getState().drift).toStrictEqual({
+    drift: false,
+    reason: 'in-sync',
+  });
+});
+
+test('checkDrift reports missing when the section is absent but committed has alwaysOn domains', () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+  });
+  shellNative.readHostsSection.mockReturnValue({ ok: true, section: null });
+
+  const result = useDomainStore.getState().checkDrift();
+
+  expect(result).toStrictEqual({ drift: true, reason: 'missing' });
+  expect(useDomainStore.getState().drift).toStrictEqual({
+    drift: true,
+    reason: 'missing',
+  });
+});
+
+test('checkDrift reports corrupt when readHostsSection returns ok:false', () => {
+  shellNative.readHostsSection.mockReturnValue({
+    ok: false,
+    error: 'markers-mismatch',
+  });
+
+  const result = useDomainStore.getState().checkDrift();
+
+  expect(result).toStrictEqual({ drift: true, reason: 'corrupt' });
+  expect(useDomainStore.getState().drift).toStrictEqual({
+    drift: true,
+    reason: 'corrupt',
+  });
+});
+
+test('checkDrift reports in-sync for empty committed + absent section', () => {
+  shellNative.readHostsSection.mockReturnValue({ ok: true, section: null });
+
+  const result = useDomainStore.getState().checkDrift();
+
+  expect(result).toStrictEqual({ drift: false, reason: 'in-sync' });
+  expect(useDomainStore.getState().drift).toStrictEqual({
+    drift: false,
+    reason: 'in-sync',
+  });
+});
+
+// ---------------------------------------------------------------------------
+// restoreSection (async): enqueue writeHosts(effectiveHostsLines(committed))
+// via the shared serialized queue; one admin prompt; on success re-check
+// drift -> in-sync; on denied drift remains.
+// ---------------------------------------------------------------------------
+
+test('restoreSection enqueues writeHosts with effectiveHostsLines(committed) and returns the envelope', async () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    drift: { drift: true, reason: 'missing' },
+  });
+  // The Restore write succeeds; the post-write re-check reads the now-correct
+  // section -> in-sync.
+  shellNative.writeHosts.mockResolvedValue({ ok: true });
+  shellNative.readHostsSection.mockReturnValue({
+    ok: true,
+    section: [
+      '0.0.0.0 example.com',
+      ':: example.com',
+      '0.0.0.0 www.example.com',
+      ':: www.example.com',
+    ],
+  });
+
+  const result = await useDomainStore.getState().restoreSection();
+
+  expect(result).toStrictEqual({ ok: true });
+  // writeHosts received the golden 4-line payload derived from committed.
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts.mock.calls[0][0]).toStrictEqual([
+    '0.0.0.0 example.com',
+    ':: example.com',
+    '0.0.0.0 www.example.com',
+    ':: www.example.com',
+  ]);
+  // No config write — Restore writes HOSTS only (config.json is canonical).
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  // Drift is re-checked after the successful write -> in-sync.
+  expect(shellNative.readHostsSection).toHaveBeenCalledTimes(1);
+  expect(useDomainStore.getState().drift).toStrictEqual({
+    drift: false,
+    reason: 'in-sync',
+  });
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().lastResult).toStrictEqual({ ok: true });
+});
+
+test('restoreSection does NOT write config (Restore writes HOSTS only)', async () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+  });
+  shellNative.writeHosts.mockResolvedValue({ ok: true });
+  shellNative.readHostsSection.mockReturnValue({ ok: true, section: null });
+
+  await useDomainStore.getState().restoreSection();
+
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+});
+
+test('restoreSection admin-denied: { ok:false, error:"admin-denied" }, drift remains, /etc/hosts unchanged', async () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+    drift: { drift: true, reason: 'missing' },
+  });
+  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+
+  const result = await useDomainStore.getState().restoreSection();
+
+  expect(result).toStrictEqual({ ok: false, error: 'admin-denied' });
+  // Drift is NOT re-checked on denial (no second readHostsSection call); the
+  // drift state remains as it was. The warning stays (no auto-re-add).
+  expect(shellNative.readHostsSection).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().drift).toStrictEqual({
+    drift: true,
+    reason: 'missing',
+  });
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().lastResult).toStrictEqual({
+    ok: false,
+    error: 'admin-denied',
+  });
+});
+
+test('restoreSection with empty committed writes the markers-only section (effectiveHostsLines([]) === [])', async () => {
+  // Empty committed -> effectiveHostsLines = [] -> writeHosts([]) writes the
+  // markers with no domain lines (unblocks all). A legitimate "Restore" when
+  // there is nothing to enforce clears a stray managed section.
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+  shellNative.writeHosts.mockResolvedValue({ ok: true });
+  shellNative.readHostsSection.mockReturnValue({ ok: true, section: [] });
+
+  const result = await useDomainStore.getState().restoreSection();
+
+  expect(result).toStrictEqual({ ok: true });
+  expect(shellNative.writeHosts.mock.calls[0][0]).toStrictEqual([]);
+  // Empty committed + empty section -> in-sync.
+  expect(useDomainStore.getState().drift).toStrictEqual({
+    drift: false,
+    reason: 'in-sync',
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Serialization: Restore queues behind an in-flight Apply (shared queue), one
+// prompt at a time — never two writeHosts calls concurrent.
+// ---------------------------------------------------------------------------
+
+test('restoreSection queues behind an in-flight Apply via the shared serialized queue', async () => {
+  // NOTE: do NOT pre-seed committed with `example.com` — if committed already
+  // holds the domain, `stageDomainAdd('example.com')` is a no-op (staged stays
+  // null) and `apply()` short-circuits to `{ ok: true }` without enqueuing, so
+  // the Apply never hits the shared queue and the test would only exercise the
+  // Restore. Leaving committed at DEFAULT_CONFIG (empty) makes staging a real
+  // draft, so apply() enqueues a genuine run that the Restore must queue behind.
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+
+  let writeHostsCalls = 0;
+  let resolveFirst: ((v: WriteResult) => void) | null = null;
+  const inflight = { current: false };
+  let overlapDetected = false;
+
+  shellNative.writeHosts.mockImplementation(() => {
+    writeHostsCalls += 1;
+    if (writeHostsCalls === 1) {
+      // The Apply run: never resolves until the test releases it, so the
+      // queued Restore cannot start until the Apply settles.
+      inflight.current = true;
+      return new Promise<WriteResult>((res) => {
+        resolveFirst = res;
+      }).then((v) => {
+        inflight.current = false;
+        return v;
+      });
+    }
+    // The Restore run: the Apply MUST already have settled (inflight false). If
+    // it has not, the runs overlapped.
+    if (inflight.current) {
+      overlapDetected = true;
+    }
+    return Promise.resolve({ ok: true } as WriteResult);
+  });
+
+  // Start an Apply (staged so it is a real run), then immediately call Restore.
+  // Both hit the shared queue; Restore must wait for Apply to settle.
+  useDomainStore.getState().stageDomainAdd('example.com');
+  const applyP = useDomainStore.getState().apply();
+  const restoreP = useDomainStore.getState().restoreSection();
+
+  // Let the Apply run start (microtask): it reaches `await writeHosts` and
+  // suspends. The Restore is queued behind it and must NOT have started.
+  await flushMicrotasks();
+  expect(writeHostsCalls).toBe(1);
+  expect(inflight.current).toBe(true);
+
+  // Release the Apply; the Restore starts only AFTER it settles.
+  // Seed the post-Restore re-check read so the Restore's computeDrift sees the
+  // golden section (the Apply committed example.com, so committed is now
+  // [{example.com,alwaysOn:true}] and the Restore must write the golden 4 lines
+  // against that run-time committed — NOT empty [] from a stale call-time
+  // snapshot).
+  shellNative.readHostsSection.mockReturnValue({
+    ok: true,
+    section: [
+      '0.0.0.0 example.com',
+      ':: example.com',
+      '0.0.0.0 www.example.com',
+      ':: www.example.com',
+    ],
+  });
+  resolveFirst!({ ok: true });
+  const [applyRes, restoreRes] = await Promise.all([applyP, restoreP]);
+
+  expect(writeHostsCalls).toBe(2);
+  expect(overlapDetected).toBe(false);
+  expect(applyRes).toStrictEqual({ ok: true });
+  expect(restoreRes).toStrictEqual({ ok: true });
+  // The Restore must have written the golden 4 lines derived from the
+  // run-time committed (now example.com), NOT [] from a stale call-time
+  // DEFAULT_CONFIG snapshot. With the OLD call-time-snapshot code this would
+  // be `[]` and the test would fail here.
+  expect(shellNative.writeHosts.mock.calls[1][0]).toStrictEqual([
+    '0.0.0.0 example.com',
+    ':: example.com',
+    '0.0.0.0 www.example.com',
+    ':: www.example.com',
+  ]);
+  // The post-Restore re-check clears drift to in-sync.
+  expect(useDomainStore.getState().drift).toStrictEqual({
+    drift: false,
+    reason: 'in-sync',
+  });
+});
+
+test('restoreSection never rejects when writeHosts throws — the port catches it into an envelope', async () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    },
+  });
+  shellNative.writeHosts.mockRejectedValue(new Error('port died'));
+
+  const result = await useDomainStore.getState().restoreSection();
+
+  // The shellRunner port caught the rejection and surfaced its message; the
+  // store resolves to the envelope (never rejects). Drift is not re-checked on
+  // failure (no readHostsSection call).
+  expect(result).toStrictEqual({ ok: false, error: 'port died' });
+  expect(shellNative.readHostsSection).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
