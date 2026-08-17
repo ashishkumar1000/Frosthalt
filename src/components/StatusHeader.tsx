@@ -29,13 +29,27 @@
  */
 
 import React, { useEffect, useRef } from 'react';
-import { AccessibilityInfo, StyleSheet, Text, View } from 'react-native';
+import {
+  AccessibilityInfo,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { tokens } from '../theme/tokens';
 import { StatusBadge } from './StatusBadge';
 import { useDomainStore } from '../domain/store';
 import { effectiveBlocklist } from '../domain/effectiveBlocklist';
 
-export function StatusHeader(): React.ReactElement {
+export interface StatusHeaderProps {
+  /**
+   * Called when the user clicks the "View hosts" link — opens the read-only
+   * hosts viewer overlay (Story 2.6). The Shell owns the `viewerOpen` state.
+   */
+  onViewHosts: () => void;
+}
+
+export function StatusHeader({ onViewHosts }: StatusHeaderProps): React.ReactElement {
   const committed = useDomainStore((s) => s.committed);
   const count = effectiveBlocklist(committed).length;
   const countLabel = `${count} ${count === 1 ? 'domain' : 'domains'}`;
@@ -64,6 +78,14 @@ export function StatusHeader(): React.ReactElement {
       <Text style={styles.count}>{countLabel}</Text>
       <Text style={styles.separator}>·</Text>
       <Text style={styles.text}>no active timer</Text>
+      <Text style={styles.separator}>·</Text>
+      <Pressable
+        onPress={onViewHosts}
+        accessibilityRole="button"
+        accessibilityLabel="View hosts"
+      >
+        <Text style={styles.link}>View hosts</Text>
+      </Pressable>
     </View>
   );
 }
@@ -91,5 +113,9 @@ const styles = StyleSheet.create({
   },
   separator: {
     ...tokens.typography.label,
+  },
+  link: {
+    ...tokens.typography.label,
+    color: tokens.primary,
   },
 });

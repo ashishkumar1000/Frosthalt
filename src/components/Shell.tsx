@@ -29,14 +29,16 @@ import { Sidebar } from './Sidebar';
 import { StatusHeader } from './StatusHeader';
 import { SurfacePlaceholder, SURFACE_NAMES, type SurfaceIndex } from './surfaces';
 import { Blocklist } from './Blocklist';
+import { HostsViewer } from './HostsViewer';
 import { useDomainStore } from '../domain/store';
 import { effectiveBlocklist } from '../domain/effectiveBlocklist';
 
 /**
  * ⌘1-⌘4 select the four surfaces; ⌘N focuses the add-domain field (Story 2.2);
  * bare Return / Enter fire Apply on the Blocklist surface when the add field is
- * blurred and there is a staged draft (Story 2.3). Keys outside this set are
- * ignored (the native default applies).
+ * blurred and there is a staged draft (Story 2.3); bare Escape closes the
+ * read-only hosts viewer overlay when it is open (Story 2.6). Keys outside this
+ * set are ignored (the native default applies).
  */
 const KEY_DOWN_EVENTS: HandledKeyEvent[] = [
   { key: '1', metaKey: true },
@@ -46,6 +48,7 @@ const KEY_DOWN_EVENTS: HandledKeyEvent[] = [
   { key: 'n', metaKey: true },
   { key: 'Return' },
   { key: 'Enter' },
+  { key: 'Escape' },
 ];
 
 export function Shell(): React.ReactElement {
@@ -67,6 +70,14 @@ export function Shell(): React.ReactElement {
   // fall through to Apply. Deterministic + unit-testable — no reliance on
   // uncertain Return bubble semantics.
   const [addFieldFocused, setAddFieldFocused] = useState(false);
+  // Whether the read-only hosts viewer overlay (Story 2.6) is open. The viewer
+  // is an OVERLAY, not a 5th sidebar surface — `SurfaceIndex`/`SURFACE_NAMES`
+  // stay a fixed 4-tuple. Shell owns this boolean; Esc and the viewer's Close
+  // button call `setViewerOpen(false)`, the StatusHeader "View hosts" link calls
+  // `setViewerOpen(true)`. While open, bare Return must NOT fire Apply (the
+  // viewer is a window-level inert surface, mirroring how the native alert
+  // inert-ifies the Shell's Return gate).
+  const [viewerOpen, setViewerOpen] = useState(false);
   // The staged draft + apply action, read here so the Return -> Apply branch
   // can fire `apply()` iff `staged != null`. Blocklist also reads these; both
   // may read the same store.
@@ -113,6 +124,16 @@ export function Shell(): React.ReactElement {
 
   const onKeyDown = (event: { nativeEvent: NativeKeyEvent }) => {
     const { metaKey, key } = event.nativeEvent;
+    // Bare Escape closes the read-only hosts viewer overlay (Story 2.6). Placed
+    // BEFORE the Return -> Apply branch so that while the viewer is open Return
+    // is never even considered for Apply (the viewer is a window-level inert
+    // surface). No ⌘Esc (bare Escape only), matching the macOS overlay dismiss
+    // contract. The `KEY_DOWN_EVENTS` declaration above marks Escape as handled
+    // so the native default does not swallow it.
+    if (!metaKey && key === 'Escape' && viewerOpen) {
+      setViewerOpen(false);
+      return;
+    }
     // ⌘N focuses the add-domain field (context-aware — only the Blocklist
     // surface renders the field, but the ref is always attached and a no-op
     // focus when the surface is absent is harmless). No announce + no
@@ -129,7 +150,12 @@ export function Shell(): React.ReactElement {
     // on uncertain Return bubble semantics. No ⌘Return (bare Return only,
     // matching the macOS default-button contract). Placed before the ⌘1-⌘4
     // branch because this is a bare-key (no metaKey) path.
-    if (!metaKey && (key === 'Return' || key === 'Enter') && surface === 0 && !addFieldFocused && staged != null) {
+    //
+    // Story 2.6: gated with `!viewerOpen` so bare Return does NOT fire Apply
+    // while the read-only hosts viewer overlay is open (the overlay is a
+    // window-level inert surface, mirroring how the native alert inert-ifies
+    // the Shell's Return gate).
+    if (!metaKey && (key === 'Return' || key === 'Enter') && surface === 0 && !addFieldFocused && staged != null && !viewerOpen) {
       void apply();
       return;
     }
@@ -155,7 +181,7 @@ export function Shell(): React.ReactElement {
         },
       ]}
     >
-      <StatusHeader />
+      <StatusHeader onViewHosts={() => setViewerOpen(true)} />
       <View style={styles.body}>
         <Sidebar
           selectedIndex={surface}
@@ -171,6 +197,9 @@ export function Shell(): React.ReactElement {
           <SurfacePlaceholder surface={surface} />
         )}
       </View>
+      {viewerOpen ? (
+        <HostsViewer onClose={() => setViewerOpen(false)} />
+      ) : null}
     </View>
   );
 }

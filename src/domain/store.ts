@@ -78,6 +78,17 @@ export interface DomainState {
    * (unchecked). Set by `checkDrift` (and re-set on a successful Restore).
    */
   drift: DriftResult | null;
+  /**
+   * The verbatim on-disk managed-section body lines (`readHostsSection`'s
+   * `section`) captured the last time `checkDrift` ran (and on a successful
+   * Restore's post-write re-check). `null` when the section was absent OR drift
+   * has not been checked yet. The read-only hosts viewer (Story 2.6) renders
+   * THIS — the actual on-disk section — NOT `effectiveHostsLines(committed)`
+   * (the intended/expected set), so drift is visible rather than hidden. No new
+   * port call: `checkDrift`/`restoreSection` already read the section; this
+   * field simply preserves what they fetched instead of discarding it.
+   */
+  lastReadSection: string[] | null;
   stageDomainAdd: (raw: string) => WriteResult;
   /**
    * Flip `alwaysOn` for the domain with the given hostname in the staged draft
@@ -129,6 +140,7 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
   applyStatus: 'idle',
   lastResult: null,
   drift: null,
+  lastReadSection: null,
 
   stageDomainAdd: (raw) => {
     const apex = normaliseDomain(raw);
@@ -282,7 +294,12 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     // native throw into a `{ok:false,error}` envelope), so this never throws.
     const read = readHostsSection();
     const result = computeDrift(get().committed, read);
-    set({ drift: result });
+    // Preserve the verbatim on-disk body lines for the read-only viewer (Story
+    // 2.6). `read.section` is `null` when the section is absent OR `ok:false`
+    // (corrupt); in both cases `null` is the right value for the viewer's
+    // empty-state. This adds no new port call — `readHostsSection` was already
+    // invoked above; this just keeps what it returned instead of discarding it.
+    set({ drift: result, lastReadSection: read.section ?? null });
     return result;
   },
 
@@ -306,10 +323,17 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
       const result = await writeHosts(lines);
       if (result.ok) {
         // Success: re-check drift -> should be in-sync. The read + compare are
-        // sync, so the drift state is updated before the promise resolves.
+        // sync, so the drift state is updated before the promise resolves. The
+        // verbatim section is preserved into `lastReadSection` so the viewer
+        // (Story 2.6) re-renders with the freshly-written on-disk body.
         const read = readHostsSection();
         const drift = computeDrift(committed, read);
-        set({ applyStatus: 'idle', lastResult: result, drift });
+        set({
+          applyStatus: 'idle',
+          lastResult: result,
+          drift,
+          lastReadSection: read.section ?? null,
+        });
       } else {
         // Denied (or hard OS error): /etc/hosts unchanged, drift remains. The
         // warning stays; no auto-re-add loop (spec: Never). `lastResult` is set

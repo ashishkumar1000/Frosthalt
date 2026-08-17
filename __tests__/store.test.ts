@@ -69,13 +69,16 @@ beforeEach(() => {
 
   // Reset store state to a clean baseline. The module-private `runChain` is
   // always settled between tests (each test awaits its applies), so only the
-  // store STATE needs resetting. `drift` is reset to null (unchecked).
+  // store STATE needs resetting. `drift` is reset to null (unchecked);
+  // `lastReadSection` is reset to null (Story 2.6 — the viewer's verbatim body
+  // source).
   useDomainStore.setState({
     committed: DEFAULT_CONFIG,
     staged: null,
     applyStatus: 'idle',
     lastResult: null,
     drift: null,
+    lastReadSection: null,
   });
 });
 
@@ -959,6 +962,15 @@ test('checkDrift reads the section, computes drift, sets state, and returns the 
     drift: false,
     reason: 'in-sync',
   });
+  // Story 2.6 — the verbatim on-disk body lines are preserved into
+  // `lastReadSection` so the read-only viewer renders the actual section, not
+  // the expected/computed set.
+  expect(useDomainStore.getState().lastReadSection).toStrictEqual([
+    '0.0.0.0 example.com',
+    ':: example.com',
+    '0.0.0.0 www.example.com',
+    ':: www.example.com',
+  ]);
 });
 
 test('checkDrift reports missing when the section is absent but committed has alwaysOn domains', () => {
@@ -977,6 +989,9 @@ test('checkDrift reports missing when the section is absent but committed has al
     drift: true,
     reason: 'missing',
   });
+  // Story 2.6 — absent section -> lastReadSection null (the viewer's
+  // empty-state).
+  expect(useDomainStore.getState().lastReadSection).toBeNull();
 });
 
 test('checkDrift reports corrupt when readHostsSection returns ok:false', () => {
@@ -992,6 +1007,9 @@ test('checkDrift reports corrupt when readHostsSection returns ok:false', () => 
     drift: true,
     reason: 'corrupt',
   });
+  // Story 2.6 — corrupt read (ok:false) -> lastReadSection null (the section
+  // body is unparseable; the viewer shows the corrupt banner + empty body).
+  expect(useDomainStore.getState().lastReadSection).toBeNull();
 });
 
 test('checkDrift reports in-sync for empty committed + absent section', () => {
@@ -1004,6 +1022,8 @@ test('checkDrift reports in-sync for empty committed + absent section', () => {
     drift: false,
     reason: 'in-sync',
   });
+  // Story 2.6 — absent section -> lastReadSection null.
+  expect(useDomainStore.getState().lastReadSection).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1072,15 @@ test('restoreSection enqueues writeHosts with effectiveHostsLines(committed) and
     drift: false,
     reason: 'in-sync',
   });
+  // Story 2.6 — the post-write re-check preserves the freshly-written on-disk
+  // body into `lastReadSection` so the viewer re-renders with the restored
+  // lines (and the banner clears).
+  expect(useDomainStore.getState().lastReadSection).toStrictEqual([
+    '0.0.0.0 example.com',
+    ':: example.com',
+    '0.0.0.0 www.example.com',
+    ':: www.example.com',
+  ]);
   expect(useDomainStore.getState().applyStatus).toBe('idle');
   expect(useDomainStore.getState().lastResult).toStrictEqual({ ok: true });
 });
@@ -1092,6 +1121,10 @@ test('restoreSection admin-denied: { ok:false, error:"admin-denied" }, drift rem
     drift: true,
     reason: 'missing',
   });
+  // Story 2.6 — on denial `lastReadSection` is NOT updated (the success branch
+  // is the only place Restore sets it). It stays at its pre-call value (null
+  // here, the clean baseline). The viewer keeps showing whatever it had.
+  expect(useDomainStore.getState().lastReadSection).toBeNull();
   expect(useDomainStore.getState().applyStatus).toBe('idle');
   expect(useDomainStore.getState().lastResult).toStrictEqual({
     ok: false,

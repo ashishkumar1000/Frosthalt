@@ -764,6 +764,7 @@ test('the count dedupes always-on domains that normalise to the same apex (effec
 // the native default does not swallow them) and is focusable (so the bubbled
 // key events reach the handler from the focused row). ⌘N (focus the add field,
 // Story 2.2) was added to the handled set so Return-in-field works after ⌘N.
+// Story 2.6 added bare Escape (closes the hosts viewer overlay).
 test('the shell root is focusable and declares ⌘1-⌘4 + ⌘N as handled key events', async () => {
   const testRenderer = renderShell();
   const container = findKeyDownContainer(testRenderer.root);
@@ -778,6 +779,8 @@ test('the shell root is focusable and declares ⌘1-⌘4 + ⌘N as handled key e
     // field is blurred and a staged draft exists.
     { key: 'Return' },
     { key: 'Enter' },
+    // Story 2.6 — bare Escape closes the read-only hosts viewer overlay.
+    { key: 'Escape' },
   ]);
 });
 
@@ -923,6 +926,12 @@ function seedForReturn(overrides: {
       staged: overrides.staged ?? null,
       applyStatus: 'idle',
       lastResult: null,
+      // Story 2.6 — reset the drift/lastReadSection fields too, so a prior
+      // test that seeded non-null drift (e.g. a viewer test) cannot leak into a
+      // Return -> Apply test. Currently masked (the viewer's mount checkDrift
+      // overwrites both), but reset here for test-isolation hygiene.
+      drift: null,
+      lastReadSection: null,
       // Always restore the real action so a previous test's mock cannot leak.
       apply: REAL_APPLY,
     });
@@ -1186,6 +1195,129 @@ test('after focus -> navigate-away -> navigate-back, bare Return fires apply() (
   });
 
   expect(applyMock).toHaveBeenCalledTimes(1);
+});
+
+// ===========================================================================
+// Story 2.6 — read-only hosts viewer overlay: "View hosts" link in the status
+// header opens the viewer; Escape (declared in KEY_DOWN_EVENTS) closes it; bare
+// Return is inert while the viewer is open (the overlay is a window-level inert
+// surface, mirroring how the native alert inert-ifies the Shell's Return gate).
+// The viewer is an OVERLAY, not a 5th sidebar surface — `SURFACE_NAMES` stays a
+// fixed 4-tuple.
+// ===========================================================================
+
+// The mocked native ShellRunner spec — `readHostsSection` is auto-mocked as a
+// `jest.fn` (returns undefined by default). When the HostsViewer mounts it
+// calls `checkDrift()` which calls `readHostsSection()`; an `undefined` return
+// is handled safely by `computeDrift` (`!read.ok` -> corrupt) so the viewer
+// shows the corrupt banner. For the open/close wiring tests we do not care
+// which banner shows — only that the viewer title appears and Escape closes it.
+const shellNativeForViewer = require('../src/native/specs/NativeShellRunnerSpec')
+  .default as unknown as { readHostsSection: jest.Mock; writeHosts: jest.Mock };
+
+/** Locate the "View hosts" link by its accessibilityLabel. */
+function findViewHostsLink(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance | undefined {
+  return root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityRole === 'button' &&
+      node.props.accessibilityLabel === 'View hosts',
+  )[0];
+}
+
+// AC: the StatusHeader renders a "View hosts" link; pressing it opens the
+// viewer (the viewer title "Hosts — managed section" appears in extractText).
+test('the StatusHeader renders a "View hosts" link that opens the hosts viewer overlay', async () => {
+  shellNativeForViewer.readHostsSection.mockReturnValue({ ok: true, section: null });
+  const testRenderer = renderShell();
+  const link = findViewHostsLink(testRenderer.root);
+  expect(link).toBeDefined();
+
+  // Before pressing: the viewer title is absent.
+  expect(extractText(testRenderer.toJSON())).not.toContain(
+    'Hosts — managed section',
+  );
+
+  // Press the link -> the viewer mounts.
+  await ReactTestRenderer.act(() => {
+    link!.props.onPress();
+  });
+
+  // The viewer title now appears in the rendered tree.
+  expect(extractText(testRenderer.toJSON())).toContain(
+    'Hosts — managed section',
+  );
+});
+
+// AC: `KEY_DOWN_EVENTS` includes `{ key: 'Escape' }` so the native default does
+// not swallow Esc before the Shell's `onKeyDown` can close the viewer.
+test('KEY_DOWN_EVENTS includes bare Escape (so Esc closes the viewer)', async () => {
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+  expect(container.props.keyDownEvents).toContainEqual({ key: 'Escape' });
+});
+
+// AC: Escape closes the viewer. Open via the "View hosts" link, fire Escape via
+// the key-down container, assert the viewer title disappears.
+test('bare Escape closes the hosts viewer overlay', async () => {
+  shellNativeForViewer.readHostsSection.mockReturnValue({ ok: true, section: null });
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  // Open the viewer via the link.
+  const link = findViewHostsLink(testRenderer.root);
+  expect(link).toBeDefined();
+  await ReactTestRenderer.act(() => {
+    link!.props.onPress();
+  });
+  expect(extractText(testRenderer.toJSON())).toContain(
+    'Hosts — managed section',
+  );
+
+  // Fire bare Escape -> the viewer closes.
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Escape' } });
+  });
+  expect(extractText(testRenderer.toJSON())).not.toContain(
+    'Hosts — managed section',
+  );
+});
+
+// AC: bare Return does NOT fire Apply while the viewer is open (the overlay is
+// a window-level inert surface). Seeds a staged draft so bare Return WOULD fire
+// Apply if the gate were absent, opens the viewer, fires Return, asserts apply
+// was NOT called.
+test('bare Return does NOT fire apply() while the hosts viewer is open', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+  shellNativeForViewer.readHostsSection.mockReturnValue({ ok: true, section: null });
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  // Open the viewer via the link.
+  const link = findViewHostsLink(testRenderer.root);
+  expect(link).toBeDefined();
+  await ReactTestRenderer.act(() => {
+    link!.props.onPress();
+  });
+  // Sanity: the viewer is open.
+  expect(extractText(testRenderer.toJSON())).toContain(
+    'Hosts — managed section',
+  );
+
+  // Bare Return -> Apply must NOT fire (the `!viewerOpen` gate holds).
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).not.toHaveBeenCalled();
 });
 
 // Restore the real apply after the Return -> Apply test module's last test, so
