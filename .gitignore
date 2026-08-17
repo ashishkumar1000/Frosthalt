@@ -69,3 +69,10 @@ vendor/bundle/
 
 # Testing
 /coverage
+
+# BMAD planning scratch — kept local. Only
+# _bmad-output/implementation-artifacts/ is version-controlled (specs, epic
+# contexts, sprint-status, deferred-work). Planning docs, research, mockups,
+# and tooling memory logs stay out of the repo.
+_bmad-output/party-mode/
+_bmad-output/planning-artifacts/
