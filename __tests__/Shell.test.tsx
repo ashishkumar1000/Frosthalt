@@ -25,6 +25,48 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
   },
 }));
 
+// Story 2.3 — ApplyButton's pulse is the codebase's first `useNativeDriver:
+// true` animation (`Animated.createAnimatedComponent(Pressable)`). The Shell
+// Return -> Apply tests trigger a Shell re-render via `setAddFieldFocused`
+// (driven through the AddDomain `onFocusChange` callback), which re-renders
+// Blocklist -> ApplyButton. Re-rendering an `Animated.createAnimatedComponent`
+// host in the node jest env hits a pre-existing react 19.1.4 vs
+// react-native 0.81.2 renderer version mismatch (the lazy re-require of the
+// `-dev` renderer throws a version-check error). The Shell tests do NOT assert
+// anything about the pulse — they assert `apply()` fires (or doesn't) on bare
+// Return — so we mock ApplyButton as a plain Pressable that forwards the
+// contract props (`onPress` + `accessibilityRole:'button'` + `accessibilityLabel`
+// + `accessibilityState`). The `pulse`/`busy` prop WIRING is asserted in
+// `Blocklist.test.tsx`, which renders the real ApplyButton once (no re-render)
+// and so does not hit the animated re-render path.
+jest.mock('../src/components/ApplyButton', () => {
+  const React = require('react');
+  const { Pressable, Text } = require('react-native');
+  const ApplyButton = (props: {
+    label: string;
+    onPress: () => void;
+    onPressIn?: () => void;
+    onPressOut?: () => void;
+    disabled?: boolean;
+    busy?: boolean;
+    pulse?: boolean;
+  }) =>
+    React.createElement(
+      Pressable,
+      {
+        onPress: props.onPress,
+        onPressIn: props.onPressIn,
+        onPressOut: props.onPressOut,
+        disabled: props.disabled,
+        accessibilityRole: 'button',
+        accessibilityLabel: props.label,
+        accessibilityState: { disabled: !!props.disabled, busy: !!props.busy },
+      },
+      React.createElement(Text, null, props.label),
+    );
+  return { __esModule: true, ApplyButton };
+});
+
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import { AccessibilityInfo } from 'react-native';
@@ -32,6 +74,15 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { Shell } from '../src/components/Shell';
 import { useDomainStore } from '../src/domain/store';
 import { DEFAULT_CONFIG } from '../src/config/types';
+import type { Domain } from '../src/config/types';
+import type { WriteResult } from '../src/hosts/shellRunner';
+
+// The REAL `apply`, captured once at module load. The Return -> Apply tests
+// install a `jest.fn` wrapper via `useDomainStore.setState({ apply })` (the
+// AddDomain `mockStageAdd` pattern — NOT `jest.spyOn`, which is fragile under
+// Zustand v5's `useSyncExternalStore` re-runs). `seedState` always restores the
+// real action so a mock can never leak into the next test.
+const REAL_APPLY = useDomainStore.getState().apply;
 
 // The react-native jest preset auto-mocks `announceForAccessibility`
 // as a `jest.fn()`, but the TypeScript type from react-native-macos's types is
@@ -50,6 +101,25 @@ const announceForAccessibility =
 // shell subtree is actually present for assertions.
 const ZERO_INSETS = { top: 0, bottom: 0, left: 0, right: 0 };
 
+// Track the current renderer so afterEach can unmount it, fully releasing the
+// store subscription so it cannot re-render on a later test's setState. This
+// matters for Story 2.3: a leftover Shell renderer subscribed to the store
+// would re-render with `pulse: true` when a later test seeds `staged`, firing
+// the ApplyButton pulse effect's native-animated connection during the act
+// flush (which has no native animated runtime in the node jest env). Unmounting
+// per test keeps exactly one renderer alive at a time — the same discipline the
+// Blocklist/AddDomain tests use.
+let currentRenderer: ReturnType<typeof ReactTestRenderer.create> | null = null;
+
+afterEach(() => {
+  if (currentRenderer) {
+    ReactTestRenderer.act(() => {
+      currentRenderer!.unmount();
+    });
+    currentRenderer = null;
+  }
+});
+
 function renderShell() {
   let testRenderer!: ReturnType<typeof ReactTestRenderer.create>;
   ReactTestRenderer.act(() => {
@@ -59,6 +129,7 @@ function renderShell() {
       </SafeAreaProvider>,
     );
   });
+  currentRenderer = testRenderer;
   return testRenderer;
 }
 
@@ -347,6 +418,10 @@ test('the shell root is focusable and declares ⌘1-⌘4 + ⌘N as handled key e
     { key: '3', metaKey: true },
     { key: '4', metaKey: true },
     { key: 'n', metaKey: true },
+    // Story 2.3 — bare Return / Enter fire Apply on surface 0 when the add
+    // field is blurred and a staged draft exists.
+    { key: 'Return' },
+    { key: 'Enter' },
   ]);
 });
 
@@ -462,5 +537,311 @@ test('Shell renders the Blocklist surface content (not the placeholder) on surfa
   // that share the module-level store instance.
   ReactTestRenderer.act(() => {
     useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
+});
+
+// ===========================================================================
+// Story 2.3 — Return -> Apply: bare Return / Enter fire `apply()` on the
+// Blocklist surface (surface 0) when the add field is blurred and a staged
+// draft exists. The add field ALWAYS owns Return when focused (its
+// `onSubmitEditing` -> Add); `addFieldFocused` is tracked via the AddDomain
+// `onFocusChange` callback so the gate is deterministic and unit-testable.
+// ===========================================================================
+
+/**
+ * Seed the store for a Return -> Apply test: committed with one domain, an
+ * optional staged draft, and the REAL `apply` restored (so a previous test's
+ * mock can never leak). Returns nothing; callers then install the mock via
+ * `mockApply()` if they want to assert on calls.
+ */
+function seedForReturn(overrides: {
+  domains?: Domain[];
+  staged?: Domain[] | null;
+}): void {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: overrides.domains ?? [{ hostname: 'example.com', alwaysOn: true }],
+      },
+      staged: overrides.staged ?? null,
+      applyStatus: 'idle',
+      lastResult: null,
+      // Always restore the real action so a previous test's mock cannot leak.
+      apply: REAL_APPLY,
+    });
+  });
+}
+
+/**
+ * Install a `jest.fn` mock for `apply` on the store (records calls; returns a
+ * resolved `{ ok: true }` so `void apply()` does not crash). The AddDomain
+ * `mockStageAdd` setState-wrapper pattern — NOT `jest.spyOn`, which is fragile
+ * under Zustand v5's `useSyncExternalStore` re-runs. `seedForReturn` restores
+ * the real action so the mock never leaks.
+ */
+function mockApply(): jest.Mock<Promise<WriteResult>, []> {
+  const mock = jest.fn(() => Promise.resolve({ ok: true } as WriteResult)) as
+    unknown as jest.Mock<Promise<WriteResult>, []>;
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ apply: mock });
+  });
+  return mock;
+}
+
+/** Locate the add field by its contract props (onChangeText fn + value string). */
+function findAddFieldIn(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance | undefined {
+  return root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onChangeText === 'function' &&
+      typeof node.props.value === 'string',
+  )[0];
+}
+
+// AC: bare Return + Enter are declared in `keyDownEvents` (so the native layer
+// does not swallow them before the Shell's `onKeyDown` can fire Apply). Two
+// separate `toContainEqual` assertions so a missing one names which key.
+test('bare Return is declared in keyDownEvents (so the native default does not swallow it)', async () => {
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+  expect(container.props.keyDownEvents).toContainEqual({ key: 'Return' });
+});
+
+test('bare Enter is declared in keyDownEvents (so the native default does not swallow it)', async () => {
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+  expect(container.props.keyDownEvents).toContainEqual({ key: 'Enter' });
+});
+
+// I/O Matrix: Return (field blurred, staged) -> apply() fires.
+test('bare Return on surface 0 with the field blurred and staged != null fires apply()', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    // Flush the `void apply()` microtask so the mock is settled.
+    await Promise.resolve();
+  });
+
+  expect(applyMock).toHaveBeenCalledTimes(1);
+});
+
+test('bare Enter on surface 0 with the field blurred and staged != null fires apply()', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Enter' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).toHaveBeenCalledTimes(1);
+});
+
+// I/O Matrix: Return (field focused) -> Add owns Return; apply() NOT fired.
+// The `addFieldFocused` state is driven via the AddDomain `onFocusChange` prop
+// the Shell passes through Blocklist (find the field, invoke its `onFocus`).
+test('bare Return does NOT fire apply() when the add field is focused (the field owns Return -> Add)', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  // Drive addFieldFocused=true via the AddDomain onFocusChange callback the
+  // Shell wires through Blocklist — the deterministic, unit-testable path
+  // (no reliance on uncertain Return bubble semantics).
+  const field = findAddFieldIn(testRenderer.root);
+  expect(field).toBeDefined();
+  ReactTestRenderer.act(() => {
+    field!.props.onFocus();
+  });
+
+  const container = findKeyDownContainer(testRenderer.root);
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).not.toHaveBeenCalled();
+});
+
+// I/O Matrix: Return (no staged) -> nothing. apply() short-circuits at call
+// time; but the Shell's branch is guarded by `staged != null`, so apply() is
+// not even called when staged is null.
+test('bare Return does NOT fire apply() when staged == null (nothing staged)', async () => {
+  seedForReturn({ staged: null });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).not.toHaveBeenCalled();
+});
+
+// I/O Matrix: Return (other surface) -> nothing (no Apply on Timer/Schedule/
+// Settings). Navigate to surface 1 (Timer) via ⌘2 first, then Return.
+test('bare Return on surface 1 (Timer) does NOT fire apply()', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+  // Navigate to Timer (surface 1) first.
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '2' } });
+  });
+  // Confirm we left surface 0.
+  expect(extractText(testRenderer.toJSON())).toContain('No timer running');
+
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).not.toHaveBeenCalled();
+});
+
+// ⌘Return must NOT fire apply() — the spec's "bare Return only, matching the
+// default-button contract" Never clause. Guards against an `onKeyDown` branch
+// that accidentally ignores `metaKey` for Return.
+test('⌘Return does NOT fire apply() (bare Return only — the default-button contract)', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).not.toHaveBeenCalled();
+});
+
+// ⌘N + empty + staged + Return -> Add no-op (field owns Return); apply() NOT
+// fired (the documented focus-context edge from the spec's matrix). ⌘N focuses
+// the field (tracked via onFocusChange), so the field owns Return and Apply
+// does not fire.
+test('after ⌘N focuses the field, bare Return does NOT fire apply() (field owns Return)', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+  // ⌘N focuses the add field. The focus() call is native-runtime (not exercised
+  // in the node jest env), but the field's onFocus fires setAddFieldFocused(true)
+  // — so we simulate the focus event the native focus() would trigger by
+  // invoking the field's onFocus directly (the deterministic test proxy for the
+  // native focus side-effect, same as the AddDomain onFocusChange test).
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: 'n' } });
+  });
+  // The ⌘N handler calls addFieldRef.current?.focus(); the native focus would
+  // fire the field's onFocus -> setAddFieldFocused(true). Simulate that:
+  const field = findAddFieldIn(testRenderer.root);
+  expect(field).toBeDefined();
+  ReactTestRenderer.act(() => {
+    field!.props.onFocus();
+  });
+
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).not.toHaveBeenCalled();
+});
+
+// Regression guard (Story 2.3 PATCH): navigating away while the add field is
+// focused, then back to surface 0, must NOT leave `addFieldFocused` stale-true.
+// In the native runtime the field's `onBlur` is queued async by
+// RCTEventDispatcher; when ⌘2 unmounts <Blocklist> the TextInput is destroyed
+// before the queued blur fires, so `onFocusChange(false)` never runs. Without
+// the `selectRow` reset, navigating back mounts a fresh, unfocused field whose
+// `onFocus` also does not fire — so `addFieldFocused` stays stale-true and bare
+// Return -> Apply silently stops working. The fix resets it in `selectRow`.
+// This test drives the round-trip-with-focus path (focus -> ⌘2 -> ⌘1 -> Return)
+// and asserts apply() fires, proving the stale-true state was cleared.
+test('after focus -> navigate-away -> navigate-back, bare Return fires apply() (no stale addFieldFocused)', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  // Focus the add field (addFieldFocused -> true), mirroring a user clicking it.
+  const field = findAddFieldIn(testRenderer.root);
+  expect(field).toBeDefined();
+  ReactTestRenderer.act(() => {
+    field!.props.onFocus();
+  });
+
+  // Navigate away to Timer (surface 1) — this unmounts <Blocklist> and its
+  // TextInput; the fix resets addFieldFocused=false in selectRow.
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '2' } });
+  });
+  expect(extractText(testRenderer.toJSON())).toContain('No timer running');
+
+  // Navigate back to Blocklist (surface 0) — a fresh TextInput mounts; it is NOT
+  // focused, so no onFocus fires. The fix's selectRow reset keeps
+  // addFieldFocused=false; without it the stale-true from the focused field
+  // would persist and gate bare Return off.
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '1' } });
+  });
+  expect(extractText(testRenderer.toJSON())).toContain('example.com');
+
+  // Bare Return must fire apply() — the regression. If addFieldFocused were
+  // stale-true, the gate `!addFieldFocused` would be false and apply() would NOT
+  // fire (the bug the PATCH fixes).
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).toHaveBeenCalledTimes(1);
+});
+
+// Restore the real apply after the Return -> Apply test module's last test, so
+// no mock leaks into suites that share the module-level store instance. (Each
+// `seedForReturn` also restores, but this is a belt-and-braces cleanup for the
+// shared store.)
+afterAll(() => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      apply: REAL_APPLY,
+      committed: { ...DEFAULT_CONFIG },
+      staged: null,
+    });
   });
 });

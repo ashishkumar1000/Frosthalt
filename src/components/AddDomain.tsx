@@ -49,6 +49,15 @@ export interface AddDomainProps {
    * not by label, but the label is kept explicit for VoiceOver.
    */
   accessibilityLabel?: string;
+  /**
+   * Focus-change signal for the Shell's Return -> Apply gating (Story 2.3).
+   * Fired with `true` on `onFocus` and `false` on `onBlur`. The Shell tracks
+   * `addFieldFocused` via this callback so the focused field deterministically
+   * owns bare Return (-> Add), and a blurred field lets Return fall through to
+   * Apply. Deterministic + unit-testable (no reliance on Return bubble
+   * semantics, which are uncertain in react-native-macos).
+   */
+  onFocusChange?: (focused: boolean) => void;
 }
 
 /**
@@ -58,7 +67,7 @@ export interface AddDomainProps {
  * the store, so they can never drift from what `stageDomainAdd` would do.
  */
 export const AddDomain = forwardRef<TextInputType, AddDomainProps>(
-  function AddDomain({ accessibilityLabel = 'Add domain' }, ref) {
+  function AddDomain({ accessibilityLabel = 'Add domain', onFocusChange }, ref) {
     const [raw, setRaw] = useState('');
     const committed = useDomainStore((s) => s.committed);
     const staged = useDomainStore((s) => s.staged);
@@ -124,6 +133,11 @@ export const AddDomain = forwardRef<TextInputType, AddDomainProps>(
             submitBehavior="submit"
             placeholder="example.com"
             accessibilityLabel={accessibilityLabel}
+            // Focus-change signal for the Shell's Return -> Apply gating
+            // (Story 2.3). The focused field owns bare Return (-> Add); a
+            // blurred field lets Return fall through to Apply.
+            onFocus={() => onFocusChange?.(true)}
+            onBlur={() => onFocusChange?.(false)}
             // Disable every form of OS-level text rewriting so a typed domain
             // reaches `normaliseDomain` verbatim — autocorrect can mangle a
             // hostname (`example.com` -> `example.con`), autocapitalize would

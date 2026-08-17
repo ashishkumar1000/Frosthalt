@@ -29,10 +29,13 @@ import { Sidebar } from './Sidebar';
 import { StatusHeader } from './StatusHeader';
 import { SurfacePlaceholder, SURFACE_NAMES, type SurfaceIndex } from './surfaces';
 import { Blocklist } from './Blocklist';
+import { useDomainStore } from '../domain/store';
 
 /**
- * ⌘1-⌘4 select the four surfaces; ⌘N focuses the add-domain field (Story 2.2).
- * Keys outside this set are ignored (the native default applies).
+ * ⌘1-⌘4 select the four surfaces; ⌘N focuses the add-domain field (Story 2.2);
+ * bare Return / Enter fire Apply on the Blocklist surface when the add field is
+ * blurred and there is a staged draft (Story 2.3). Keys outside this set are
+ * ignored (the native default applies).
  */
 const KEY_DOWN_EVENTS: HandledKeyEvent[] = [
   { key: '1', metaKey: true },
@@ -40,6 +43,8 @@ const KEY_DOWN_EVENTS: HandledKeyEvent[] = [
   { key: '3', metaKey: true },
   { key: '4', metaKey: true },
   { key: 'n', metaKey: true },
+  { key: 'Return' },
+  { key: 'Enter' },
 ];
 
 export function Shell(): React.ReactElement {
@@ -55,9 +60,30 @@ export function Shell(): React.ReactElement {
   // mirroring the `selectRow` ref-focus pattern below. Owned here so the Shell
   // can drive focus; passed down to <Blocklist/> -> <AddDomain/>.
   const addFieldRef = useRef<TextInputType>(null);
+  // Whether the add field is currently focused, tracked via the AddDomain
+  // `onFocusChange` callback (Story 2.3). Used to gate bare Return -> Apply: the
+  // focused field ALWAYS owns Return (-> Add); only a blurred field lets Return
+  // fall through to Apply. Deterministic + unit-testable — no reliance on
+  // uncertain Return bubble semantics.
+  const [addFieldFocused, setAddFieldFocused] = useState(false);
+  // The staged draft + apply action, read here so the Return -> Apply branch
+  // can fire `apply()` iff `staged != null`. Blocklist also reads these; both
+  // may read the same store.
+  const staged = useDomainStore((s) => s.staged);
+  const apply = useDomainStore((s) => s.apply);
 
   const selectRow = (i: number) => {
     setSurface(i as SurfaceIndex);
+    // Reset add-field focus tracking on every navigation. Navigating away from
+    // surface 0 unmounts <Blocklist> (and its TextInput); the TextInput's
+    // native `onBlur` is queued async by RCTEventDispatcher and dropped when the
+    // view is destroyed, so `onFocusChange(false)` never fires and
+    // `addFieldFocused` would stay stale-true. Navigating back to surface 0
+    // mounts a fresh, unfocused field whose `onFocus` doesn't fire either, so
+    // the stale state would persist — silently breaking the bare Return -> Apply
+    // gate (`!addFieldFocused`). After any `selectRow` focus is on a sidebar
+    // row, never the field, so `false` is correct in every case. Story 2.3.
+    setAddFieldFocused(false);
     rowRefs[i].current?.focus();
     AccessibilityInfo.announceForAccessibility(
       `${SURFACE_NAMES[i]}, 0 domains`,
@@ -82,6 +108,18 @@ export function Shell(): React.ReactElement {
     // surface change: ⌘N is a focus shortcut, not navigation.
     if (metaKey && key === 'n') {
       addFieldRef.current?.focus();
+      return;
+    }
+    // Bare Return / Enter fires Apply on the Blocklist surface (surface 0)
+    // when the add field is blurred and there is a staged draft (Story 2.3 —
+    // the default-button binding). The focused field ALWAYS owns Return (its
+    // `onSubmitEditing` -> Add); `addFieldFocused` is tracked via the
+    // AddDomain `onFocusChange` callback so this is deterministic, not reliant
+    // on uncertain Return bubble semantics. No ⌘Return (bare Return only,
+    // matching the macOS default-button contract). Placed before the ⌘1-⌘4
+    // branch because this is a bare-key (no metaKey) path.
+    if (!metaKey && (key === 'Return' || key === 'Enter') && surface === 0 && !addFieldFocused && staged != null) {
+      void apply();
       return;
     }
     // Gate on ⌘ AND key in 1-4. A plain 1-4 (no ⌘) must NOT navigate.
@@ -114,7 +152,10 @@ export function Shell(): React.ReactElement {
           rowRefs={rowRefs}
         />
         {surface === 0 ? (
-          <Blocklist addFieldRef={addFieldRef} />
+          <Blocklist
+            addFieldRef={addFieldRef}
+            onFocusChange={setAddFieldFocused}
+          />
         ) : (
           <SurfacePlaceholder surface={surface} />
         )}

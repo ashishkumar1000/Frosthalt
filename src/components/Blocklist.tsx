@@ -36,6 +36,7 @@ import {
 } from 'react-native';
 import type { TextInput as TextInputType } from 'react-native';
 import { useDomainStore } from '../domain/store';
+import { stagedChangeCount } from '../domain/stagedChangeCount';
 import { tokens } from '../theme/tokens';
 import { AddDomain } from './AddDomain';
 import { ApplyButton } from './ApplyButton';
@@ -56,9 +57,19 @@ export interface BlocklistProps {
    * renders can mount `<Blocklist/>` without one.
    */
   addFieldRef?: React.RefObject<TextInputType | null>;
+  /**
+   * Focus-change signal from the add field, owned by the Shell so it can gate
+   * bare Return -> Apply (the focused field always owns Return -> Add). The
+   * Shell passes `setAddFieldFocused`; Blocklist forwards it to `<AddDomain>`.
+   * Optional so tests / direct renders can mount `<Blocklist/>` without one.
+   */
+  onFocusChange?: (focused: boolean) => void;
 }
 
-export function Blocklist({ addFieldRef }: BlocklistProps): React.ReactElement {
+export function Blocklist({
+  addFieldRef,
+  onFocusChange,
+}: BlocklistProps): React.ReactElement {
   const committed = useDomainStore((s) => s.committed);
   const staged = useDomainStore((s) => s.staged);
   const applyStatus = useDomainStore((s) => s.applyStatus);
@@ -73,6 +84,16 @@ export function Blocklist({ addFieldRef }: BlocklistProps): React.ReactElement {
   const running = applyStatus === 'running';
   const hasStaged = staged != null;
   const isEmpty = committed.domains.length === 0 && staged == null;
+  // The "N changes staged" hint count (UX-DR9). Diffed by hostname via the pure
+  // `stagedChangeCount` sibling to `draftEqualsCommitted` — a naive length-diff
+  // is wrong (a toggle changes no length; the clean-revert clears `staged` on
+  // net-zero). Only computed when `staged != null` (invariant: staged != null
+  // ⟹ count >= 1, since clean-revert clears staged to null on net-zero).
+  const changeCount = staged != null
+    ? stagedChangeCount(staged, committed.domains)
+    : 0;
+  const changesHint =
+    changeCount === 1 ? '1 change staged' : `${changeCount} changes staged`;
 
   // Mount announce: "Blocklist, N domains, M always-on". N is the rendered
   // list length (staged or committed), M is the always-on count from the same
@@ -96,7 +117,7 @@ export function Blocklist({ addFieldRef }: BlocklistProps): React.ReactElement {
       {/* The add field is always visible — above the rows AND in the empty
           state, so it is reachable regardless of whether domains exist yet.
           ⌘N (Shell) focuses the field via the forwarded ref. */}
-      <AddDomain ref={addFieldRef} />
+      <AddDomain ref={addFieldRef} onFocusChange={onFocusChange} />
       {isEmpty ? (
         <Text style={styles.body}>{EMPTY_STATE_TEXT}</Text>
       ) : (
@@ -113,18 +134,23 @@ export function Blocklist({ addFieldRef }: BlocklistProps): React.ReactElement {
           </View>
           <View style={styles.controls}>
             <ApplyButton
-              label="Apply"
+              label={running ? 'Applying…' : 'Apply'}
               onPress={() => {
                 void apply();
               }}
               disabled={running || !hasStaged}
+              pulse={hasStaged && !running}
+              busy={running}
             />
             {hasStaged ? (
-              <PressableGhost
-                label="Cancel"
-                onPress={cancelStaged}
-                disabled={running}
-              />
+              <React.Fragment>
+                <PressableGhost
+                  label="Cancel"
+                  onPress={cancelStaged}
+                  disabled={running}
+                />
+                <Text style={styles.changesHint}>{changesHint}</Text>
+              </React.Fragment>
             ) : null}
           </View>
         </>
@@ -190,6 +216,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: tokens.spacing.md,
     marginTop: tokens.spacing.md,
+  },
+  changesHint: {
+    ...tokens.typography.body,
+    // Subdued so the hint reads as a count, not a primary affordance.
+    opacity: 0.7,
   },
   ghost: {
     paddingHorizontal: tokens.spacing.md,

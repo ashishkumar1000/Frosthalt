@@ -213,7 +213,8 @@ test('empty input: no preview, no error, and Add is disabled', () => {
 
   const add = findAddButton(testRenderer.root);
   expect(add.props.disabled).toBe(true);
-  expect(add.props.accessibilityState).toEqual({ disabled: true });
+  // Story 2.3 added the `busy` prop to ApplyButton's accessibilityState.
+  expect(add.props.accessibilityState).toEqual({ disabled: true, busy: false });
 });
 
 test('whitespace-only input is treated as idle: no preview, no error, Add disabled', () => {
@@ -250,7 +251,7 @@ test('typing a valid new domain shows the normalised preview and enables Add', (
 
   const add = findAddButton(testRenderer.root);
   expect(add.props.disabled).toBe(false);
-  expect(add.props.accessibilityState).toEqual({ disabled: false });
+  expect(add.props.accessibilityState).toEqual({ disabled: false, busy: false });
 });
 
 // ---------------------------------------------------------------------------
@@ -458,4 +459,63 @@ test('AddDomain forwards a ref to the underlying TextInput (for ⌘N focus)', ()
   // ref ATTACHES — proving the forwardRef wiring the Shell's ⌘N handler relies
   // on (`addFieldRef.current?.focus()`).
   expect(ref.current).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Story 2.3 — onFocusChange: reports focus/blur to the Shell so it can gate
+// bare Return -> Apply (the focused field owns Return -> Add). The focus()
+// call + isFocused() are native-runtime and not unit-testable in the node jest
+// env, so we assert the CALLBACK WIRING: invoking the TextInput's `onFocus` /
+// `onBlur` props fires the Shell-passed `onFocusChange` with true / false.
+// ---------------------------------------------------------------------------
+
+test('onFocusChange is invoked with true on the field onFocus and false on onBlur', () => {
+  seedState({ domains: [] });
+  const onFocusChange = jest.fn();
+  let testRenderer!: ReturnType<typeof ReactTestRenderer.create>;
+  ReactTestRenderer.act(() => {
+    testRenderer = ReactTestRenderer.create(
+      <AddDomain onFocusChange={onFocusChange} />,
+    );
+  });
+  currentRenderer = testRenderer;
+
+  const field = findField(testRenderer.root);
+  expect(typeof field.props.onFocus).toBe('function');
+  expect(typeof field.props.onBlur).toBe('function');
+
+  // Focus the field -> the callback fires with true.
+  ReactTestRenderer.act(() => {
+    field.props.onFocus();
+  });
+  expect(onFocusChange).toHaveBeenCalledWith(true);
+
+  // Blur the field -> the callback fires with false.
+  ReactTestRenderer.act(() => {
+    field.props.onBlur();
+  });
+  expect(onFocusChange).toHaveBeenCalledWith(false);
+
+  // Exactly two calls total (one focus, one blur).
+  expect(onFocusChange).toHaveBeenCalledTimes(2);
+});
+
+test('onFocusChange is optional: omitting it does not break onFocus/onBlur (no throw)', () => {
+  // The prop is optional; the field's onFocus/onBlur use `onFocusChange?.(...)`
+  // so a render without the prop must not throw when focus/blur fire.
+  seedState({ domains: [] });
+  let testRenderer!: ReturnType<typeof ReactTestRenderer.create>;
+  ReactTestRenderer.act(() => {
+    testRenderer = ReactTestRenderer.create(<AddDomain />);
+  });
+  currentRenderer = testRenderer;
+
+  const field = findField(testRenderer.root);
+  // Invoking onFocus/onBlur with no callback wired must not throw.
+  expect(() => {
+    ReactTestRenderer.act(() => {
+      field.props.onFocus();
+      field.props.onBlur();
+    });
+  }).not.toThrow();
 });

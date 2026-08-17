@@ -24,7 +24,13 @@ function findPressable(root: ReactTestRenderer.ReactTestInstance) {
       typeof node.props.onPress === 'function' &&
       node.props.accessibilityRole === 'button',
   );
-  expect(matches).toHaveLength(1);
+  // Story 2.3 wrapped Pressable in `Animated.createAnimatedComponent`, which
+  // forwards the contract props (`onPress` + `accessibilityRole`) onto BOTH
+  // the animated wrapper node and the inner Pressable node. So `findAll`
+  // returns 2 matches. The WRAPPER (first match) owns the original `style`
+  // function prop (the inner node receives the flattened resolved style), so
+  // we pick the first to keep the pressed-style assertion reading a function.
+  expect(matches.length).toBeGreaterThanOrEqual(1);
   return matches[0];
 }
 
@@ -40,7 +46,11 @@ test('ApplyButton renders its label and fires onPress when pressed', async () =>
   expect(extractText(testRenderer.toJSON())).toBe('Apply');
   const button = findPressable(testRenderer.root);
   expect(button.props.disabled).toBe(false);
-  expect(button.props.accessibilityState).toEqual({ disabled: false });
+  // Story 2.3 added the `busy` prop to `accessibilityState`; default false.
+  expect(button.props.accessibilityState).toEqual({
+    disabled: false,
+    busy: false,
+  });
   await ReactTestRenderer.act(() => {
     button.props.onPress();
   });
@@ -62,18 +72,22 @@ test('ApplyButton disabled reflects the disabled state', async () => {
   });
   const button = findPressable(testRenderer.root);
   expect(button.props.disabled).toBe(true);
-  expect(button.props.accessibilityState).toEqual({ disabled: true });
+  expect(button.props.accessibilityState).toEqual({
+    disabled: true,
+    busy: false,
+  });
   // The disabled style ({ opacity: 0.4 }) is a plain number, safe to assert
   // without coupling to PlatformColor mock shapes. It conveys the
   // "reduced-opacity, non-interactive" affordance from the I/O matrix row.
   expect(hasOpacity(testRenderer.toJSON(), 0.4)).toBe(true);
 });
 
-// I/O Matrix: ApplyButton pressed — the press-feedback affordance. The
-// Pressable style is a function of the interaction state; the default render
-// is pressed:false, so the pressed style can't be read from toJSON(). Invoke
-// the style callback with pressed:true and assert the pressed style
-// ({ opacity: 0.85 }) is present — mirroring the disabled-opacity assertion.
+// I/O Matrix: ApplyButton pressed — the press-feedback affordance. Story 2.3
+// converted the style to a static array (the `Animated.createAnimatedComponent`
+// wrapper does not resolve a Pressable press-state function-style), so press
+// feedback is now driven by `onPressIn`/`onPressOut` state. Drive `onPressIn`
+// and assert the rendered style now carries the pressed opacity (0.85) —
+// mirroring the disabled-opacity assertion. `onPressOut` restores it.
 test('ApplyButton shows reduced opacity in the pressed state', async () => {
   const onPress = jest.fn();
   let testRenderer!: ReturnType<typeof ReactTestRenderer.create>;
@@ -83,10 +97,18 @@ test('ApplyButton shows reduced opacity in the pressed state', async () => {
     );
   });
   const button = findPressable(testRenderer.root);
-  const styleFn = button.props.style;
-  expect(typeof styleFn).toBe('function');
-  const pressedStyle = styleFn({ pressed: true });
-  expect(styleHasOpacity(pressedStyle, 0.85)).toBe(true);
+  // Default render: pressed:false — the pressed style (0.85) is NOT present.
+  expect(styleHasOpacity(button.props.style, 0.85)).toBe(false);
+  // Press in: the state flips and the re-rendered style carries 0.85.
+  await ReactTestRenderer.act(() => {
+    button.props.onPressIn();
+  });
+  expect(styleHasOpacity(findPressable(testRenderer.root).props.style, 0.85)).toBe(true);
+  // Press out: restored.
+  await ReactTestRenderer.act(() => {
+    findPressable(testRenderer.root).props.onPressOut();
+  });
+  expect(styleHasOpacity(findPressable(testRenderer.root).props.style, 0.85)).toBe(false);
 });
 
 /**

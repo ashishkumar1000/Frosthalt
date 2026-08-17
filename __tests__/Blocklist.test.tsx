@@ -273,7 +273,11 @@ test('Apply is disabled when there is no staged draft (clean config)', () => {
   const apply = findButtonByLabel(testRenderer.root, 'Apply');
   expect(apply).toBeDefined();
   expect(apply!.props.disabled).toBe(true);
-  expect(apply!.props.accessibilityState).toEqual({ disabled: true });
+  // Story 2.3 added the `busy` prop to ApplyButton's accessibilityState.
+  expect(apply!.props.accessibilityState).toEqual({
+    disabled: true,
+    busy: false,
+  });
 });
 
 test('Apply is enabled when a staged draft exists', () => {
@@ -296,8 +300,16 @@ test('Apply is disabled while an Apply run is in flight (applyStatus running)', 
   });
 
   const testRenderer = renderBlocklist();
-  const apply = findButtonByLabel(testRenderer.root, 'Apply');
-  expect(apply!.props.disabled).toBe(true);
+  // Story 2.3 swaps the label to "Applying…" while running (the in-flight cue).
+  const applying = findButtonByLabel(testRenderer.root, 'Applying…');
+  expect(applying).toBeDefined();
+  expect(applying!.props.disabled).toBe(true);
+  expect(applying!.props.accessibilityState).toEqual({
+    disabled: true,
+    busy: true,
+  });
+  // The idle "Apply" label is NOT rendered while running.
+  expect(findButtonByLabel(testRenderer.root, 'Apply')).toBeUndefined();
 });
 
 test('pressing Apply calls the store apply() action', async () => {
@@ -583,4 +595,186 @@ test('Blocklist renders AddDomain, forwards the add-field ref, and a clean Add s
   const apply = findButtonByLabel(testRenderer.root, 'Apply');
   expect(apply).toBeDefined();
   expect(apply!.props.disabled).toBe(false);
+});
+
+// ===========================================================================
+// Story 2.3 — Apply-button live UX: "N changes staged" hint, pulse wiring,
+// running label + busy, and onFocusChange forwarding to AddDomain.
+// ===========================================================================
+
+/**
+ * Locate the ApplyButton COMPOSITE instance (not the rendered Pressable) by the
+ * `pulse` prop discriminator. Only Blocklist's Apply passes `pulse` (the Add
+ * button in AddDomain does not), so `'pulse' in node.props` uniquely matches the
+ * Apply composite — whose `props.pulse` / `props.busy` / `props.label` are what
+ * the spec's "assert its `pulse` prop" wants. (The rendered AnimatedPressable
+ * node does NOT carry `pulse` — it is consumed inside ApplyButton — so the
+ * contract-prop finder `findButtonByLabel` cannot read it; this composite
+ * finder is the stable way to assert the prop Blocklist passes.)
+ */
+function findApplyComposite(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance {
+  const matches = root.findAll(
+    (node) => node.props != null && 'pulse' in node.props,
+  );
+  expect(matches.length).toBeGreaterThanOrEqual(1);
+  return matches[0];
+}
+
+// ---------------------------------------------------------------------------
+// "N changes staged" hint: singular / plural / absent
+// ---------------------------------------------------------------------------
+
+test('the hint reads "1 change staged" when staged has exactly 1 net change', () => {
+  // committed has example.com alwaysOn:true; staged flips it off -> 1 toggle.
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+
+  const testRenderer = renderBlocklist();
+  const text = extractText(testRenderer.toJSON());
+  expect(text).toContain('1 change staged');
+  expect(text).not.toContain('changes staged');
+});
+
+test('the hint reads "1 change staged" for a single added domain', () => {
+  // committed empty; staged adds one domain -> 1 added.
+  seedState({
+    domains: [],
+    staged: [{ hostname: 'newsite.com', alwaysOn: true }],
+  });
+
+  const testRenderer = renderBlocklist();
+  expect(extractText(testRenderer.toJSON())).toContain('1 change staged');
+});
+
+test('the hint reads "N changes staged" (plural) when staged has N>1 changes', () => {
+  // committed has example.com alwaysOn:true; staged flips it off AND adds
+  // social.com -> 1 toggle + 1 added = 2 changes (the spec's golden example).
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+    staged: [
+      { hostname: 'example.com', alwaysOn: false }, // toggled
+      { hostname: 'social.com', alwaysOn: true }, // added
+    ],
+  });
+
+  const testRenderer = renderBlocklist();
+  const text = extractText(testRenderer.toJSON());
+  expect(text).toContain('2 changes staged');
+  expect(text).not.toContain('1 change staged');
+});
+
+test('the hint is absent when staged is null (clean config)', () => {
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+    staged: null,
+  });
+
+  const testRenderer = renderBlocklist();
+  const text = extractText(testRenderer.toJSON());
+  expect(text).not.toContain('change staged');
+  expect(text).not.toContain('changes staged');
+});
+
+test('the hint persists while running (staged is retained across an in-flight Apply)', () => {
+  // The running state retains staged (the spec's I/O matrix: "hint persists
+  // (staged retained)"). With 1 staged toggle, the hint reads "1 change staged"
+  // even while applyStatus === 'running'.
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+    applyStatus: 'running',
+  });
+
+  const testRenderer = renderBlocklist();
+  expect(extractText(testRenderer.toJSON())).toContain('1 change staged');
+});
+
+// ---------------------------------------------------------------------------
+// pulse wiring: pulse = hasStaged && !running
+// ---------------------------------------------------------------------------
+
+test('Apply pulse is true when staged != null and not running', () => {
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+
+  const testRenderer = renderBlocklist();
+  const apply = findApplyComposite(testRenderer.root);
+  expect(apply.props.pulse).toBe(true);
+  expect(apply.props.busy).toBe(false);
+  expect(apply.props.label).toBe('Apply');
+});
+
+test('Apply pulse is false when staged is null (clean)', () => {
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+    staged: null,
+  });
+
+  const testRenderer = renderBlocklist();
+  const apply = findApplyComposite(testRenderer.root);
+  expect(apply.props.pulse).toBe(false);
+});
+
+test('Apply pulse is false while running (and label is "Applying…" + busy)', () => {
+  // running: pulse = hasStaged && !running -> false; busy = running -> true;
+  // label -> "Applying…". The pulse animation must NOT run while disabled
+  // (running disables Apply), so a mid-cycle stop never clashes with the
+  // disabled opacity.
+  seedState({
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+    applyStatus: 'running',
+  });
+
+  const testRenderer = renderBlocklist();
+  const apply = findApplyComposite(testRenderer.root);
+  expect(apply.props.pulse).toBe(false);
+  expect(apply.props.busy).toBe(true);
+  expect(apply.props.label).toBe('Applying…');
+  // The rendered button carries the running accessibilityState.
+  const applying = findButtonByLabel(testRenderer.root, 'Applying…');
+  expect(applying).toBeDefined();
+  expect(applying!.props.accessibilityState).toEqual({
+    disabled: true,
+    busy: true,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// onFocusChange forwarding: Blocklist forwards the prop to AddDomain's field
+// ---------------------------------------------------------------------------
+
+test('Blocklist forwards onFocusChange to AddDomain (field onFocus/onBlur fire the callback)', () => {
+  seedState({ domains: [] });
+  const onFocusChange = jest.fn();
+  let testRenderer!: ReturnType<typeof ReactTestRenderer.create>;
+  ReactTestRenderer.act(() => {
+    testRenderer = ReactTestRenderer.create(
+      <Blocklist onFocusChange={onFocusChange} />,
+    );
+  });
+  currentRenderer = testRenderer;
+
+  const field = findAddField(testRenderer.root);
+  expect(field).toBeDefined();
+  expect(typeof field!.props.onFocus).toBe('function');
+  expect(typeof field!.props.onBlur).toBe('function');
+
+  ReactTestRenderer.act(() => {
+    field!.props.onFocus();
+  });
+  expect(onFocusChange).toHaveBeenCalledWith(true);
+
+  ReactTestRenderer.act(() => {
+    field!.props.onBlur();
+  });
+  expect(onFocusChange).toHaveBeenCalledWith(false);
+
+  expect(onFocusChange).toHaveBeenCalledTimes(2);
 });
