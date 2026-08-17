@@ -118,6 +118,14 @@ afterEach(() => {
     });
     currentRenderer = null;
   }
+  // Story 2.5 — the domain count + nav announce read `committed`, so a leaked
+  // seed from a test that fails before its inline restore would silently flip
+  // later tests' count assertions (the old nav tests assert "0 domains", which
+  // only holds when committed is empty). Reset the store to the empty baseline
+  // after every test so each starts from a deterministic empty blocklist.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG }, staged: null });
+  });
 });
 
 function renderShell() {
@@ -203,6 +211,26 @@ function extractText(node: unknown): string {
   return '';
 }
 
+/** Reads the `fontVariant` array from a (possibly array) style prop. Mirrors
+ * the array-aware `styleOpacity` helper in DomainRow.test.tsx. */
+function styleFontVariant(style: unknown): string[] {
+  const entries = Array.isArray(style) ? style : [style];
+  const variants: string[] = [];
+  for (const entry of entries) {
+    if (
+      entry != null &&
+      typeof entry === 'object' &&
+      'fontVariant' in (entry as Record<string, unknown>)
+    ) {
+      const fv = (entry as { fontVariant?: unknown }).fontVariant;
+      if (Array.isArray(fv)) {
+        variants.push(...(fv as string[]));
+      }
+    }
+  }
+  return variants;
+}
+
 // AC: a left sidebar with four rows (Blocklist/Timer/Schedule/Settings)
 // renders.
 test('Shell renders exactly four sidebar rows in the fixed order', async () => {
@@ -258,7 +286,8 @@ test('clicking a sidebar row selects it and swaps the content to that surface', 
 });
 
 // I/O Matrix: ⌘1-⌘4 nav — selects row 0/1/2/3, calls
-// `announceForAccessibility("<Surface>, 0 domains")`.
+// `announceForAccessibility("<Surface>, <count> domain(s)")` with the real
+// effective count (0 here because the store is empty after the afterEach reset).
 test('⌘2 selects row 1 (Timer), moves focus, and announces the surface', async () => {
   announceForAccessibility.mockClear();
   const testRenderer = renderShell();
@@ -379,18 +408,57 @@ test('⌘ with a key outside 1-4 does not navigate', async () => {
   expect(announceForAccessibility).not.toHaveBeenCalled();
 });
 
-// I/O Matrix: Status header on every surface — header renders the "Free"
-// badge + "0 domains" + "no active timer" above the content.
-test('the status header renders the Free badge and the static placeholders', async () => {
+// I/O Matrix: Status header — header renders the "Free" badge + the EFFECTIVE
+// domain count (not the raw config count) + "no active timer" above the
+// content. Seed committed with 3 always-on + 1 non-always-on -> effective count
+// 3 (the non-always-on domain is NOT written to /etc/hosts by this epic's Apply,
+// so `effectiveBlocklist` filters it out). The header must show 3, NOT 4.
+test('the status header renders the Free badge and the effective (not raw) domain count', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'a.com', alwaysOn: true },
+          { hostname: 'b.com', alwaysOn: true },
+          { hostname: 'c.com', alwaysOn: true },
+          { hostname: 'dev.local', alwaysOn: false },
+        ],
+      },
+    });
+  });
   const testRenderer = renderShell();
   const text = extractText(testRenderer.toJSON());
   expect(text).toContain('Free');
-  expect(text).toContain('0 domains');
+  expect(text).toContain('3 domains');
+  // The raw config has 4 domains, but the effective count is 3 (always-on
+  // only). The header must NOT show the raw count.
+  expect(text).not.toContain('4 domains');
   expect(text).toContain('no active timer');
+  // Restore the empty baseline so this seed does not leak into other suites
+  // that share the module-level store instance.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
 });
 
-// AC: the status header stays present across every surface.
-test('the status header is present on every selected surface', async () => {
+// AC: the status header with the effective count stays present across every
+// surface. Seeds committed with 3 always-on + 1 non-always-on (effective 3)
+// and asserts "3 domains" persists after each ⌘1-⌘4 navigation.
+test('the status header with the effective count is present on every selected surface', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'a.com', alwaysOn: true },
+          { hostname: 'b.com', alwaysOn: true },
+          { hostname: 'c.com', alwaysOn: true },
+          { hostname: 'dev.local', alwaysOn: false },
+        ],
+      },
+    });
+  });
   const testRenderer = renderShell();
   const container = findKeyDownContainer(testRenderer.root);
   for (const key of ['1', '2', '3', '4']) {
@@ -399,9 +467,297 @@ test('the status header is present on every selected surface', async () => {
     });
     const text = extractText(testRenderer.toJSON());
     expect(text).toContain('Free');
-    expect(text).toContain('0 domains');
+    expect(text).toContain('3 domains');
     expect(text).toContain('no active timer');
   }
+  // Restore the empty baseline so this seed does not leak into other suites.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
+});
+
+// ===========================================================================
+// Story 2.5 — Domain count in the status header: effective blocked count +
+// tabular figures + on-change announce. The count is
+// `effectiveBlocklist(committed).length` — always-on domains enforced in
+// /etc/hosts right now (staged/pending edits do not move it until Applied).
+// ===========================================================================
+
+// AC: Given effective count 1, the header reads "1 domain" (singular); given
+// 0 or >1, "N domains". Seeds committed with exactly 1 always-on domain and
+// asserts the singular form. `toContain('1 domain')` matches the singular
+// text; `not.toContain('1 domains')` rules out the plural (since "1 domain"
+// is a substring of "1 domains", the negation of the plural string is the
+// discriminator).
+test('the status header shows "1 domain" (singular) when the effective count is 1', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [{ hostname: 'solo.com', alwaysOn: true }],
+      },
+    });
+  });
+  const testRenderer = renderShell();
+  const text = extractText(testRenderer.toJSON());
+  expect(text).toContain('1 domain');
+  expect(text).not.toContain('1 domains');
+  // Restore the empty baseline.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
+});
+
+// AC: Given Apply succeeds (committed updates), the header count updates and
+// VoiceOver announces the new count. Seeds committed with 1 always-on, renders
+// (StatusHeader's first-run guard skips the mount announce), clears the mock,
+// then simulates an Apply committing a new committed (1 -> 2 always-on) via
+// `setState`. Asserts the header shows "2 domains" and the on-change announce
+// fired with "2 domains blocked".
+test('the header count updates and VoiceOver announces on count change (Apply commit)', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [{ hostname: 'a.com', alwaysOn: true }],
+      },
+    });
+  });
+  const testRenderer = renderShell();
+  // StatusHeader mounts; its effect's first-run guard skips the initial mount
+  // (the Blocklist surface's mount announce covers the entry). Clear the mock
+  // so the on-change announce is isolated.
+  announceForAccessibility.mockClear();
+
+  // Simulate an Apply committing a new committed (1 -> 2 always-on domains).
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'a.com', alwaysOn: true },
+          { hostname: 'b.com', alwaysOn: true },
+        ],
+      },
+    });
+  });
+
+  // The header count updates to 2 (tabular-nums, plural).
+  expect(extractText(testRenderer.toJSON())).toContain('2 domains');
+  // The StatusHeader on-change announce fires with the new count.
+  expect(announceForAccessibility).toHaveBeenCalledWith('2 domains blocked');
+
+  // Restore the empty baseline.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
+});
+
+// AC: Given the user navigates (⌘1-⌘4), the nav announce speaks the real
+// effective count (not "0 domains"). Seeds committed with 2 always-on, then
+// ⌘2 (Timer) and asserts the announce is "Timer, 2 domains".
+test('the nav announce uses the real effective count (not hardcoded "0 domains")', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'a.com', alwaysOn: true },
+          { hostname: 'b.com', alwaysOn: true },
+        ],
+      },
+    });
+  });
+  const testRenderer = renderShell();
+  // Clear the Blocklist mount announce so the nav announce is isolated.
+  announceForAccessibility.mockClear();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '2' } });
+  });
+
+  expect(announceForAccessibility).toHaveBeenCalledWith('Timer, 2 domains');
+  // Restore the empty baseline.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
+});
+
+// AC: Given app launch, StatusHeader does NOT announce on mount. The Blocklist
+// surface's mount-announce (`Blocklist.tsx`) already speaks "Blocklist, N
+// domains, M always-on" on entry; StatusHeader's first-run guard skips the
+// initial mount to avoid double-announcing. Filters the mock calls for the
+// StatusHeader announce pattern ("N domain(s) blocked"); it must be empty.
+test('StatusHeader does NOT announce on the initial mount (Blocklist entry announce covers it)', async () => {
+  // Ensure committed is clean (empty) so the effective count is 0.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
+  announceForAccessibility.mockClear();
+  renderShell();
+  // The Blocklist surface's mount announce fires ("Blocklist, 0 domains, 0
+  // always-on"), but the StatusHeader's on-change announce must NOT — its
+  // first-run guard skips the initial mount. Filter for the StatusHeader
+  // announce pattern ("N domain(s) blocked"); it must be empty.
+  const blockedAnnounces = announceForAccessibility.mock.calls
+    .map((c) => String(c[0]))
+    .filter((s) => /domains? blocked$/.test(s));
+  expect(blockedAnnounces).toEqual([]);
+});
+
+// I/O Matrix row 3 — staged edit, not yet applied -> header count unchanged.
+// The count reflects `committed` (applied), NOT `staged` (pending). Seeds
+// committed with exactly 1 always-on domain, renders, asserts the header reads
+// "1 domain". Then sets `staged` to a draft with a pending add (committed
+// UNCHANGED), re-extracts the header text, and asserts it STILL reads
+// "1 domain" — the pending edit must NOT move the count until Apply commits.
+test('the header count reflects committed, not staged (a pending staged edit does not move it)', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [{ hostname: 'a.com', alwaysOn: true }],
+      },
+      staged: null,
+    });
+  });
+  const testRenderer = renderShell();
+  expect(extractText(testRenderer.toJSON())).toContain('1 domain');
+
+  // Stage a pending add (a new always-on domain) — committed is UNCHANGED.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      staged: [
+        { hostname: 'a.com', alwaysOn: true },
+        { hostname: 'new.com', alwaysOn: true },
+      ],
+    });
+  });
+
+  // The header count is UNCHANGED — it reads `committed`, not `staged`. The
+  // pending add does not move the count until Apply commits it.
+  expect(extractText(testRenderer.toJSON())).toContain('1 domain');
+  // Guard: the staged draft has 2 domains, but the header must NOT show "2
+  // domains" (that would mean it is counting staged, not committed).
+  expect(extractText(testRenderer.toJSON())).not.toContain('2 domains');
+
+  // Restore the empty baseline + clear the staged draft.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: { ...DEFAULT_CONFIG },
+      staged: null,
+    });
+  });
+});
+
+// Always clause — the count numeral uses `fontVariant: ['tabular-nums']` so
+// digit width is fixed and the header does not jitter as the count changes
+// (9 -> 10). Reuses the proven `tokens.typography.countdown` pattern
+// (`tokens.ts:120`). Pins the load-bearing `fontVariant` on the count `Text`
+// (same pinning discipline as DomainRow.test's `focusable` pin).
+test('the count numeral uses tabular figures (fontVariant tabular-nums)', async () => {
+  // Seed committed with 2 always-on domains -> effective count 2 -> the count
+  // Text label is "2 domains".
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'a.com', alwaysOn: true },
+          { hostname: 'b.com', alwaysOn: true },
+        ],
+      },
+    });
+  });
+  const testRenderer = renderShell();
+
+  // Find the count Text node whose children is the count label string
+  // ("N domains" / "N domain"). The separator dots ("·"), "Free", "no active
+  // timer", hostnames, etc. do NOT match `/^\d+ domains?$/`.
+  const countTexts = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.children === 'string' &&
+      /^\d+ domains?$/.test(node.props.children),
+  );
+  // React-Native's `Text` exposes its string children through an internal
+  // nested `Text` instance too (both carry the same `children` + style), so
+  // `findAll` returns >=1 match for the single rendered count `Text`. We only
+  // need at least one; `toJSON()` (the real host tree) has exactly one count
+  // Text, so we pin the style on `countTexts[0]`.
+  expect(countTexts.length).toBeGreaterThanOrEqual(1);
+
+  // Read `fontVariant` from the (possibly array) style prop — mirrors the
+  // array-aware `styleOpacity` helper in DomainRow.test.tsx.
+  const fontVariant = styleFontVariant(countTexts[0].props.style);
+  expect(fontVariant).toContain('tabular-nums');
+
+  // Restore the empty baseline.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
+});
+
+// AC (I/O matrix row 5 — "nav announce likewise"): the nav announce uses the
+// singular form when the effective count is 1. The plural nav-announce test
+// above seeds 2; this seeds exactly 1 always-on and asserts "Timer, 1 domain"
+// (singular), exercising the `count === 1` branch of `Shell.selectRow`'s ternary
+// that no other test reaches.
+test('the nav announce uses the singular form when the effective count is 1', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [{ hostname: 'solo.com', alwaysOn: true }],
+      },
+    });
+  });
+  const testRenderer = renderShell();
+  announceForAccessibility.mockClear();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '2' } });
+  });
+
+  expect(announceForAccessibility).toHaveBeenCalledWith('Timer, 1 domain');
+  // Restore the empty baseline.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
+});
+
+// AC (Always clause; verification gap): the count is
+// `effectiveBlocklist(committed).length` — effectiveBlocklist normalises each
+// hostname and DEDUPES by apex (effectiveBlocklist.ts:37-48), so a corrupt
+// config holding duplicate-by-apex always-on entries (e.g. `a.com` and
+// `www.a.com`, which both normalise to apex `a.com`) must count as 1, NOT 2.
+// A regression to `committed.domains.filter(d => d.alwaysOn).length` would
+// render "2 domains" here. No other count test distinguishes the two (every
+// other seed uses distinct normalised apexes).
+test('the count dedupes always-on domains that normalise to the same apex (effectiveBlocklist, not a raw alwaysOn filter)', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'a.com', alwaysOn: true },
+          { hostname: 'www.a.com', alwaysOn: true },
+        ],
+      },
+    });
+  });
+  const testRenderer = renderShell();
+  const text = extractText(testRenderer.toJSON());
+  // Both entries normalise to apex `a.com` -> effective count 1 (deduped).
+  expect(text).toContain('1 domain');
+  // A raw alwaysOn filter would count 2; effectiveBlocklist must not.
+  expect(text).not.toContain('2 domains');
+  // Restore the empty baseline.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
 });
 
 // AC: the focusable container declares ⌘1-⌘4 + ⌘N as handled key events (so

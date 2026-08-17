@@ -30,6 +30,7 @@ import { StatusHeader } from './StatusHeader';
 import { SurfacePlaceholder, SURFACE_NAMES, type SurfaceIndex } from './surfaces';
 import { Blocklist } from './Blocklist';
 import { useDomainStore } from '../domain/store';
+import { effectiveBlocklist } from '../domain/effectiveBlocklist';
 
 /**
  * ⌘1-⌘4 select the four surfaces; ⌘N focuses the add-domain field (Story 2.2);
@@ -71,6 +72,11 @@ export function Shell(): React.ReactElement {
   // may read the same store.
   const staged = useDomainStore((s) => s.staged);
   const apply = useDomainStore((s) => s.apply);
+  // `committed` is read here so the nav announce (`selectRow`) can speak the
+  // real effective blocked count (Story 2.5), replacing the hardcoded "0
+  // domains" placeholder. `committed` updates only on Apply success, so the
+  // spoken count matches what is enforced right now.
+  const committed = useDomainStore((s) => s.committed);
 
   const selectRow = (i: number) => {
     setSurface(i as SurfaceIndex);
@@ -85,8 +91,13 @@ export function Shell(): React.ReactElement {
     // row, never the field, so `false` is correct in every case. Story 2.3.
     setAddFieldFocused(false);
     rowRefs[i].current?.focus();
+    // Story 2.5 — the nav announce uses the real effective blocked count
+    // (always-on domains enforced in /etc/hosts right now), not the hardcoded
+    // "0 domains" placeholder. Singular/plural applies. The spoken cue and the
+    // visible status header agree — both derive from `effectiveBlocklist(committed)`.
+    const count = effectiveBlocklist(committed).length;
     AccessibilityInfo.announceForAccessibility(
-      `${SURFACE_NAMES[i]}, 0 domains`,
+      `${SURFACE_NAMES[i]}, ${count} ${count === 1 ? 'domain' : 'domains'}`,
     );
   };
 
