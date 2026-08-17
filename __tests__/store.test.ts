@@ -146,6 +146,30 @@ test('stageDomainAdd stacks additional domains on top of the current draft', () 
   ]);
 });
 
+// Story 2.2 — pins the mid-run-edit invariant for `stageDomainAdd`. The
+// apply-queue's retain-newer-draft detection (`s.staged === stagedSnapshot` at
+// store.ts:182) relies on a newer draft being a DIFFERENT array reference from
+// the snapshot a running Apply captured. `stageDomainAdd` spreads `base`
+// (`store.ts:119`), so each add produces a NEW ref — but this was only
+// asserted for the toggle today, not for add. Two successive adds must yield
+// two distinct `staged` references (not in-place mutation), otherwise a second
+// add staged during an in-flight Apply would be silently clobbered on success.
+test('stageDomainAdd produces a NEW staged array reference on each add (preserves mid-run-edit detection)', () => {
+  useDomainStore.getState().stageDomainAdd('example.com');
+  const ref1 = useDomainStore.getState().staged;
+  expect(ref1).not.toBeNull();
+
+  useDomainStore.getState().stageDomainAdd('social.com');
+  const ref2 = useDomainStore.getState().staged;
+  // NEW array reference, not in-place mutation — a newer draft is always a
+  // different reference from the snapshot a running Apply captured.
+  expect(ref2).not.toBe(ref1);
+  expect(ref2).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+    { hostname: 'social.com', alwaysOn: true },
+  ]);
+});
+
 // ---------------------------------------------------------------------------
 // stageAlwaysOnToggle (Story 2.1)
 // ---------------------------------------------------------------------------

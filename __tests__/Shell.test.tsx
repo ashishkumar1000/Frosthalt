@@ -63,18 +63,28 @@ function renderShell() {
 }
 
 // Locate sidebar rows by their contract props (`onPress` fn +
-// `accessibilityRole: 'button'`) — NOT by `findByType(Pressable)`. Under pnpm +
-// RN 0.81's lazy component getters the imported `Pressable` is not
-// identity-equal to the one in the rendered tree, so `findByType(Pressable)`
-// finds nothing. The prop-based query is stable and says exactly what we
-// mean: "the row elements carrying the press handler." See the ApplyButton /
-// StatusBadge tests in 1.2 for the same pattern.
+// `accessibilityRole: 'button'` + a `selected` accessibilityState) — NOT by
+// `findByType(Pressable)`. Under pnpm + RN 0.81's lazy component getters the
+// imported `Pressable` is not identity-equal to the one in the rendered tree,
+// so `findByType(Pressable)` finds nothing. The prop-based query is stable and
+// says exactly what we mean: "the row elements carrying the press handler."
+//
+// The `accessibilityState.selected` discriminator was added in Story 2.2:
+// the Blocklist surface now renders an "Add" button (`ApplyButton`,
+// `accessibilityRole:'button'`) inside the empty state, so a bare
+// `onPress + accessibilityRole:'button'` query would also match that action
+// button. Sidebar rows carry `accessibilityState={{ selected }}` (always a
+// boolean); action buttons carry `accessibilityState={{ disabled }}` with no
+// `selected` key — so requiring `selected` to be present keeps the query
+// pinned to the four sidebar rows.
 function findRows(root: ReactTestRenderer.ReactTestInstance) {
   return root.findAll(
     (node) =>
       node.props &&
       typeof node.props.onPress === 'function' &&
-      node.props.accessibilityRole === 'button',
+      node.props.accessibilityRole === 'button' &&
+      node.props.accessibilityState != null &&
+      'selected' in node.props.accessibilityState,
   );
 }
 
@@ -323,10 +333,11 @@ test('the status header is present on every selected surface', async () => {
   }
 });
 
-// AC: the focusable container declares ⌘1-⌘4 as handled key events (so the
-// native default does not swallow them) and is focusable (so the bubbled key
-// events reach the handler from the focused row).
-test('the shell root is focusable and declares ⌘1-⌘4 as handled key events', async () => {
+// AC: the focusable container declares ⌘1-⌘4 + ⌘N as handled key events (so
+// the native default does not swallow them) and is focusable (so the bubbled
+// key events reach the handler from the focused row). ⌘N (focus the add field,
+// Story 2.2) was added to the handled set so Return-in-field works after ⌘N.
+test('the shell root is focusable and declares ⌘1-⌘4 + ⌘N as handled key events', async () => {
   const testRenderer = renderShell();
   const container = findKeyDownContainer(testRenderer.root);
   expect(container.props.focusable).toBe(true);
@@ -335,7 +346,45 @@ test('the shell root is focusable and declares ⌘1-⌘4 as handled key events',
     { key: '2', metaKey: true },
     { key: '3', metaKey: true },
     { key: '4', metaKey: true },
+    { key: 'n', metaKey: true },
   ]);
+});
+
+// Story 2.2 — ⌘N is declared in `keyDownEvents` so the native layer does not
+// swallow it before the Shell's `onKeyDown` can focus the add field. The
+// `addFieldRef.current?.focus()` call itself is native-runtime and not
+// unit-testable in the node jest env (same caveat as the 2.1 row-focus tests),
+// so this asserts the DECLARATION (the part that is testable here).
+test('⌘N is declared in keyDownEvents (focus the add field)', async () => {
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+  expect(container.props.keyDownEvents).toContainEqual({
+    key: 'n',
+    metaKey: true,
+  });
+});
+
+// Story 2.2 — ⌘N does NOT navigate away from the surface and does NOT announce
+// (it is a focus shortcut, not navigation). Guards against an `onKeyDown`
+// branch that accidentally falls through to `selectRow` or announces.
+test('⌘N does not navigate away and does not announce (focus-only shortcut)', async () => {
+  announceForAccessibility.mockClear();
+  const testRenderer = renderShell();
+  // Clear the Blocklist mount announce after render so the assertion isolates
+  // the keyDown behaviour.
+  announceForAccessibility.mockClear();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: 'n' } });
+  });
+
+  const rows = findRows(testRenderer.root);
+  // Still on row 0 (Blocklist) — ⌘N did not change the surface.
+  expect(rows[0].props.accessibilityState?.selected).toBe(true);
+  expect(selectedRowCount(rows)).toBe(1);
+  // ⌘N is focus-only — no VoiceOver announcement.
+  expect(announceForAccessibility).not.toHaveBeenCalled();
 });
 
 // ---------------------------------------------------------------------------
@@ -372,6 +421,18 @@ test('Shell renders the Blocklist surface content (not the placeholder) on surfa
   );
   expect(checkboxes.length).toBeGreaterThanOrEqual(1);
 
+  // The AddDomain field (Story 2.2) is present on the composed surface 0 — a
+  // node with `onChangeText` fn + `value` string (the TextInput host spreads
+  // these). Regression guard: catches AddDomain disappearing from the
+  // composed surface.
+  const addFields = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onChangeText === 'function' &&
+      typeof node.props.value === 'string',
+  );
+  expect(addFields.length).toBeGreaterThanOrEqual(1);
+
   // Navigate away to Timer (surface 1) then back to Blocklist (surface 0)
   // via ⌘2 then ⌘1 — the Blocklist surface must remount and re-render its
   // content (pins the navigate-away-and-back path, not just the mount).
@@ -387,6 +448,15 @@ test('Shell renders the Blocklist surface content (not the placeholder) on surfa
   const textAfterReturn = extractText(testRenderer.toJSON());
   expect(textAfterReturn).toContain('Blocklist');
   expect(textAfterReturn).toContain('example.com');
+  // The AddDomain field re-renders after the navigate-away-and-back remount.
+  expect(
+    testRenderer.root.findAll(
+      (node) =>
+        node.props &&
+        typeof node.props.onChangeText === 'function' &&
+        typeof node.props.value === 'string',
+    ).length,
+  ).toBeGreaterThanOrEqual(1);
 
   // Restore the empty baseline so this seed does not leak into other suites
   // that share the module-level store instance.

@@ -18,19 +18,28 @@ import {
   StyleSheet,
   View,
 } from 'react-native';
-import type { View as ViewType, HandledKeyEvent, NativeKeyEvent } from 'react-native';
+import type {
+  HandledKeyEvent,
+  NativeKeyEvent,
+  TextInput as TextInputType,
+  View as ViewType,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Sidebar } from './Sidebar';
 import { StatusHeader } from './StatusHeader';
 import { SurfacePlaceholder, SURFACE_NAMES, type SurfaceIndex } from './surfaces';
 import { Blocklist } from './Blocklist';
 
-/** ⌘1-⌘4 are the four surfaces; keys outside this set are ignored. */
+/**
+ * ⌘1-⌘4 select the four surfaces; ⌘N focuses the add-domain field (Story 2.2).
+ * Keys outside this set are ignored (the native default applies).
+ */
 const KEY_DOWN_EVENTS: HandledKeyEvent[] = [
   { key: '1', metaKey: true },
   { key: '2', metaKey: true },
   { key: '3', metaKey: true },
   { key: '4', metaKey: true },
+  { key: 'n', metaKey: true },
 ];
 
 export function Shell(): React.ReactElement {
@@ -42,6 +51,10 @@ export function Shell(): React.ReactElement {
     useRef<ViewType>(null),
     useRef<ViewType>(null),
   ];
+  // The add-domain field ref. ⌘N focuses it (`addFieldRef.current?.focus()`),
+  // mirroring the `selectRow` ref-focus pattern below. Owned here so the Shell
+  // can drive focus; passed down to <Blocklist/> -> <AddDomain/>.
+  const addFieldRef = useRef<TextInputType>(null);
 
   const selectRow = (i: number) => {
     setSurface(i as SurfaceIndex);
@@ -63,6 +76,14 @@ export function Shell(): React.ReactElement {
 
   const onKeyDown = (event: { nativeEvent: NativeKeyEvent }) => {
     const { metaKey, key } = event.nativeEvent;
+    // ⌘N focuses the add-domain field (context-aware — only the Blocklist
+    // surface renders the field, but the ref is always attached and a no-op
+    // focus when the surface is absent is harmless). No announce + no
+    // surface change: ⌘N is a focus shortcut, not navigation.
+    if (metaKey && key === 'n') {
+      addFieldRef.current?.focus();
+      return;
+    }
     // Gate on ⌘ AND key in 1-4. A plain 1-4 (no ⌘) must NOT navigate.
     if (metaKey && key >= '1' && key <= '4') {
       selectRow(Number(key) - 1);
@@ -92,7 +113,11 @@ export function Shell(): React.ReactElement {
           onSelect={selectRow}
           rowRefs={rowRefs}
         />
-        {surface === 0 ? <Blocklist /> : <SurfacePlaceholder surface={surface} />}
+        {surface === 0 ? (
+          <Blocklist addFieldRef={addFieldRef} />
+        ) : (
+          <SurfacePlaceholder surface={surface} />
+        )}
       </View>
     </View>
   );

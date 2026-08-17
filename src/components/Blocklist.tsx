@@ -27,16 +27,38 @@
  */
 
 import React, { useEffect } from 'react';
-import { AccessibilityInfo, Pressable, StyleSheet, Text, View } from 'react-native';
+import {
+  AccessibilityInfo,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
+import type { TextInput as TextInputType } from 'react-native';
 import { useDomainStore } from '../domain/store';
 import { tokens } from '../theme/tokens';
+import { AddDomain } from './AddDomain';
 import { ApplyButton } from './ApplyButton';
 import { DomainRow } from './DomainRow';
 
-/** Empty-state copy (presentational only — no Add button in 2.1; that is 2.2). */
+/**
+ * Empty-state copy. Story 2.2 adds the always-visible AddDomain field ABOVE
+ * this copy (the field is reachable in both the empty and populated states),
+ * so the copy now reads as a hint alongside the field rather than a standalone
+ * placeholder.
+ */
 const EMPTY_STATE_TEXT = 'No domains yet. Add one to start blocking.';
 
-export function Blocklist(): React.ReactElement {
+export interface BlocklistProps {
+  /**
+   * A ref to the AddDomain field's `TextInput`, owned by the Shell so ⌘N can
+   * focus it (`addFieldRef.current?.focus()`). Optional so tests / direct
+   * renders can mount `<Blocklist/>` without one.
+   */
+  addFieldRef?: React.RefObject<TextInputType | null>;
+}
+
+export function Blocklist({ addFieldRef }: BlocklistProps): React.ReactElement {
   const committed = useDomainStore((s) => s.committed);
   const staged = useDomainStore((s) => s.staged);
   const applyStatus = useDomainStore((s) => s.applyStatus);
@@ -71,6 +93,10 @@ export function Blocklist(): React.ReactElement {
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Blocklist</Text>
+      {/* The add field is always visible — above the rows AND in the empty
+          state, so it is reachable regardless of whether domains exist yet.
+          ⌘N (Shell) focuses the field via the forwarded ref. */}
+      <AddDomain ref={addFieldRef} />
       {isEmpty ? (
         <Text style={styles.body}>{EMPTY_STATE_TEXT}</Text>
       ) : (

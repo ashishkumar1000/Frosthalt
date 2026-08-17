@@ -47,7 +47,7 @@ development_status:
 
   epic-2: in-progress
   2-1-blocklist-surface-with-always-on-checkbox: done
-  2-2-add-domain-field-with-live-normalisation: backlog
+  2-2-add-domain-field-with-live-normalisation: review
   2-3-effective-blocklist-computation-and-apply-integration: backlog
   2-4-remove-domain-confirm-alert: backlog
   2-5-domain-count-in-the-status-header: backlog

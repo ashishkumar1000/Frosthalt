@@ -14,7 +14,8 @@
  *   - Apply is enabled when a staged draft exists.
  *   - Cancel-staged is only rendered when a staged draft exists.
  *   - Empty state: "No domains yet. Add one to start blocking." and no rows,
- *     no Apply, no Cancel (no Add button — that is Story 2.2).
+ *     no Apply, no Cancel. Story 2.2 now renders the AddDomain field (with its
+ *     Add button) ABOVE the empty-state copy, so the field is always reachable.
  *   - Optimistic render: `staged ?? committed.domains` flips the checkbox
  *     immediately on toggle.
  *
@@ -42,6 +43,7 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import { AccessibilityInfo } from 'react-native';
+import type { TextInput as TextInputType } from 'react-native';
 import { Blocklist } from '../src/components/Blocklist';
 import { useDomainStore } from '../src/domain/store';
 import { DEFAULT_CONFIG } from '../src/config/types';
@@ -103,6 +105,23 @@ function findButtonByLabel(
       typeof node.props.onPress === 'function' &&
       node.props.accessibilityRole === 'button' &&
       node.props.accessibilityLabel === label,
+  )[0];
+}
+
+/**
+ * Locate the AddDomain field by its contract props: a node with an
+ * `onChangeText` function and a `value` string (the TextInput host spreads
+ * these). Same finder pattern as AddDomain.test.tsx — NOT `findByType(TextInput)`
+ * (identity differs under pnpm + RN 0.81's lazy component getters).
+ */
+function findAddField(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance | undefined {
+  return root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onChangeText === 'function' &&
+      typeof node.props.value === 'string',
   )[0];
 }
 
@@ -173,6 +192,9 @@ test('Blocklist renders the committed domains as rows with a checkbox and hostna
   expect(text).toContain('social.com');
   // Two checkboxes — one per row.
   expect(findCheckboxes(testRenderer.root)).toHaveLength(2);
+  // The AddDomain field renders ALONGSIDE the rows (Story 2.2 composes it at
+  // the top of the surface, populated or empty).
+  expect(findAddField(testRenderer.root)).toBeDefined();
 });
 
 test('Blocklist checkbox checked state mirrors domain.alwaysOn', () => {
@@ -495,4 +517,70 @@ test('checkboxes are disabled while an Apply run is in flight', () => {
   expect(checkboxes).toHaveLength(1);
   expect(checkboxes[0].props.disabled).toBe(true);
   expect(checkboxes[0].props.accessibilityState?.disabled).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// Story 2.2 — composition: Blocklist renders + forwards AddDomain, and a clean
+// Add flows through to a staged DomainRow + Apply enabled. Covers the
+// Blocklist -> AddDomain -> store -> DomainRow seam: if Blocklist stops
+// rendering or forwarding AddDomain, or Add stops wiring to stageDomainAdd,
+// this fails.
+// ---------------------------------------------------------------------------
+
+test('Blocklist renders AddDomain, forwards the add-field ref, and a clean Add stages a new DomainRow + enables Apply', () => {
+  seedState({ domains: [] });
+
+  const addFieldRef = React.createRef<TextInputType>();
+  let testRenderer!: ReturnType<typeof ReactTestRenderer.create>;
+  ReactTestRenderer.act(() => {
+    testRenderer = ReactTestRenderer.create(
+      <Blocklist addFieldRef={addFieldRef} />,
+    );
+  });
+  currentRenderer = testRenderer;
+
+  // (a) The AddDomain field is present on the composed surface.
+  const field = findAddField(testRenderer.root);
+  expect(field).toBeDefined();
+
+  // (b) The ref flows through Blocklist -> AddDomain's forwarded TextInput.
+  // The actual `.focus()` is native-runtime (not unit-testable here — same
+  // caveat as the 2.1 row-focus tests), so we assert the ref ATTACHES, which is
+  // what the Shell's ⌘N handler relies on.
+  expect(addFieldRef.current).not.toBeNull();
+
+  // (c) Type a clean new domain into the field and press Add — the real
+  // store action stages it, a new DomainRow (checkbox) for that hostname
+  // appears, and Apply becomes enabled. No mock: this exercises the full
+  // Blocklist -> AddDomain -> store -> DomainRow path with the real action.
+  ReactTestRenderer.act(() => {
+    field!.props.onChangeText('newsite.com');
+  });
+  const addButton = findButtonByLabel(testRenderer.root, 'Add');
+  expect(addButton).toBeDefined();
+  // Add is enabled for a clean new domain.
+  expect(addButton!.props.disabled).toBe(false);
+
+  ReactTestRenderer.act(() => {
+    addButton!.props.onPress();
+  });
+
+  // The store staged the domain (alwaysOn:true) via the real stageDomainAdd.
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'newsite.com', alwaysOn: true },
+  ]);
+  // A DomainRow (checkbox) for the new hostname is now rendered.
+  const checkboxes = findCheckboxes(testRenderer.root);
+  expect(checkboxes).toHaveLength(1);
+  expect(checkboxes[0].props.accessibilityLabel).toBe(
+    'Always-on for newsite.com',
+  );
+  expect(checkboxes[0].props.accessibilityState).toEqual({
+    checked: true,
+    disabled: false,
+  });
+  // Apply is enabled (a staged draft exists).
+  const apply = findButtonByLabel(testRenderer.root, 'Apply');
+  expect(apply).toBeDefined();
+  expect(apply!.props.disabled).toBe(false);
 });
