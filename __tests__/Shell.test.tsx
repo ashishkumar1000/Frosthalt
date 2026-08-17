@@ -274,12 +274,16 @@ test('clicking a sidebar row selects it and swaps the content to that surface', 
   expect(selectedRowCount(rowsAfterTimer)).toBe(1);
   expect(rowsAfterTimer[1].props.accessibilityState?.selected).toBe(true);
 
-  // Click the Settings row (index 3) — content swaps again.
+  // Click the Settings row (index 3) — content swaps again. Story 3.1 made
+  // Settings a real screen: with no password set (the store default) it renders
+  // the SetPassword form, so the placeholder copy is gone and the form's
+  // submit label is present.
   await ReactTestRenderer.act(() => {
     rowsAfterTimer[3].props.onPress();
   });
   json = testRenderer.toJSON();
-  expect(extractText(json)).toContain('App settings will appear here');
+  expect(extractText(json)).not.toContain('App settings will appear here');
+  expect(extractText(json)).toContain('Set password');
   const rowsAfterSettings = findRows(testRenderer.root);
   expect(selectedRowCount(rowsAfterSettings)).toBe(1);
   expect(rowsAfterSettings[3].props.accessibilityState?.selected).toBe(true);

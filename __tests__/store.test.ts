@@ -37,6 +37,7 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 import { useDomainStore } from '../src/domain/store';
 import { stagedChangeCount } from '../src/domain/stagedChangeCount';
 import { DEFAULT_CONFIG } from '../src/config/types';
+import { hashPassword } from '../src/config/password';
 import type { WriteResult } from '../src/hosts/shellRunner';
 
 type NativeConfigMock = { readConfig: jest.Mock; writeConfig: jest.Mock };
@@ -1259,4 +1260,174 @@ test('restoreSection never rejects when writeHosts throws — the port catches i
   expect(result).toStrictEqual({ ok: false, error: 'port died' });
   expect(shellNative.readHostsSection).not.toHaveBeenCalled();
   expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// ===========================================================================
+// Story 3.1 — setPassword (non-block-affecting direct config commit)
+// ===========================================================================
+//
+// setPassword writes `passwordHash` (salt-free SHA-256) straight to config.json
+// via writeConfig — NOT through the staged-Apply pipeline, does NOT touch
+// /etc/hosts. Sequenced through the shared serialized queue so it cannot
+// clobber an in-flight Apply's writeConfig. `committed` is re-read INSIDE the
+// enqueue at run time so the password write preserves any domains an ahead-of-
+// it Apply just committed.
+
+test('setPassword writes the SHA-256 hash to config, advances committed, and returns { ok: true }', async () => {
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+
+  const result = await useDomainStore.getState().setPassword('secret123');
+
+  // `writeConfig` returns `{ ok, error: undefined }` (the configStore port
+  // always includes the `error` key), so `toEqual` (which ignores undefined
+  // keys) is the right matcher — `toStrictEqual` would flag the extra key.
+  expect(result).toEqual({ ok: true });
+  // writeConfig called exactly once with the full next config carrying the
+  // hash. The hash is the salt-free SHA-256 of the plaintext.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.passwordHash).toBe(hashPassword('secret123'));
+  // Plaintext is never persisted — the written config contains the hash, not
+  // the password.
+  expect(configNative.writeConfig.mock.calls[0][0]).not.toContain('secret123');
+  // committed advanced to carry the hash.
+  expect(useDomainStore.getState().committed.passwordHash).toBe(
+    hashPassword('secret123'),
+  );
+});
+
+test('setPassword does NOT call writeHosts (non-block-affecting: no /etc/hosts touch)', async () => {
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+
+  await useDomainStore.getState().setPassword('secret123');
+
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+});
+
+test('setPassword on writeConfig failure returns the envelope and leaves committed unchanged', async () => {
+  configNative.writeConfig.mockReturnValue({ ok: false, error: 'disk-full' });
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+
+  const result = await useDomainStore.getState().setPassword('secret123');
+
+  expect(result).toStrictEqual({ ok: false, error: 'disk-full' });
+  // committed.passwordHash stays unset (no half-advance on failure).
+  expect(useDomainStore.getState().committed.passwordHash).toBeUndefined();
+});
+
+test('setPassword does NOT flip applyStatus (it is not an Apply run)', async () => {
+  useDomainStore.setState({ committed: DEFAULT_CONFIG, applyStatus: 'idle' });
+
+  await useDomainStore.getState().setPassword('secret123');
+
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+test('setPassword queued behind an in-flight Apply does NOT clobber the Apply\'s writeConfig — password write preserves the Apply\'s committed domains', async () => {
+  // Stage a domain and start an Apply whose writeHosts does not resolve until
+  // we release it, so the Apply stays in flight while setPassword queues.
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+  let resolveApply: ((v: WriteResult) => void) | null = null;
+  shellNative.writeHosts.mockImplementation(
+    () =>
+      new Promise<WriteResult>((res) => {
+        resolveApply = res;
+      }),
+  );
+
+  useDomainStore.getState().stageDomainAdd('example.com');
+  const applyP = useDomainStore.getState().apply();
+  await flushMicrotasks();
+  expect(useDomainStore.getState().applyStatus).toBe('running');
+
+  // While the Apply is in flight, call setPassword — it queues behind it.
+  const pwP = useDomainStore.getState().setPassword('secret123');
+  await flushMicrotasks();
+  // The Apply has not settled yet, so setPassword must NOT have run — only
+  // the Apply's writeConfig (config commit) has happened so far.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+
+  // Release the Apply: it commits staged domains, THEN setPassword runs and
+  // writes {...committed (now with the Apply's domains), passwordHash}.
+  resolveApply!({ ok: true });
+  const [applyRes, pwRes] = await Promise.all([applyP, pwP]);
+
+  expect(applyRes).toStrictEqual({ ok: true });
+  // setPassword returns the writeConfig envelope, which carries an explicit
+  // `error: undefined` key — `toEqual` ignores it.
+  expect(pwRes).toEqual({ ok: true });
+  // Two writeConfig calls total: the Apply's (config commit) + the password
+  // write. setPassword did NOT overlap the Apply's writeConfig.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(2);
+  // The password write (the second call) built on the RUN-TIME committed,
+  // which now carries the Apply's just-committed domains. So the written
+  // config preserves domains AND adds passwordHash — no clobber.
+  const pwWritten = JSON.parse(configNative.writeConfig.mock.calls[1][0]);
+  expect(pwWritten.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  expect(pwWritten.passwordHash).toBe(hashPassword('secret123'));
+  // Plaintext is never persisted — the serialized config carries the hash only.
+  expect(configNative.writeConfig.mock.calls[1][0]).not.toContain('secret123');
+  // committed reflects both writes: the Apply's domains + the password hash.
+  const state = useDomainStore.getState();
+  expect(state.committed.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  expect(state.committed.passwordHash).toBe(hashPassword('secret123'));
+  // writeHosts called exactly once (by the Apply) — setPassword never calls it.
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+});
+test('back-to-back setPassword calls serialize: the second write carries the latest hash, not a stale snapshot', async () => {
+  // Two setPassword calls queue FIFO. The first writes hashA and advances
+  // committed; the second re-reads committed at run time (now carrying hashA)
+  // and overwrites passwordHash with hashB. Final committed.passwordHash is
+  // hashB — the second call did not build on a stale call-time snapshot.
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+
+  const [r1, r2] = await Promise.all([
+    useDomainStore.getState().setPassword('firstpw'),
+    useDomainStore.getState().setPassword('secondpw'),
+  ]);
+
+  expect(r1).toEqual({ ok: true });
+  expect(r2).toEqual({ ok: true });
+  // Two serialized writeConfig calls.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(2);
+  // The first written config carries hashA; the second carries hashB.
+  const first = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  const second = JSON.parse(configNative.writeConfig.mock.calls[1][0]);
+  expect(first.passwordHash).toBe(hashPassword('firstpw'));
+  expect(second.passwordHash).toBe(hashPassword('secondpw'));
+  // Final committed reflects the LAST write (hashB), not hashA.
+  expect(useDomainStore.getState().committed.passwordHash).toBe(
+    hashPassword('secondpw'),
+  );
+});
+
+test('setPassword persists committed only — staged (un-Applied) domain changes are NOT silently written to config', async () => {
+  // Guards against a future regression that spreads `staged` instead of
+  // `committed` into the password write. The user stages a domain (not yet
+  // Applied) then sets a password: the written config must carry the hash on
+  // top of `committed` (no staged domain), and the staged draft must remain
+  // untouched for a later Apply.
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+  useDomainStore.getState().stageDomainAdd('example.com');
+  // Sanity: the stage took and is not yet committed.
+  expect(useDomainStore.getState().staged).not.toBeNull();
+  expect(useDomainStore.getState().committed.domains).toStrictEqual([]);
+
+  await useDomainStore.getState().setPassword('secret123');
+
+  // The written config carries the hash but NOT the staged domain.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.passwordHash).toBe(hashPassword('secret123'));
+  expect(written.domains).toStrictEqual([]);
+  // committed gained the hash but no domain; staged is unchanged.
+  expect(useDomainStore.getState().committed.domains).toStrictEqual([]);
+  expect(useDomainStore.getState().committed.passwordHash).toBe(
+    hashPassword('secret123'),
+  );
+  expect(useDomainStore.getState().staged).not.toBeNull();
 });

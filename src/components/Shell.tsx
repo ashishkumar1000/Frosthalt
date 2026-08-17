@@ -29,6 +29,7 @@ import { Sidebar } from './Sidebar';
 import { StatusHeader } from './StatusHeader';
 import { SurfacePlaceholder, SURFACE_NAMES, type SurfaceIndex } from './surfaces';
 import { Blocklist } from './Blocklist';
+import { Settings } from './Settings';
 import { HostsViewer } from './HostsViewer';
 import { useDomainStore } from '../domain/store';
 import { effectiveBlocklist } from '../domain/effectiveBlocklist';
@@ -193,6 +194,8 @@ export function Shell(): React.ReactElement {
             addFieldRef={addFieldRef}
             onFocusChange={setAddFieldFocused}
           />
+        ) : surface === 3 ? (
+          <Settings />
         ) : (
           <SurfacePlaceholder surface={surface} />
         )}

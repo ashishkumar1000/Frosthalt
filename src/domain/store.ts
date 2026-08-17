@@ -57,7 +57,8 @@
 
 import { create } from 'zustand';
 import type { Config, Domain } from '../config/types';
-import { readConfig } from '../config/configStore';
+import { readConfig, writeConfig } from '../config/configStore';
+import { hashPassword } from '../config/password';
 import { normaliseDomain } from './normalise';
 import { runApply } from './apply';
 import { effectiveHostsLines } from './effectiveBlocklist';
@@ -132,6 +133,24 @@ export interface DomainState {
    * writes HOSTS only (config.json is canonical and unchanged by drift).
    */
   restoreSection: () => Promise<WriteResult>;
+  /**
+   * Set the self-discipline password (Story 3.1). Non-block-affecting direct
+   * config commit (AD-6): builds `{...committed, passwordHash: hashPassword(pw)}`
+   * and writes it to `config.json` via `writeConfig` — NOT through the staged-
+   * Apply pipeline, does NOT touch `/etc/hosts`. Plaintext is hashed in the JS
+   * layer and never persisted (AD-9).
+   *
+   * Race-safe vs Apply (the spec's Always constraint): the write is sequenced
+   * through the SAME serialized queue the Apply pipeline uses, so a direct
+   * `writeConfig` can never overlap (clobber) an in-flight Apply's `writeConfig`.
+   * `committed` is re-read INSIDE the enqueue at run time (not captured at call
+   * time) so the password write preserves any domains an ahead-of-it Apply just
+   * committed — mirroring `restoreSection`'s run-time re-read. On `ok` the
+   * `committed` state is advanced to the new config (carrying `passwordHash`);
+   * on a `writeConfig` failure `committed` is left unchanged and the error
+   * envelope is returned for the UI to surface.
+   */
+  setPassword: (pw: string) => Promise<WriteResult>;
 }
 
 export const useDomainStore = create<DomainState>()((set, get) => ({
@@ -339,6 +358,51 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
         // warning stays; no auto-re-add loop (spec: Never). `lastResult` is set
         // so the UI status line reflects the denial.
         set({ applyStatus: 'idle', lastResult: result });
+      }
+      return result;
+    });
+  },
+
+  setPassword: (pw) => {
+    // Non-block-affecting direct config commit (AD-6): write `passwordHash`
+    // straight to `config.json` via `writeConfig` — NOT through the staged-
+    // Apply pipeline, does NOT touch `/etc/hosts` (no `writeHosts`, no admin
+    // prompt). The hash is computed in the JS layer (`hashPassword` =
+    // salt-free SHA-256, AD-9); plaintext is never persisted.
+    //
+    // Race-safety (the spec's Always constraint): route the write through the
+    // SAME serialized queue Apply uses (`enqueue`), so a direct `writeConfig`
+    // can never overlap an in-flight Apply's `writeConfig`. The queue is FIFO
+    // and single-flight, so if an Apply is running when the user sets a
+    // password, this write waits for the Apply to settle, then runs with the
+    // Apply's just-committed domains already in `committed` — the password
+    // write cannot clobber the Apply's `writeConfig` (the spec's AC).
+    //
+    // `committed` is re-read INSIDE the enqueue (at run time), NOT captured at
+    // call time. If an Apply queued ahead of this write commits new domains
+    // while we wait, the password write must build on the CURRENT committed —
+    // not a stale call-time snapshot, which would clobber the Apply's just-
+    // written domains (mirrors `restoreSection`'s run-time re-read at
+    // store.ts:321). `writeConfig` serializes the WHOLE config, so the full
+    // next `Config` is built here: `{...committed, passwordHash}`.
+    //
+    // `applyStatus` is NOT flipped: this is not an Apply run (no admin prompt,
+    // no `/etc/hosts` write), so the Blocklist Apply button is not disabled by
+    // a password save. `writeConfig` is a synchronous native call, so the
+    // enqueued job settles in a single microtask; the UI awaits the returned
+    // promise for its own saving/saved state.
+    return enqueue(async () => {
+      const committed = get().committed;
+      const nextConfig: Config = {
+        ...committed,
+        passwordHash: hashPassword(pw),
+      };
+      const result = writeConfig(nextConfig);
+      if (result.ok) {
+        // Advance committed to the new config (carrying `passwordHash`). On
+        // failure, leave committed unchanged and return the error envelope for
+        // the UI to surface ("Couldn't save password. No changes made.").
+        set({ committed: nextConfig });
       }
       return result;
     });

@@ -34,7 +34,12 @@ const EMPTY_STATE_TEXT: Record<SurfaceIndex, string> = {
   0: 'No domains yet. Add one to start blocking.',
   1: 'No timer running. Start one to block on a countdown.',
   2: 'No schedule set. Create one to block on a recurring window.',
-  3: 'App settings will appear here.',
+  // Surface 3 (Settings) is a real screen as of Story 3.1 — the placeholder
+  // copy is intentionally absent here so the placeholder is never rendered
+  // for it (the Shell routes surface 3 to <Settings/>). The registry
+  // (`SURFACE_NAMES`) stays intact so the sidebar label + VoiceOver announce
+  // are unchanged.
+  3: '',
 };
 
 export interface SurfacePlaceholderProps {
