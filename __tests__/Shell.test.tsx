@@ -74,6 +74,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { Shell } from '../src/components/Shell';
 import { useDomainStore } from '../src/domain/store';
 import { DEFAULT_CONFIG } from '../src/config/types';
+import { hashPassword } from '../src/config/password';
 import type { Domain } from '../src/config/types';
 import type { WriteResult } from '../src/hosts/shellRunner';
 
@@ -123,8 +124,18 @@ afterEach(() => {
   // later tests' count assertions (the old nav tests assert "0 domains", which
   // only holds when committed is empty). Reset the store to the empty baseline
   // after every test so each starts from a deterministic empty blocklist.
+  // Story 3.2 — also reset the gate runtime state so a prior test's open gate
+  // or wrong attempts can't leak into a later test (e.g. a leftover
+  // `gateOpen:true` would block the Return -> Apply guard).
   ReactTestRenderer.act(() => {
-    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG }, staged: null });
+    useDomainStore.setState({
+      committed: { ...DEFAULT_CONFIG },
+      staged: null,
+      gateOpen: false,
+      gateAction: null,
+      gateAttempts: 0,
+      gateThrottleUntil: null,
+    });
   });
 });
 
@@ -936,6 +947,12 @@ function seedForReturn(overrides: {
       // overwrites both), but reset here for test-isolation hygiene.
       drift: null,
       lastReadSection: null,
+      // Story 3.2 — reset the gate state so a prior test's open gate or wrong
+      // attempts can't block the Return -> Apply guard (`!gateOpen`).
+      gateOpen: false,
+      gateAction: null,
+      gateAttempts: 0,
+      gateThrottleUntil: null,
       // Always restore the real action so a previous test's mock cannot leak.
       apply: REAL_APPLY,
     });
@@ -1324,6 +1341,246 @@ test('bare Return does NOT fire apply() while the hosts viewer is open', async (
   expect(applyMock).not.toHaveBeenCalled();
 });
 
+// ===========================================================================
+// Story 3.2 — the password gate wiring: the Shell renders `<PasswordGate>`
+// when `gateOpen` is true, bare Escape closes the gate (calling `closeGate`,
+// which preserves the attempt counter), and bare Return does NOT fire Apply
+// while the gate is open (the gate is a window-level inert surface, mirroring
+// the hosts-viewer Return gate). The gate has no real caller in 3-2 (3-3
+// wires change-password first); these tests prove the Shell wiring so a
+// regression in the Esc branch or the `!gateOpen` guard surfaces here.
+// ===========================================================================
+
+/** Seed a password + open the gate via `requirePassword` (the real entry point). */
+function seedGateOpen(attempts = 0): void {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        passwordHash: hashPassword('secret123'),
+      },
+      // Reset any prior gate state, then open via the real action so the
+      // `gateAction` stash + `gateOpen` flag are set exactly as a caller
+      // would set them.
+      gateOpen: false,
+      gateAction: null,
+      gateAttempts: attempts,
+      gateThrottleUntil: null,
+    });
+  });
+  ReactTestRenderer.act(() => {
+    useDomainStore.getState().requirePassword(() => {});
+  });
+}
+
+/** Seed a password + open the gate via `requirePassword` with a REAL action. */
+function seedGateOpenWithAction(action: () => void, attempts = 0): void {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        passwordHash: hashPassword('secret123'),
+      },
+      gateOpen: false,
+      gateAction: null,
+      gateAttempts: attempts,
+      gateThrottleUntil: null,
+    });
+  });
+  ReactTestRenderer.act(() => {
+    useDomainStore.getState().requirePassword(action);
+  });
+}
+
+/** Find the gate's password field by accessibilityLabel 'Gate password'. */
+function findGateField(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance {
+  const matches = root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onChangeText === 'function' &&
+      node.props.accessibilityLabel === 'Gate password',
+  );
+  expect(matches.length).toBeGreaterThanOrEqual(1);
+  return matches[0];
+}
+
+/** Find the gate's Verify button by accessibilityLabel 'Verify'. */
+function findGateVerify(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance {
+  const matches = root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityRole === 'button' &&
+      node.props.accessibilityLabel === 'Verify',
+  );
+  expect(matches.length).toBeGreaterThanOrEqual(1);
+  return matches[0];
+}
+
+// AC: Given the gate is open, when the user presses Esc, then the sheet
+// closes, the action does NOT fire, and the attempt counter is preserved.
+test('bare Escape closes the password gate (calls closeGate) and preserves the attempt counter', async () => {
+  seedGateOpen(2);
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+  expect(useDomainStore.getState().gateAttempts).toBe(2);
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  // The gate's title is present while open.
+  expect(extractText(testRenderer.toJSON())).toContain('Enter password');
+
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Escape' } });
+  });
+
+  // The gate closed.
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+  expect(useDomainStore.getState().gateAction).toBeNull();
+  expect(extractText(testRenderer.toJSON())).not.toContain('Enter password');
+  // The attempt counter is PRESERVED (Esc does NOT reset it — the spec's Never).
+  expect(useDomainStore.getState().gateAttempts).toBe(2);
+});
+
+// AC: Given the gate is open, when the user presses Return, then Apply does
+// NOT fire (the gate blocks the Return -> Apply shortcut). Seeds a staged
+// draft so bare Return WOULD fire Apply if the gate were absent, opens the
+// gate, fires Return, asserts apply was NOT called.
+test('bare Return does NOT fire apply() while the password gate is open', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+  // Now open the gate on top of the staged draft.
+  seedGateOpen(0);
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  // apply() was NOT called — the `!gateOpen` gate held.
+  expect(applyMock).not.toHaveBeenCalled();
+});
+
+// AC: the Shell renders `<PasswordGate>` when `gateOpen` is true (the gate
+// title appears), and does NOT render it when `gateOpen` is false.
+test('the Shell renders the PasswordGate sheet when gateOpen is true', async () => {
+  seedGateOpen(0);
+  const testRenderer = renderShell();
+  expect(extractText(testRenderer.toJSON())).toContain('Enter password');
+  // The gate's Verify button is present.
+  const verify = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityRole === 'button' &&
+      node.props.accessibilityLabel === 'Verify',
+  );
+  expect(verify.length).toBeGreaterThanOrEqual(1);
+});
+
+test('the Shell does NOT render the PasswordGate sheet when gateOpen is false', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: { ...DEFAULT_CONFIG },
+      gateOpen: false,
+    });
+  });
+  const testRenderer = renderShell();
+  expect(extractText(testRenderer.toJSON())).not.toContain('Enter password');
+});
+
+// AC: Given no password is set, when a caller invokes `requirePassword(action)`,
+// then `action` runs immediately and no sheet renders (the no-op short-
+// circuit). Proves the gate is dormant in 3-2 (no caller yet) — a direct
+// `requirePassword` call with no hash runs the action and keeps the gate
+// closed.
+test('requirePassword with no password set runs the action immediately and renders NO gate sheet', async () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+  });
+  const testRenderer = renderShell();
+  const action = jest.fn();
+  ReactTestRenderer.act(() => {
+    useDomainStore.getState().requirePassword(action);
+  });
+  expect(action).toHaveBeenCalledTimes(1);
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+  expect(extractText(testRenderer.toJSON())).not.toContain('Enter password');
+});
+
+// Review patch (step-04): the runGateAction SUCCESS path — the one piece of new
+// Shell behavior tying the gate to callers. Without this, a regression in the
+// onVerified wiring (or runGateAction / closeGate) ships green because the
+// store-level test simulates runGateAction by hand. This exercises the REAL
+// Shell wiring: type the correct password into the rendered gate, press Verify,
+// and assert the stashed action ran + the gate closed.
+test('end-to-end: typing the correct password runs the stashed action + closes the gate (runGateAction success path)', async () => {
+  const action = jest.fn();
+  seedGateOpenWithAction(action);
+  const testRenderer = renderShell();
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+  expect(useDomainStore.getState().gateAction).toBe(action);
+
+  // Type the correct password + press Verify (the real onVerified -> runGateAction).
+  ReactTestRenderer.act(() => {
+    findGateField(testRenderer.root).props.onChangeText('secret123');
+  });
+  await ReactTestRenderer.act(async () => {
+    findGateVerify(testRenderer.root).props.onPress();
+    await Promise.resolve();
+  });
+
+  // The stashed action ran exactly once (runGateAction fired it).
+  expect(action).toHaveBeenCalledTimes(1);
+  // The gate closed + cleared; verifyPassword reset attempts on success.
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+  expect(useDomainStore.getState().gateAction).toBeNull();
+  expect(useDomainStore.getState().gateAttempts).toBe(0);
+  // The sheet unmounted.
+  expect(extractText(testRenderer.toJSON())).not.toContain('Enter password');
+});
+
+// Review patch (step-04): pins the call-time read in runGateAction. If it
+// captured `gateAction` at RENDER time, re-stashing a new action after render
+// (then verifying) would run the STALE (old) action. Reading via `getState()`
+// at call time runs the new one.
+test('runGateAction reads gateAction at CALL TIME, not render time (a re-stash after render runs the NEW action)', async () => {
+  const actionA = jest.fn();
+  const actionB = jest.fn();
+  seedGateOpenWithAction(actionA);
+  const testRenderer = renderShell();
+
+  // Re-stash a NEW action after the Shell has rendered (gateAction: A -> B).
+  ReactTestRenderer.act(() => {
+    useDomainStore.getState().requirePassword(actionB);
+  });
+  expect(useDomainStore.getState().gateAction).toBe(actionB);
+
+  // Type the correct password + press Verify.
+  ReactTestRenderer.act(() => {
+    findGateField(testRenderer.root).props.onChangeText('secret123');
+  });
+  await ReactTestRenderer.act(async () => {
+    findGateVerify(testRenderer.root).props.onPress();
+    await Promise.resolve();
+  });
+
+  // The NEW action (B) ran — not the stale (A).
+  expect(actionB).toHaveBeenCalledTimes(1);
+  expect(actionA).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+});
+
 // Restore the real apply after the Return -> Apply test module's last test, so
 // no mock leaks into suites that share the module-level store instance. (Each
 // `seedForReturn` also restores, but this is a belt-and-braces cleanup for the
@@ -1334,6 +1591,10 @@ afterAll(() => {
       apply: REAL_APPLY,
       committed: { ...DEFAULT_CONFIG },
       staged: null,
+      gateOpen: false,
+      gateAction: null,
+      gateAttempts: 0,
+      gateThrottleUntil: null,
     });
   });
 });

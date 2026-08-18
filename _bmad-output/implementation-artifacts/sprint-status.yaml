@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-14-2026 00:19
-last_updated: 08-17-2026
+last_updated: 08-18-2026
 project: Frosthalt
 project_key: NOKEY
 tracking_system: file-system
@@ -56,7 +56,7 @@ development_status:
 
   epic-3: in-progress
   3-1-set-password-salt-free-sha-256: review
-  3-2-password-gate-sheet-reusable: backlog
+  3-2-password-gate-sheet-reusable: review
   3-3-danger-zone-section-and-change-password: backlog
   3-4-panic-unblock-password-gated: backlog
   epic-3-retrospective: optional

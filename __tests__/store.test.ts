@@ -37,7 +37,11 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 import { useDomainStore } from '../src/domain/store';
 import { stagedChangeCount } from '../src/domain/stagedChangeCount';
 import { DEFAULT_CONFIG } from '../src/config/types';
-import { hashPassword } from '../src/config/password';
+import {
+  hashPassword,
+  GATE_MAX_ATTEMPTS,
+  GATE_THROTTLE_MS,
+} from '../src/config/password';
 import type { WriteResult } from '../src/hosts/shellRunner';
 
 type NativeConfigMock = { readConfig: jest.Mock; writeConfig: jest.Mock };
@@ -72,7 +76,9 @@ beforeEach(() => {
   // always settled between tests (each test awaits its applies), so only the
   // store STATE needs resetting. `drift` is reset to null (unchecked);
   // `lastReadSection` is reset to null (Story 2.6 — the viewer's verbatim body
-  // source).
+  // source). Story 3.2 — the gate runtime state (`gateOpen`/`gateAction`/
+  // `gateAttempts`/`gateThrottleUntil`) is reset too so a prior test's wrong
+  // attempts or an open gate can't leak into the next test.
   useDomainStore.setState({
     committed: DEFAULT_CONFIG,
     staged: null,
@@ -80,6 +86,10 @@ beforeEach(() => {
     lastResult: null,
     drift: null,
     lastReadSection: null,
+    gateOpen: false,
+    gateAction: null,
+    gateAttempts: 0,
+    gateThrottleUntil: null,
   });
 });
 
@@ -1430,4 +1440,393 @@ test('setPassword persists committed only — staged (un-Applied) domain changes
     hashPassword('secret123'),
   );
   expect(useDomainStore.getState().staged).not.toBeNull();
+});
+
+// ===========================================================================
+// Story 3.2 — the reusable password gate: `requirePassword` /
+// `verifyPassword` / `closeGate` / `clearGateThrottle`. Runtime-only state
+// (`gateOpen`/`gateAction`/`gateAttempts`/`gateThrottleUntil`) — NOT persisted
+// to `config.json`, NOT in `Config`/`types.ts`. The gate is built ONCE and
+// reused by every gated caller; these tests prove the mechanism before 3-3
+// wires a real caller.
+// ===========================================================================
+
+/** Seed a password into `committed` so the gate has something to compare. */
+function seedPassword(pw: string): void {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, passwordHash: hashPassword(pw) },
+  });
+}
+
+// A stub gated action — records that it ran. The same shape a real caller
+// (3-3 change-password, 3-4 Panic, 4-6 end-early) would pass to
+// `requirePassword`.
+const makeAction = () => {
+  const fn = jest.fn();
+  return { fn, action: fn as unknown as () => void };
+};
+
+// ---------------------------------------------------------------------------
+// requirePassword: no-password short-circuit vs sheet-open
+// ---------------------------------------------------------------------------
+
+test('requirePassword with NO password set runs the action immediately and does NOT open the gate', () => {
+  useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } }); // passwordHash unset
+  const { fn, action } = makeAction();
+
+  useDomainStore.getState().requirePassword(action);
+
+  // The action ran immediately (the no-op short-circuit — the gate is never
+  // an empty sheet).
+  expect(fn).toHaveBeenCalledTimes(1);
+  // The gate did NOT open.
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+  expect(useDomainStore.getState().gateAction).toBeNull();
+});
+
+test('requirePassword with an empty-string passwordHash also short-circuits (treats "" as unset)', () => {
+  // Guards against a corrupt config that wrote `passwordHash: ""`. The
+  // sentinel matches `Settings.tsx` (`passwordHash != null && passwordHash !== ''`).
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, passwordHash: '' },
+  });
+  const { fn, action } = makeAction();
+
+  useDomainStore.getState().requirePassword(action);
+
+  expect(fn).toHaveBeenCalledTimes(1);
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+});
+
+test('requirePassword with a password set opens the gate and stashes the action (does NOT run it yet)', () => {
+  seedPassword('secret123');
+  const { fn, action } = makeAction();
+
+  useDomainStore.getState().requirePassword(action);
+
+  // The action has NOT run yet — it waits for a successful verify.
+  expect(fn).not.toHaveBeenCalled();
+  // The gate opened and stashed the action.
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+  expect(useDomainStore.getState().gateAction).toBe(action);
+});
+
+// ---------------------------------------------------------------------------
+// verifyPassword: correct / wrong / throttle / reset
+// ---------------------------------------------------------------------------
+
+test('verifyPassword with the correct password returns { ok: true } and resets attempts + throttle', () => {
+  seedPassword('secret123');
+  // Simulate two prior wrong attempts + an EXPIRED throttle (the countdown
+  // interval hasn't ticked yet). A correct entry must clear all of it (the
+  // spec's "correct entry -> gateAttempts→0, gateThrottleUntil→null").
+  useDomainStore.setState({
+    gateAttempts: 2,
+    gateThrottleUntil: Date.now() - 1,
+  });
+
+  const result = useDomainStore.getState().verifyPassword('secret123');
+
+  expect(result).toEqual({ ok: true });
+  expect(useDomainStore.getState().gateAttempts).toBe(0);
+  expect(useDomainStore.getState().gateThrottleUntil).toBeNull();
+});
+
+test('verifyPassword with a wrong password (tries 1-4) increments attempts and returns triesLeft', () => {
+  seedPassword('secret123');
+
+  // 1st wrong.
+  let result = useDomainStore.getState().verifyPassword('wrong1');
+  expect(result).toEqual({ ok: false, triesLeft: GATE_MAX_ATTEMPTS - 1 });
+  expect(useDomainStore.getState().gateAttempts).toBe(1);
+  expect(useDomainStore.getState().gateThrottleUntil).toBeNull();
+
+  // 2nd wrong.
+  result = useDomainStore.getState().verifyPassword('wrong2');
+  expect(result).toEqual({ ok: false, triesLeft: GATE_MAX_ATTEMPTS - 2 });
+  expect(useDomainStore.getState().gateAttempts).toBe(2);
+
+  // 4th wrong (skip to it).
+  useDomainStore.setState({ gateAttempts: 3 });
+  result = useDomainStore.getState().verifyPassword('wrong4');
+  expect(result).toEqual({ ok: false, triesLeft: GATE_MAX_ATTEMPTS - 4 });
+  expect(useDomainStore.getState().gateAttempts).toBe(4);
+  // Still NOT throttled — the 5th wrong engages the throttle.
+  expect(useDomainStore.getState().gateThrottleUntil).toBeNull();
+});
+
+test('verifyPassword on the 5th wrong entry engages the throttle and returns throttleMs', () => {
+  seedPassword('secret123');
+  useDomainStore.setState({ gateAttempts: GATE_MAX_ATTEMPTS - 1 }); // 4 prior wrong
+
+  const before = Date.now();
+  const result = useDomainStore.getState().verifyPassword('wrong5');
+  const after = Date.now();
+
+  expect(result.ok).toBe(false);
+  expect(result.triesLeft).toBe(0);
+  expect(result.throttleMs).toBe(GATE_THROTTLE_MS);
+  // The throttle deadline is now + GATE_THROTTLE_MS (allow a 5ms slack for the
+  // Date.now() calls bracketing the action).
+  const until = useDomainStore.getState().gateThrottleUntil;
+  expect(until).not.toBeNull();
+  expect(until!).toBeGreaterThanOrEqual(before + GATE_THROTTLE_MS - 5);
+  expect(until!).toBeLessThanOrEqual(after + GATE_THROTTLE_MS + 5);
+  expect(useDomainStore.getState().gateAttempts).toBe(GATE_MAX_ATTEMPTS);
+});
+
+test('verifyPassword while throttled (not yet elapsed) returns throttleMs without comparing', () => {
+  seedPassword('secret123');
+  // An active throttle 10s in the future. Even the CORRECT password must not
+  // verify while throttled — the field is disabled, so this is a defensive
+  // guard for a direct store caller / a race.
+  useDomainStore.setState({
+    gateAttempts: GATE_MAX_ATTEMPTS,
+    gateThrottleUntil: Date.now() + 10_000,
+  });
+
+  const result = useDomainStore.getState().verifyPassword('secret123');
+
+  expect(result.ok).toBe(false);
+  expect(result.throttleMs).toBeGreaterThan(0);
+  expect(result.throttleMs).toBeLessThanOrEqual(10_000);
+  // Attempts + throttle unchanged (the throttle is still active).
+  expect(useDomainStore.getState().gateAttempts).toBe(GATE_MAX_ATTEMPTS);
+  expect(useDomainStore.getState().gateThrottleUntil).not.toBeNull();
+});
+
+test('verifyPassword on an exact-expiry submit clears the throttle and proceeds (race with the interval tick)', () => {
+  seedPassword('secret123');
+  // Throttle deadline in the past — the countdown interval hasn't ticked yet,
+  // but a submit landing now should clear the throttle and start fresh.
+  useDomainStore.setState({
+    gateAttempts: GATE_MAX_ATTEMPTS,
+    gateThrottleUntil: Date.now() - 1,
+  });
+
+  // A WRONG entry after throttle expiry: attempts reset to 0 first, then this
+  // is the 1st wrong of a fresh cycle (triesLeft = GATE_MAX_ATTEMPTS - 1).
+  const result = useDomainStore.getState().verifyPassword('wrong-fresh');
+  expect(result).toEqual({ ok: false, triesLeft: GATE_MAX_ATTEMPTS - 1 });
+  expect(useDomainStore.getState().gateAttempts).toBe(1);
+  expect(useDomainStore.getState().gateThrottleUntil).toBeNull();
+});
+
+test('verifyPassword with no password set returns { ok: true } (defensive — requirePassword short-circuits)', () => {
+  // `requirePassword` never opens the gate when no password is set, so
+  // `verifyPassword` is never called in that state. But a defensive `ok: true`
+  // ensures a misconfigured caller (e.g. a test seeding `gateOpen:true` with
+  // no hash) doesn't lock the user out.
+  useDomainStore.setState({ committed: { ...DEFAULT_CONFIG } });
+
+  const result = useDomainStore.getState().verifyPassword('anything');
+
+  expect(result).toEqual({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// closeGate: clears open + action, PRESERVES attempts + throttle
+// ---------------------------------------------------------------------------
+
+test('closeGate clears gateOpen + gateAction and PRESERVES gateAttempts + gateThrottleUntil', () => {
+  seedPassword('secret123');
+  const { action } = makeAction();
+  useDomainStore.getState().requirePassword(action);
+  // Simulate 3 prior wrong attempts + an active throttle.
+  const until = Date.now() + 10_000;
+  useDomainStore.setState({
+    gateAttempts: 3,
+    gateThrottleUntil: until,
+  });
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+
+  useDomainStore.getState().closeGate();
+
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+  expect(useDomainStore.getState().gateAction).toBeNull();
+  // Attempts + throttle PRESERVED (Esc/cancel does NOT reset the counter — the
+  // spec's Never clause).
+  expect(useDomainStore.getState().gateAttempts).toBe(3);
+  expect(useDomainStore.getState().gateThrottleUntil).toBe(until);
+});
+
+test('attempts persist across closeGate + reopen (Esc does not reset the counter)', () => {
+  // The spec's AC: "Given wrong attempts were made, when the sheet is closed
+  // and reopened, then the attempt counter is unchanged."
+  seedPassword('secret123');
+  const { fn, action } = makeAction();
+  useDomainStore.getState().requirePassword(action);
+  // 2 prior wrong attempts.
+  useDomainStore.getState().verifyPassword('wrong1');
+  useDomainStore.getState().verifyPassword('wrong2');
+  expect(useDomainStore.getState().gateAttempts).toBe(2);
+
+  // Esc -> closeGate.
+  useDomainStore.getState().closeGate();
+  expect(useDomainStore.getState().gateAttempts).toBe(2);
+
+  // Reopen via a new requirePassword — the counter is STILL 2.
+  const { fn: fn2, action: action2 } = makeAction();
+  useDomainStore.getState().requirePassword(action2);
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+  expect(useDomainStore.getState().gateAttempts).toBe(2);
+
+  // The 3rd wrong now (attempts 2 -> 3) — NOT a fresh 1st wrong. This proves
+  // the counter survived close + reopen.
+  const result = useDomainStore.getState().verifyPassword('wrong3');
+  expect(result).toEqual({ ok: false, triesLeft: GATE_MAX_ATTEMPTS - 3 });
+  expect(useDomainStore.getState().gateAttempts).toBe(3);
+
+  // The first action (from the first requirePassword) was cleared by closeGate
+  // and never ran; the second action is the one stashed now.
+  expect(fn).not.toHaveBeenCalled();
+  expect(fn2).not.toHaveBeenCalled();
+});
+
+// ---------------------------------------------------------------------------
+// clearGateThrottle: nulls throttle + resets attempts (5 fresh tries)
+// ---------------------------------------------------------------------------
+
+test('clearGateThrottle nulls gateThrottleUntil and resets gateAttempts to 0', () => {
+  seedPassword('secret123');
+  useDomainStore.setState({
+    gateAttempts: GATE_MAX_ATTEMPTS,
+    gateThrottleUntil: Date.now() + 10_000,
+  });
+
+  useDomainStore.getState().clearGateThrottle();
+
+  expect(useDomainStore.getState().gateThrottleUntil).toBeNull();
+  expect(useDomainStore.getState().gateAttempts).toBe(0);
+});
+
+test('after clearGateThrottle, 5 fresh tries are available (the counter restarts from 0)', () => {
+  seedPassword('secret123');
+  // Burn all 5 tries -> throttle.
+  for (let i = 0; i < GATE_MAX_ATTEMPTS; i++) {
+    useDomainStore.getState().verifyPassword('wrong');
+  }
+  expect(useDomainStore.getState().gateThrottleUntil).not.toBeNull();
+
+  // Throttle elapses -> clearGateThrottle.
+  useDomainStore.getState().clearGateThrottle();
+  expect(useDomainStore.getState().gateAttempts).toBe(0);
+
+  // 5 fresh wrong tries before the throttle re-engages.
+  for (let i = 0; i < GATE_MAX_ATTEMPTS - 1; i++) {
+    const r = useDomainStore.getState().verifyPassword('wrong');
+    expect(r.ok).toBe(false);
+    expect(r.throttleMs).toBeUndefined();
+  }
+  // The 5th fresh wrong re-engages the throttle.
+  const r5 = useDomainStore.getState().verifyPassword('wrong');
+  expect(r5.ok).toBe(false);
+  expect(r5.throttleMs).toBe(GATE_THROTTLE_MS);
+  expect(useDomainStore.getState().gateThrottleUntil).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// requirePassword + verifyPassword end-to-end: success runs the action
+// ---------------------------------------------------------------------------
+
+test('a correct verifyPassword after wrong attempts lets the stashed action run via the Shell onVerified flow', () => {
+  // This proves the mechanism end-to-end: requirePassword stashes the action,
+  // wrong attempts don't run it, a correct verifyPassword resets the counter,
+  // and the caller (the Shell's runGateAction in production) reads gateAction
+  // + runs it + closeGate.
+  seedPassword('secret123');
+  const { fn, action } = makeAction();
+  useDomainStore.getState().requirePassword(action);
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+
+  // 2 wrong attempts — the action does NOT run.
+  useDomainStore.getState().verifyPassword('wrong1');
+  useDomainStore.getState().verifyPassword('wrong2');
+  expect(fn).not.toHaveBeenCalled();
+
+  // Correct entry — verifyPassword resets the counter but does NOT run the
+  // action itself (the Shell's onVerified does that).
+  const result = useDomainStore.getState().verifyPassword('secret123');
+  expect(result).toEqual({ ok: true });
+  expect(useDomainStore.getState().gateAttempts).toBe(0);
+  expect(fn).not.toHaveBeenCalled();
+
+  // Simulate the Shell's runGateAction: read the stashed action, run it,
+  // close the gate.
+  const stashed = useDomainStore.getState().gateAction;
+  expect(stashed).toBe(action);
+  stashed!();
+  useDomainStore.getState().closeGate();
+
+  expect(fn).toHaveBeenCalledTimes(1);
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+  expect(useDomainStore.getState().gateAction).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Review patches (step-04): clearGateThrottle guard, VerifyResult shape,
+// no-writeConfig invariant
+// ---------------------------------------------------------------------------
+
+test('clearGateThrottle is a no-op when NOT throttled (does NOT wipe gateAttempts)', () => {
+  // Guard against a stray clearGateThrottle call after a few wrong tries but
+  // before the throttle engages — otherwise it would reset the counter and
+  // bypass the 5-try limit. The countdown tick only fires while throttled, so
+  // this guard does not block the legitimate expiry path.
+  seedPassword('secret123');
+  useDomainStore.setState({
+    gateAttempts: 3,
+    gateThrottleUntil: null, // not throttled
+  });
+
+  useDomainStore.getState().clearGateThrottle();
+
+  // attempts UNCHANGED (not reset to 0); throttle still null.
+  expect(useDomainStore.getState().gateAttempts).toBe(3);
+  expect(useDomainStore.getState().gateThrottleUntil).toBeNull();
+});
+
+test('verifyPassword while throttled returns triesLeft: 0 (consistent shape with the 5th-wrong branch)', () => {
+  // Both throttled results (active-throttle here, 5th-wrong in the wrong-entry
+  // path) carry `triesLeft` + `throttleMs`, so a caller reading `triesLeft` on
+  // a throttle result never sees `undefined`.
+  seedPassword('secret123');
+  useDomainStore.setState({
+    gateAttempts: GATE_MAX_ATTEMPTS,
+    gateThrottleUntil: Date.now() + 5_000,
+  });
+
+  const result = useDomainStore.getState().verifyPassword('anything');
+
+  expect(result.ok).toBe(false);
+  expect(result.triesLeft).toBe(0);
+  expect(typeof result.throttleMs).toBe('number');
+});
+
+test('gate actions never call writeConfig (gate state is runtime-only, NOT persisted)', () => {
+  // The spec's Always/Never: gateAttempts/gateThrottleUntil are runtime store
+  // state — NOT persisted to config.json, NOT added to Config/types.ts.
+  // Exercise every gate action (requirePassword, verifyPassword wrong +
+  // correct, closeGate, clearGateThrottle) and assert writeConfig is never
+  // called — a regression that accidentally persisted gate state would fail
+  // here.
+  configNative.writeConfig.mockClear();
+  seedPassword('secret123');
+
+  const { fn, action } = makeAction();
+  useDomainStore.getState().requirePassword(action); // open + stash
+  useDomainStore.getState().verifyPassword('wrong'); // wrong-entry path
+  useDomainStore.getState().verifyPassword('secret123'); // correct-entry path
+  useDomainStore.getState().closeGate(); // Esc/cancel path
+  // Throttle + clear path.
+  useDomainStore.setState({
+    gateAttempts: GATE_MAX_ATTEMPTS,
+    gateThrottleUntil: Date.now() + 1000,
+  });
+  useDomainStore.getState().clearGateThrottle();
+
+  // requirePassword with a password set stashes (does not run) the action.
+  expect(fn).not.toHaveBeenCalled();
+  // No gate action persisted anything to config.json.
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
 });

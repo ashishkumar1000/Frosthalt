@@ -58,7 +58,7 @@
 import { create } from 'zustand';
 import type { Config, Domain } from '../config/types';
 import { readConfig, writeConfig } from '../config/configStore';
-import { hashPassword } from '../config/password';
+import { hashPassword, GATE_MAX_ATTEMPTS, GATE_THROTTLE_MS } from '../config/password';
 import { normaliseDomain } from './normalise';
 import { runApply } from './apply';
 import { effectiveHostsLines } from './effectiveBlocklist';
@@ -68,6 +68,18 @@ import { readHostsSection, writeHosts } from '../hosts/shellRunner';
 import type { WriteResult } from '../hosts/shellRunner';
 
 export type ApplyStatus = 'idle' | 'running';
+
+/**
+ * The result of `verifyPassword` (Story 3.2). On success only `ok` is set;
+ * on a wrong entry `triesLeft` is the remaining attempts before throttle; on
+ * throttle (or a submit while throttled) `throttleMs` is the remaining wait.
+ * The shape is the spec's contract: `{ ok, triesLeft?, throttleMs? }`.
+ */
+export interface VerifyResult {
+  ok: boolean;
+  triesLeft?: number;
+  throttleMs?: number;
+}
 
 export interface DomainState {
   committed: Config;
@@ -151,6 +163,62 @@ export interface DomainState {
    * envelope is returned for the UI to surface.
    */
   setPassword: (pw: string) => Promise<WriteResult>;
+
+  // ----- Story 3.2 — the reusable password gate (runtime-only state) -----
+  //
+  // The gate is built ONCE and reused by every gated action (3-3 change-
+  // password, 3-4 Panic, 4-6 end-early). The Shell hosts the single
+  // `<PasswordGate>` instance; callers invoke `requirePassword(action)` and
+  // the store either short-circuits (no password set -> run `action()` right
+  // away, no sheet) or opens the sheet (password set -> wait for `verifyPassword`).
+  //
+  // `gateAttempts` + `gateThrottleUntil` are RUNTIME state — NOT persisted to
+  // `config.json`, NOT in `Config`/`types.ts`. They survive close/reopen within
+  // a session (Esc does NOT reset the counter — otherwise the 5-try limit is
+  // bypassed by reopening) and reset on relaunch. On success or throttle expiry
+  // the counter resets to 0 (5 fresh tries).
+
+  /** Whether the gate sheet is currently open (Shell renders `<PasswordGate>`). */
+  gateOpen: boolean;
+  /** The pending action to run on a successful verify. `null` when no gate is open. */
+  gateAction: (() => void) | null;
+  /** Consecutive wrong attempts in the current session. Resets on success/throttle expiry. */
+  gateAttempts: number;
+  /** Epoch ms when the throttle elapses, or `null` when not throttled. */
+  gateThrottleUntil: number | null;
+  /**
+   * Open the gate for `action` when a password is set, or run `action()`
+   * immediately when no password is set (the no-op short-circuit — the gate is
+   * never an empty sheet). The single reusable entry point every gated caller
+   * uses; do NOT fork per caller.
+   */
+  requirePassword: (action: () => void) => void;
+  /**
+   * Verify `pw` against `committed.passwordHash` (re-hash + compare — never
+   * re-implement hashing). Throttle-gated: while throttled and not yet elapsed,
+   * returns `{ ok: false, throttleMs }` without comparing. On match: resets
+   * `gateAttempts`→0 + `gateThrottleUntil`→null and returns `{ ok: true }`.
+   * On wrong: increments `gateAttempts`; at `GATE_MAX_ATTEMPTS` sets
+   * `gateThrottleUntil = now + GATE_THROTTLE_MS` and returns
+   * `{ ok: false, triesLeft: 0, throttleMs }`; below the limit returns
+   * `{ ok: false, triesLeft }`. Does NOT touch `gateOpen`/`gateAction` — the
+   * Shell's `onVerified` closes the gate after running the action.
+   */
+  verifyPassword: (pw: string) => VerifyResult;
+  /**
+   * Close the gate sheet: clear `gateOpen` + `gateAction`. PRESERVES
+   * `gateAttempts` + `gateThrottleUntil` (Esc/cancel does NOT reset the
+   * counter — the spec's Never clause). Called by the Shell's Esc branch and
+   * the gate's Cancel button.
+   */
+  closeGate: () => void;
+  /**
+   * Clear the throttle: null `gateThrottleUntil` and reset `gateAttempts`→0
+   * (5 fresh tries). Called by the gate's countdown `setInterval` when the
+   * countdown hits 0. Also called defensively inside `verifyPassword` when a
+   * submit lands at the exact expiry moment (race with the interval tick).
+   */
+  clearGateThrottle: () => void;
 }
 
 export const useDomainStore = create<DomainState>()((set, get) => ({
@@ -160,6 +228,11 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
   lastResult: null,
   drift: null,
   lastReadSection: null,
+  // Story 3.2 — runtime-only gate state. Reset on relaunch (not persisted).
+  gateOpen: false,
+  gateAction: null,
+  gateAttempts: 0,
+  gateThrottleUntil: null,
 
   stageDomainAdd: (raw) => {
     const apex = normaliseDomain(raw);
@@ -406,6 +479,98 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
       }
       return result;
     });
+  },
+
+  // ----- Story 3.2 — the reusable password gate actions -----
+
+  requirePassword: (action) => {
+    // No password set: run `action()` immediately, no sheet. The gate is a
+    // no-op, never an empty sheet (the spec's Always clause). `passwordHash`
+    // absent OR empty-string both count as "no password set" — matches
+    // `Settings.tsx`'s sentinel (`passwordHash != null && passwordHash !== ''`).
+    const hash = get().committed.passwordHash;
+    if (hash == null || hash === '') {
+      action();
+      return;
+    }
+    // Password set: open the sheet and stash the action for `onVerified`.
+    set({ gateOpen: true, gateAction: action });
+  },
+
+  verifyPassword: (pw) => {
+    // Throttle-gated: while the throttle is active and not yet elapsed, refuse
+    // without comparing (the spec's "field+submit disabled until it elapses" —
+    // the UI disables submit during throttle, so this is a defensive guard for
+    // a race or a direct store caller). Return the remaining wait so the UI
+    // can keep its countdown in sync.
+    const now = Date.now();
+    const throttleUntil = get().gateThrottleUntil;
+    if (throttleUntil != null && now < throttleUntil) {
+      // `triesLeft: 0` keeps the throttled-result shape consistent with the
+      // 5th-wrong branch below (both carry `triesLeft` + `throttleMs`) so a
+      // caller reading `triesLeft` on a throttle result never sees `undefined`.
+      return { ok: false, triesLeft: 0, throttleMs: throttleUntil - now };
+    }
+    // If the throttle has elapsed but the countdown interval hasn't ticked yet
+    // (a submit landing at the exact expiry moment), clear it here for 5 fresh
+    // tries. This mirrors `clearGateThrottle` and keeps `verifyPassword`
+    // self-contained — the next wrong entry starts from attempts=0.
+    if (throttleUntil != null && now >= throttleUntil) {
+      set({ gateAttempts: 0, gateThrottleUntil: null });
+    }
+    // Re-hash the entry and compare to `committed.passwordHash` (the spec's
+    // Always clause — reuse `hashPassword`, never re-implement). No
+    // `writeConfig`, no `writeHosts`, no new native module.
+    const committedHash = get().committed.passwordHash;
+    if (committedHash == null || committedHash === '') {
+      // Defensive: `requirePassword` short-circuits when no password is set,
+      // so the gate never opens without a hash. If a caller reaches here
+      // anyway (e.g. a test seeding `gateOpen:true` with no hash), treat it as
+      // verified so the user isn't locked out by a misconfiguration.
+      return { ok: true };
+    }
+    if (hashPassword(pw) === committedHash) {
+      // Success: reset attempts + throttle (the spec's I/O matrix — "correct
+      // entry -> gateAttempts→0, gateThrottleUntil→null"). Does NOT touch
+      // `gateOpen`/`gateAction` — the Shell's `onVerified` closes the gate
+      // after running the action.
+      set({ gateAttempts: 0, gateThrottleUntil: null });
+      return { ok: true };
+    }
+    // Wrong: increment attempts. At `GATE_MAX_ATTEMPTS` engage the throttle.
+    const attempts = get().gateAttempts + 1;
+    if (attempts >= GATE_MAX_ATTEMPTS) {
+      set({
+        gateAttempts: attempts,
+        gateThrottleUntil: now + GATE_THROTTLE_MS,
+      });
+      return { ok: false, triesLeft: 0, throttleMs: GATE_THROTTLE_MS };
+    }
+    set({ gateAttempts: attempts });
+    return { ok: false, triesLeft: GATE_MAX_ATTEMPTS - attempts };
+  },
+
+  closeGate: () => {
+    // Clear `gateOpen` + `gateAction`. PRESERVE `gateAttempts` +
+    // `gateThrottleUntil` (Esc/cancel does NOT reset the counter — the spec's
+    // Never clause: "Reset the attempt counter on Esc/close" is a Never). The
+    // counter resets only on success (`verifyPassword`) or throttle expiry
+    // (`clearGateThrottle`).
+    set({ gateOpen: false, gateAction: null });
+  },
+
+  clearGateThrottle: () => {
+    // Null the throttle + reset attempts to 0 (5 fresh tries). Called by the
+    // gate's countdown `setInterval` when the countdown hits 0, and on mount
+    // when the gate re-opens with a throttle timestamp already in the past.
+    // Guarded: a no-op when NOT throttled — otherwise a stray call after a few
+    // wrong tries (but before the throttle engages) would wipe `gateAttempts`
+    // and bypass the 5-try limit. The countdown tick only fires while
+    // throttled, so this guard does not block the legitimate expiry path.
+    if (get().gateThrottleUntil == null) {
+      return;
+    }
+    set({ gateAttempts: 0, gateThrottleUntil: null });
   },
 }));
 

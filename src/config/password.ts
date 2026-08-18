@@ -26,6 +26,25 @@ import { sha256 } from './sha256';
 export const PASSWORD_MIN_LENGTH = 6;
 
 /**
+ * Maximum wrong attempts before the gate throttles (Story 3.2). After this
+ * many consecutive wrong entries the gate engages a visible countdown
+ * (`GATE_THROTTLE_MS`) and disables the field + submit until it elapses. On
+ * success or throttle expiry the counter resets to 0 (5 fresh tries). Co-
+ * located here so the store + tests import the single source of truth — the
+ * gate UI reads it transitively via the store's `verifyPassword` result
+ * (`triesLeft = GATE_MAX_ATTEMPTS - gateAttempts`).
+ */
+export const GATE_MAX_ATTEMPTS = 5;
+
+/**
+ * Throttle wait in milliseconds after `GATE_MAX_ATTEMPTS` wrong entries
+ * (Story 3.2). The gate shows a visible countdown derived from this; when it
+ * elapses the countdown tick calls `clearGateThrottle()` for 5 fresh tries.
+ * Tunable product-feel knob (the spec's Ask First flagged 30s as proposed).
+ */
+export const GATE_THROTTLE_MS = 30_000;
+
+/**
  * Hash a plaintext password with salt-free SHA-256. Returns the 64-char
  * lowercase hex digest, which is what `setPassword` persists as
  * `committed.passwordHash` in `config.json`.

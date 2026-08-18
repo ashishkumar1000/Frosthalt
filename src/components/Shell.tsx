@@ -31,6 +31,7 @@ import { SurfacePlaceholder, SURFACE_NAMES, type SurfaceIndex } from './surfaces
 import { Blocklist } from './Blocklist';
 import { Settings } from './Settings';
 import { HostsViewer } from './HostsViewer';
+import { PasswordGate } from './PasswordGate';
 import { useDomainStore } from '../domain/store';
 import { effectiveBlocklist } from '../domain/effectiveBlocklist';
 
@@ -89,6 +90,13 @@ export function Shell(): React.ReactElement {
   // domains" placeholder. `committed` updates only on Apply success, so the
   // spoken count matches what is enforced right now.
   const committed = useDomainStore((s) => s.committed);
+  // Story 3.2 — the reusable password gate. The Shell hosts the SINGLE
+  // `<PasswordGate>` instance; `gateOpen` mounts/unmounts it. `closeGate` is
+  // the Esc/Cancel handler (preserves attempts). `runGateAction` (defined
+  // below) is the `onVerified` callback: it reads the stashed `gateAction`
+  // from the store at call time, runs it, then closes the gate.
+  const gateOpen = useDomainStore((s) => s.gateOpen);
+  const closeGate = useDomainStore((s) => s.closeGate);
 
   const selectRow = (i: number) => {
     setSurface(i as SurfaceIndex);
@@ -125,6 +133,17 @@ export function Shell(): React.ReactElement {
 
   const onKeyDown = (event: { nativeEvent: NativeKeyEvent }) => {
     const { metaKey, key } = event.nativeEvent;
+    // Story 3.2 — bare Escape closes the password gate sheet when it is open
+    // (mirrors the hosts-viewer Esc branch below). Placed FIRST so that while
+    // the gate is open no other key branch (Return -> Apply, ⌘1-⌘4 nav) is
+    // even considered — the gate is a window-level inert surface that owns
+    // Escape. `closeGate` clears `gateOpen` + `gateAction` and PRESERVES the
+    // attempt counter (Esc does NOT reset it — the spec's Never clause). No
+    // ⌘Esc (bare Escape only), matching the macOS overlay dismiss contract.
+    if (!metaKey && key === 'Escape' && gateOpen) {
+      closeGate();
+      return;
+    }
     // Bare Escape closes the read-only hosts viewer overlay (Story 2.6). Placed
     // BEFORE the Return -> Apply branch so that while the viewer is open Return
     // is never even considered for Apply (the viewer is a window-level inert
@@ -156,13 +175,46 @@ export function Shell(): React.ReactElement {
     // while the read-only hosts viewer overlay is open (the overlay is a
     // window-level inert surface, mirroring how the native alert inert-ifies
     // the Shell's Return gate).
-    if (!metaKey && (key === 'Return' || key === 'Enter') && surface === 0 && !addFieldFocused && staged != null && !viewerOpen) {
+    // Story 3.2: also gated with `!gateOpen` so bare Return does NOT fire
+    // Apply while the password gate sheet is open (the gate is a window-level
+    // inert surface; the gate's own field owns Return when focused).
+    if (!metaKey && (key === 'Return' || key === 'Enter') && surface === 0 && !addFieldFocused && staged != null && !viewerOpen && !gateOpen) {
       void apply();
       return;
     }
     // Gate on ⌘ AND key in 1-4. A plain 1-4 (no ⌘) must NOT navigate.
     if (metaKey && key >= '1' && key <= '4') {
       selectRow(Number(key) - 1);
+    }
+  };
+
+  // Story 3.2 — the gate's `onVerified` callback. Reads the stashed
+  // `gateAction` from the store AT CALL TIME (not at render time — the action
+  // is stashed by `requirePassword` when the gate opens, and a stale closure
+  // here would run the wrong action if the Shell re-rendered between open and
+  // verify). Runs the action, then closes the gate (clears `gateOpen` +
+  // `gateAction`; `verifyPassword` already reset attempts + throttle on the
+  // successful compare).
+  //
+  // try/finally: if the stashed action throws, `closeGate` still runs so the
+  // sheet doesn't get stuck open with a stale `gateAction`.
+  //
+  // Re-open guard: close ONLY if the action did not synchronously re-open the
+  // gate (e.g. a future caller whose action re-enters `requirePassword`). A
+  // re-open replaces `gateAction` with a new function; comparing identity
+  // (still the same function we just ran) tells "action did not re-open" from
+  // "action re-opened with a new gate" — closing in the latter case would
+  // clobber the freshly opened gate.
+  const runGateAction = () => {
+    const action = useDomainStore.getState().gateAction;
+    try {
+      if (action != null) {
+        action();
+      }
+    } finally {
+      if (useDomainStore.getState().gateAction === action) {
+        closeGate();
+      }
     }
   };
 
@@ -202,6 +254,9 @@ export function Shell(): React.ReactElement {
       </View>
       {viewerOpen ? (
         <HostsViewer onClose={() => setViewerOpen(false)} />
+      ) : null}
+      {gateOpen ? (
+        <PasswordGate onVerified={runGateAction} onClose={closeGate} />
       ) : null}
     </View>
   );
