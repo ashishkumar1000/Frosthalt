@@ -27,7 +27,7 @@ import type {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Sidebar } from './Sidebar';
 import { StatusHeader } from './StatusHeader';
-import { SurfacePlaceholder, SURFACE_NAMES, type SurfaceIndex } from './surfaces';
+import { SurfacePlaceholder, SURFACE_NAMES, BLOCKLIST_SURFACE_INDEX, type SurfaceIndex } from './surfaces';
 import { Blocklist } from './Blocklist';
 import { Settings } from './Settings';
 import { HostsViewer } from './HostsViewer';
@@ -247,7 +247,30 @@ export function Shell(): React.ReactElement {
             onFocusChange={setAddFieldFocused}
           />
         ) : surface === 3 ? (
-          <Settings />
+          // Story 3-4: <Panic>'s success-toast "Re-enable your blocklist"
+          // link navigates the user to Blocklist (row 0). Threading the
+          // navigation callback here keeps surface state owned by Shell and
+          // avoids duplicating the selectRow machinery — Settings receives
+          // the same callable the sidebar rows use. Uses the named
+          // `BLOCKLIST_SURFACE_INDEX` constant (not a literal `0`) so the
+          // nav cannot silently break if `SURFACE_NAMES` is reordered.
+          //
+          // Gate-guard (P6 review patch): if `gateOpen` is true when the
+          // link fires, swap surfaces mid-gate is genuinely unsafe (the
+          // gate's onVerified reads `gateAction` at call time and expects
+          // the same shell state). For v1, we no-op the nav — the user is
+          // mid-verification and the link's surface swap is not worth the
+          // complexity of closeGate + deferred nav. In practice the Panic
+          // flow closes the gate before the toast appears, so this is a
+          // defensive only-once-per-universe check.
+          <Settings
+            onNavigateBlocklist={() => {
+              if (useDomainStore.getState().gateOpen) {
+                return;
+              }
+              selectRow(BLOCKLIST_SURFACE_INDEX);
+            }}
+          />
         ) : (
           <SurfacePlaceholder surface={surface} />
         )}

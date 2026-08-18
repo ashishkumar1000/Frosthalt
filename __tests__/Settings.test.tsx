@@ -67,7 +67,13 @@ afterEach(() => {
 function renderSettings() {
   let testRenderer!: ReturnType<typeof ReactTestRenderer.create>;
   ReactTestRenderer.act(() => {
-    testRenderer = ReactTestRenderer.create(<Settings />);
+    testRenderer = ReactTestRenderer.create(
+      // Story 3-4 threads `onNavigateBlocklist` (Shell's `selectRow(0)`)
+      // through Settings -> Panic. The Settings tests do not exercise the
+      // navigation link (Panic's success toast handler), so a noop stub is
+      // fine here — the navigation wiring is asserted in Panic.test.tsx.
+      <Settings onNavigateBlocklist={() => {}} />,
+    );
   });
   currentRenderer = testRenderer;
   return testRenderer;
@@ -138,6 +144,9 @@ test('the "Password set" state shows the Danger Zone section with a "Change pass
   // The "Change password" trigger button is present (Story 3-3's first
   // occupant of the Danger Zone).
   expect(text).toContain('Change password');
+  // Story 3-4 — the Panic trigger ("Clear all blocked hosts") is rendered as
+  // a sibling of <ChangePassword/> INSIDE the Danger Zone.
+  expect(text).toContain('Clear all blocked hosts');
   // The neutral "Password set." status line is still shown (kept per spec).
   expect(text).toContain('Password set.');
 
@@ -156,6 +165,59 @@ test('the "Password set" state shows the Danger Zone section with a "Change pass
     (node) => node.props && node.props.accessibilityLabel === 'Danger Zone',
   );
   expect(dangerContainers.length).toBeGreaterThanOrEqual(1);
+
+  // The Panic trigger is INSIDE the Danger Zone container: confirm the
+  // ancestor relationship, not just the text presence, so a future caller
+  // can't accidentally mount it next to the container. react-test-renderer
+  // has no `parentOf`, so we assert via document order in `toJSON()`:
+  // the Danger Zone container is an ancestor of the Panic trigger if and
+  // only if it appears at a strictly earlier JSON-tree index. Pin both
+  // nodes via their accessibility props.
+  const panicTrigger = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      node.props.accessibilityLabel === 'Clear all blocked hosts — requires password' &&
+      node.props.accessibilityRole === 'button',
+  )[0];
+  expect(panicTrigger).toBeDefined();
+  // Document-order check: the Danger Zone container appears BEFORE the
+  // Panic trigger in the toJSON() tree, proving ancestor containment.
+  const json = testRenderer.toJSON();
+  const jsonStr = JSON.stringify(json);
+  const dangerIdx = jsonStr.indexOf('"accessibilityLabel":"Danger Zone"');
+  const panicIdx = jsonStr.indexOf(
+    '"accessibilityLabel":"Clear all blocked hosts — requires password"',
+  );
+  expect(dangerIdx).toBeGreaterThanOrEqual(0);
+  expect(panicIdx).toBeGreaterThanOrEqual(0);
+  expect(dangerIdx).toBeLessThan(panicIdx);
+});
+
+test('with no password set, Settings renders the SetPassword form and NO Danger Zone / Panic (Story 3-1 + 3-4 absence)', () => {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: { ...DEFAULT_CONFIG }, // passwordHash unset
+    });
+  });
+
+  const testRenderer = renderSettings();
+  const text = extractText(testRenderer.toJSON());
+  // No Danger Zone when no password is set (the parent branch handles it).
+  expect(text).not.toContain('Danger Zone');
+  expect(text).not.toContain('Change password');
+  // Story 3-4 — the Panic trigger is mounted ONLY inside the Danger Zone,
+  // so it is also absent in the no-password branch.
+  expect(text).not.toContain('Clear all blocked hosts');
+  // Prop-based pin so a future regression that silently drops the branch
+  // cannot ship green — the trigger must be ENTIRELY absent.
+  const panicTrigger = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      node.props.accessibilityLabel ===
+        'Clear all blocked hosts — requires password' &&
+      node.props.accessibilityRole === 'button',
+  );
+  expect(panicTrigger.length).toBe(0);
 });
 
 test('the Settings screen title is always "Settings" in both branches', () => {

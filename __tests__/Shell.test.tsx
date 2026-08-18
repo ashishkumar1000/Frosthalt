@@ -1598,3 +1598,155 @@ afterAll(() => {
     });
   });
 });
+
+// ===========================================================================
+// Story 3-4 — Shell-level end-to-end: Panic's success toast navigation
+// link drives the Shell to select the Blocklist surface (row 0). Mirrors
+// the 3-2 success-path test (L1527-1551) so a regression in the
+// onVerified -> runGateAction -> setConfirmOpen(true) -> handleClear ->
+// success toast -> onReenablePress -> selectRow(BLOCKLIST_SURFACE_INDEX)
+// chain surfaces here. Seeds a password + 2 committed domains, uses a
+// callThrough apply mock so the real writeConfig + writeHosts runs (the
+// native specs return `{ ok: true }` by default), navigates to Settings,
+// drives the full Panic flow, taps "Re-enable your blocklist", and
+// asserts the active surface is now Blocklist (row 0).
+// ===========================================================================
+
+/** Find the Panic trigger by its VoiceOver label inside the Shell-rendered
+ * Danger Zone. The Shell renders Settings only on surface 3 (per Shell.tsx),
+ * so navigate there first; then `findAll` pins the trigger. */
+function findShellPanicTrigger(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance {
+  const matches = root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityRole === 'button' &&
+      node.props.accessibilityLabel ===
+        'Clear all blocked hosts — requires password',
+  );
+  expect(matches.length).toBeGreaterThanOrEqual(1);
+  return matches[0];
+}
+
+test('Shell-level e2e: Panic success toast "Re-enable your blocklist" navigates to Blocklist (P16)', async () => {
+  // The Shell's mocked native specs return undefined by default, which
+  // the apply pipeline would treat as `{ ok: false }`. Set them up to
+  // resolve cleanly for this e2e.
+  const configNative = require('../src/native/specs/NativeConfigStoreSpec')
+    .default as { writeConfig: jest.Mock };
+  const shellNative = require('../src/native/specs/NativeShellRunnerSpec')
+    .default as { writeHosts: jest.Mock };
+  configNative.writeConfig.mockReturnValue({ ok: true });
+  shellNative.writeHosts.mockResolvedValue({ ok: true });
+
+  // Seed: password set + 2 committed domains so the AC committed.domains
+  // === [] is meaningful after a successful clear.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'example.com', alwaysOn: true },
+          { hostname: 'news.example.org', alwaysOn: true },
+        ],
+        passwordHash: hashPassword('secret123'),
+      },
+      staged: null,
+      gateOpen: false,
+      gateAction: null,
+      gateAttempts: 0,
+      gateThrottleUntil: null,
+    });
+  });
+
+  // Install a callThrough apply mock so the real apply pipeline runs and
+  // commits the staged [] into committed.domains.
+  const applySpy = jest.fn(REAL_APPLY) as unknown as jest.Mock<
+    Promise<WriteResult>,
+    []
+  >;
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ apply: applySpy });
+  });
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  // Navigate to Settings (row 3).
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '4' } });
+  });
+  // The Panic trigger is now in the rendered tree.
+  const trigger = findShellPanicTrigger(testRenderer.root);
+
+  // Tap the trigger -> gate opens.
+  await ReactTestRenderer.act(() => {
+    trigger.props.onPress();
+  });
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+
+  // Type the correct password + press Verify (real onVerified -> runGateAction).
+  ReactTestRenderer.act(() => {
+    findGateField(testRenderer.root).props.onChangeText('secret123');
+  });
+  await ReactTestRenderer.act(async () => {
+    findGateVerify(testRenderer.root).props.onPress();
+    await Promise.resolve();
+  });
+
+  // The flip ran -> the confirm is open.
+  const confirmButton = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityLabel === 'Clear all blocks',
+  )[0];
+  expect(confirmButton).toBeDefined();
+
+  // Press Confirm -> apply -> success toast. Drain the enqueue's
+  // microtasks (the store uses a chain of promises to serialize
+  // apply runs).
+  await ReactTestRenderer.act(async () => {
+    await confirmButton.props.onPress();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(applySpy).toHaveBeenCalledTimes(1);
+  // The strict `committed.domains === []` claim is pinned in
+  // Panic.test.tsx (P8). Here we assert the success toast appeared, the
+  // link is wired, and navigation runs — the Shell-level claim under
+  // test for this e2e (P16).
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(extractText(testRenderer.toJSON())).toContain('All blocks cleared.');
+
+  // The success toast is visible; tap the "Re-enable" link.
+  const link = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityLabel === 'Re-enable your blocklist',
+  )[0];
+  expect(link).toBeDefined();
+
+  await ReactTestRenderer.act(() => {
+    link.props.onPress();
+  });
+
+  // The Shell's selectRow(BLOCKLIST_SURFACE_INDEX) ran -> surface is now
+  // row 0 (Blocklist).
+  const rows = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityRole === 'button' &&
+      node.props.accessibilityState != null &&
+      'selected' in node.props.accessibilityState,
+  );
+  expect(rows[0].props.accessibilityState?.selected).toBe(true);
+  expect(selectedRowCount(rows)).toBe(1);
+});

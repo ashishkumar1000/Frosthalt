@@ -29,6 +29,14 @@ export const SURFACE_NAMES = [
 
 export type SurfaceIndex = 0 | 1 | 2 | 3;
 
+/**
+ * Index of the Blocklist surface in `SURFACE_NAMES`. Exported as a named
+ * constant so callers that need to navigate to Blocklist (Panic's success
+ * toast "Re-enable" link, threaded through Settings) don't depend on the
+ * literal `0` — fragile to reordering of `SURFACE_NAMES`.
+ */
+export const BLOCKLIST_SURFACE_INDEX: SurfaceIndex = 0;
+
 /** Per-surface empty-state copy. Presentational only — no domain state yet. */
 const EMPTY_STATE_TEXT: Record<SurfaceIndex, string> = {
   0: 'No domains yet. Add one to start blocking.',
