@@ -1,10 +1,11 @@
 /**
- * Story 3.1 — the Settings screen branching tests.
+ * Story 3.1 + 3.3 — the Settings screen branching tests.
  *
  * The Settings screen branches on `committed.passwordHash`: when unset it
  * renders `<SetPassword>` (the set-password form); when set it renders a
- * neutral "Password set." state with NO change-password UI (change-password is
- * Story 3-3). These tests pin both branches so a regression in the sentinel
+ * neutral "Password set." status line PLUS the Danger Zone section (Story 3-3)
+ * — a destructive header containing `<ChangePassword>` (the "Change password"
+ * trigger). These tests pin both branches so a regression in the sentinel
  * check (`passwordHash != null && passwordHash !== ''`) surfaces.
  *
  * The store is a real Zustand store; the two NATIVE specs are mocked so
@@ -87,6 +88,10 @@ test('with no password set, Settings renders the SetPassword form (entry + confi
   expect(text).toContain('Password');
   expect(text).toContain('Confirm password');
   expect(text).toContain('Set password');
+  // No Danger Zone section + no Change password trigger when no password is
+  // set (Story 3-3 — the Danger Zone renders ONLY when `hasPassword`).
+  expect(text).not.toContain('Danger Zone');
+  expect(text).not.toContain('Change password');
 });
 
 test('with a password set, Settings renders the neutral "Password set." state and NO set-password form', () => {
@@ -116,7 +121,7 @@ test('with a password set, Settings renders the neutral "Password set." state an
   expect(fields.length).toBe(0);
 });
 
-test('the "Password set" state shows NO change-password UI in this story (change-password is 3-3)', () => {
+test('the "Password set" state shows the Danger Zone section with a "Change password" button (Story 3-3)', () => {
   ReactTestRenderer.act(() => {
     useDomainStore.setState({
       committed: {
@@ -128,10 +133,29 @@ test('the "Password set" state shows NO change-password UI in this story (change
 
   const testRenderer = renderSettings();
   const text = extractText(testRenderer.toJSON());
-  // No "Change password" button/label — that is Story 3-3's Danger Zone.
-  expect(text).not.toContain('Change password');
-  // No "Danger Zone" section — that is Story 3-3.
-  expect(text).not.toContain('Danger');
+  // The Danger Zone section is present (destructive header).
+  expect(text).toContain('Danger Zone');
+  // The "Change password" trigger button is present (Story 3-3's first
+  // occupant of the Danger Zone).
+  expect(text).toContain('Change password');
+  // The neutral "Password set." status line is still shown (kept per spec).
+  expect(text).toContain('Password set.');
+
+  // The Danger Zone is announced as a distinct region (spec's Always). Pin the
+  // a11y PROPS — not just the text — so the contract can't be silently dropped:
+  // the header carries `accessibilityRole="header"` (the VoiceOver landmark;
+  // RN 0.81 has no region/group role) and the container carries
+  // `accessibilityLabel="Danger Zone"` (the grouping affordance). The header
+  // has no label and the container has no role, so the two queries are
+  // disjoint and each pins exactly one node.
+  const headers = testRenderer.root.findAll(
+    (node) => node.props && node.props.accessibilityRole === 'header',
+  );
+  expect(headers.length).toBeGreaterThanOrEqual(1);
+  const dangerContainers = testRenderer.root.findAll(
+    (node) => node.props && node.props.accessibilityLabel === 'Danger Zone',
+  );
+  expect(dangerContainers.length).toBeGreaterThanOrEqual(1);
 });
 
 test('the Settings screen title is always "Settings" in both branches', () => {

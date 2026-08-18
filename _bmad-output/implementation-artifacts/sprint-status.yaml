@@ -57,7 +57,7 @@ development_status:
   epic-3: in-progress
   3-1-set-password-salt-free-sha-256: done
   3-2-password-gate-sheet-reusable: done
-  3-3-danger-zone-section-and-change-password: backlog
+  3-3-danger-zone-section-and-change-password: done
   3-4-panic-unblock-password-gated: backlog
   epic-3-retrospective: optional
 
