@@ -279,7 +279,12 @@ test('clicking a sidebar row selects it and swaps the content to that surface', 
     rows[1].props.onPress();
   });
   let json = testRenderer.toJSON();
-  expect(extractText(json)).toContain('No timer running');
+  // Story 4.1: Timer is a real surface; with the empty store, the empty-
+  // blocklist empty state renders (the preset chips + check list are
+  // absent). Pin the empty-state CTA + "Add some domains on Blocklist
+  // first." copy so a regression that re-introduces a placeholder would
+  // surface here.
+  expect(extractText(json)).toContain('Add some domains on Blocklist first.');
   // Exactly one row active, and it is the Timer row.
   const rowsAfterTimer = findRows(testRenderer.root);
   expect(selectedRowCount(rowsAfterTimer)).toBe(1);
@@ -315,7 +320,11 @@ test('⌘2 selects row 1 (Timer), moves focus, and announces the surface', async
   const rows = findRows(testRenderer.root);
   expect(rows[1].props.accessibilityState?.selected).toBe(true);
   expect(selectedRowCount(rows)).toBe(1);
-  expect(extractText(testRenderer.toJSON())).toContain('No timer running');
+  // Story 4.1: with no domains in the store, Timer's empty-blocklist state
+  // renders — the CTA + copy are present, the placeholder is gone.
+  expect(extractText(testRenderer.toJSON())).toContain(
+    'Add some domains on Blocklist first.',
+  );
   expect(announceForAccessibility).toHaveBeenCalledWith(
     'Timer, 0 domains',
   );
@@ -889,7 +898,11 @@ test('Shell renders the Blocklist surface content (not the placeholder) on surfa
   await ReactTestRenderer.act(() => {
     container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '2' } });
   });
-  expect(extractText(testRenderer.toJSON())).toContain('No timer running');
+  // Story 4.1: Timer Free-state surface renders (the seeded example.com
+  // domain is in committed.domains, so the picker list + Start button are
+  // visible — not the empty-blocklist empty state). The duration picker
+  // presets are unique to Timer.
+  expect(extractText(testRenderer.toJSON())).toContain('Domains in this session');
 
   await ReactTestRenderer.act(() => {
     container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '1' } });
@@ -1098,8 +1111,10 @@ test('bare Return on surface 1 (Timer) does NOT fire apply()', async () => {
   await ReactTestRenderer.act(() => {
     container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '2' } });
   });
-  // Confirm we left surface 0.
-  expect(extractText(testRenderer.toJSON())).toContain('No timer running');
+  // Confirm we left surface 0. Story 4.1: Timer Free-state surface renders
+  // the duration picker + Start; the seed has one domain so the empty-
+  // blocklist empty state does NOT fire.
+  expect(extractText(testRenderer.toJSON())).toContain('Domains in this session');
 
   await ReactTestRenderer.act(async () => {
     container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
@@ -1196,7 +1211,9 @@ test('after focus -> navigate-away -> navigate-back, bare Return fires apply() (
   await ReactTestRenderer.act(() => {
     container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '2' } });
   });
-  expect(extractText(testRenderer.toJSON())).toContain('No timer running');
+  // Story 4.1: confirm we landed on Timer (Free-state surface renders with
+  // the seed's domain).
+  expect(extractText(testRenderer.toJSON())).toContain('Domains in this session');
 
   // Navigate back to Blocklist (surface 0) — a fresh TextInput mounts; it is NOT
   // focused, so no onFocus fires. The fix's selectRow reset keeps

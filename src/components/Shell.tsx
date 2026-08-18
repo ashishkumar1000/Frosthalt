@@ -30,6 +30,7 @@ import { StatusHeader } from './StatusHeader';
 import { SurfacePlaceholder, SURFACE_NAMES, BLOCKLIST_SURFACE_INDEX, type SurfaceIndex } from './surfaces';
 import { Blocklist } from './Blocklist';
 import { Settings } from './Settings';
+import { Timer } from './Timer';
 import { HostsViewer } from './HostsViewer';
 import { PasswordGate } from './PasswordGate';
 import { useDomainStore } from '../domain/store';
@@ -246,6 +247,15 @@ export function Shell(): React.ReactElement {
             addFieldRef={addFieldRef}
             onFocusChange={setAddFieldFocused}
           />
+        ) : surface === 1 ? (
+          // Story 4.1: the Timer surface (Free-state). Threads
+          // `onOpenBlocklist` so the empty-state + running-state
+          // placeholders can navigate back to Blocklist without
+          // duplicating surface state in the store. Mirrors Settings'
+          // `onNavigateBlocklist` threading (Shell.tsx:266-273). The Timer
+          // component itself owns the Free-state UI + Start engine; the
+          // Shell stays surface-routing-only.
+          <Timer onOpenBlocklist={() => selectRow(BLOCKLIST_SURFACE_INDEX)} />
         ) : surface === 3 ? (
           // Story 3-4: <Panic>'s success-toast "Re-enable your blocklist"
           // link navigates the user to Blocklist (row 0). Threading the

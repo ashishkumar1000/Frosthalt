@@ -40,7 +40,12 @@ export const BLOCKLIST_SURFACE_INDEX: SurfaceIndex = 0;
 /** Per-surface empty-state copy. Presentational only — no domain state yet. */
 const EMPTY_STATE_TEXT: Record<SurfaceIndex, string> = {
   0: 'No domains yet. Add one to start blocking.',
-  1: 'No timer running. Start one to block on a countdown.',
+  // Surface 1 (Timer) is a real screen as of Story 4.1 — the placeholder
+  // copy is intentionally absent here so the placeholder is never rendered
+  // for it (the Shell routes surface 1 to <Timer/>). The registry
+  // (`SURFACE_NAMES`) stays intact so the sidebar label + VoiceOver announce
+  // are unchanged.
+  1: '',
   2: 'No schedule set. Create one to block on a recurring window.',
   // Surface 3 (Settings) is a real screen as of Story 3.1 — the placeholder
   // copy is intentionally absent here so the placeholder is never rendered

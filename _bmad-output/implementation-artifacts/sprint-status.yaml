@@ -29,7 +29,8 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-14-2026 00:19
-last_updated: 08-18-2026
+last_updated: 08-19-2026
+
 project: Frosthalt
 project_key: NOKEY
 tracking_system: file-system
@@ -61,8 +62,8 @@ development_status:
   3-4-panic-unblock-password-gated: done
   epic-3-retrospective: optional
 
-  epic-4: backlog
-  4-1-timer-surface-with-duration-presets-and-domain-selection: backlog
+  epic-4: in-progress
+  4-1-timer-surface-with-duration-presets-and-domain-selection: review
   4-2-start-focus-session-block-persist-epoch-end-time: backlog
   4-3-live-countdown-hybrid-ring-scoped-slice: backlog
   4-4-countdown-in-the-status-header: backlog
