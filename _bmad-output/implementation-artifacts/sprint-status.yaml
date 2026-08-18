@@ -54,11 +54,11 @@ development_status:
   2-6-read-only-hosts-viewer-with-drift-warning: done
   epic-2-retrospective: optional
 
-  epic-3: in-progress
+  epic-3: done
   3-1-set-password-salt-free-sha-256: done
   3-2-password-gate-sheet-reusable: done
   3-3-danger-zone-section-and-change-password: done
-  3-4-panic-unblock-password-gated: review
+  3-4-panic-unblock-password-gated: done
   epic-3-retrospective: optional
 
   epic-4: backlog
