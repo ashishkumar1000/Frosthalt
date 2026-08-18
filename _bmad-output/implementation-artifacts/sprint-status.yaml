@@ -63,7 +63,7 @@ development_status:
   epic-3-retrospective: optional
 
   epic-4: in-progress
-  4-1-timer-surface-with-duration-presets-and-domain-selection: review
+  4-1-timer-surface-with-duration-presets-and-domain-selection: done
   4-2-start-focus-session-block-persist-epoch-end-time: backlog
   4-3-live-countdown-hybrid-ring-scoped-slice: backlog
   4-4-countdown-in-the-status-header: backlog
