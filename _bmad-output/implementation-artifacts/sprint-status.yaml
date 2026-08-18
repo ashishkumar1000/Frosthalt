@@ -35,27 +35,27 @@ project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 development_status:
-  epic-1: in-progress
+  epic-1: done
   1-1-scaffold-the-react-native-macos-app-with-new-architecture-an: done
-  1-2-design-token-system-and-shared-visual-primitives: review
-  1-3-sidebar-navigation-and-status-header-shell: review
+  1-2-design-token-system-and-shared-visual-primitives: done
+  1-3-sidebar-navigation-and-status-header-shell: done
   1-4-configstore-turbomodule-and-config-shape: done
   1-5-shellrunner-turbomodule-and-hosts-file-contract: done
   1-6-staged-then-apply-serialized-pipeline-proven-on-one-domain: done
   1-7-drift-detection-and-user-initiated-restore-section: done
   epic-1-retrospective: optional
 
-  epic-2: in-progress
+  epic-2: done
   2-1-blocklist-surface-with-always-on-checkbox: done
-  2-2-add-domain-field-with-live-normalisation: review
-  2-3-effective-blocklist-computation-and-apply-integration: review
-  2-4-remove-domain-confirm-alert: review
-  2-5-domain-count-in-the-status-header: review
-  2-6-read-only-hosts-viewer-with-drift-warning: review
+  2-2-add-domain-field-with-live-normalisation: done
+  2-3-effective-blocklist-computation-and-apply-integration: done
+  2-4-remove-domain-confirm-alert: done
+  2-5-domain-count-in-the-status-header: done
+  2-6-read-only-hosts-viewer-with-drift-warning: done
   epic-2-retrospective: optional
 
   epic-3: in-progress
-  3-1-set-password-salt-free-sha-256: review
+  3-1-set-password-salt-free-sha-256: done
   3-2-password-gate-sheet-reusable: done
   3-3-danger-zone-section-and-change-password: backlog
   3-4-panic-unblock-password-gated: backlog
