@@ -1443,6 +1443,292 @@ test('setPassword persists committed only — staged (un-Applied) domain changes
 });
 
 // ===========================================================================
+// Story 4.2 — `stageStartTimer` (the focus-session engine swap).
+//
+// Mirrors `setPassword`'s serialized `enqueue` + run-time `committed` re-read
+// (`store.ts:454-460`) and `restoreSection`'s hosts-write + `applyStatus`
+// flip (`store.ts:411-415`). Strict config-then-hosts order, one admin
+// prompt. Covers: success / config-fail / hosts-deny / race-vs-Apply /
+// back-to-back / staged-not-clobbered.
+// ===========================================================================
+
+/** A 25-minute duration in ms (mirrors the Timer's default preset). */
+const TWENTY_FIVE_MIN_MS = 25 * 60_000;
+
+test('stageStartTimer success: writeConfig (activeTimer) BEFORE writeHosts (strict order), single admin prompt, advances committed.activeTimer', async () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'a.com', alwaysOn: true }],
+    },
+    staged: null,
+    applyStatus: 'idle',
+  });
+  const before = Date.now();
+
+  const result = await useDomainStore
+    .getState()
+    .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['a.com', 'b.com']) });
+
+  expect(result).toEqual({ ok: true });
+  // Strict order: writeConfig fires once BEFORE writeHosts.
+  const writeConfigOrder = configNative.writeConfig.mock.invocationCallOrder[0];
+  const writeHostsOrder = shellNative.writeHosts.mock.invocationCallOrder[0];
+  expect(writeConfigOrder).toBeLessThan(writeHostsOrder);
+  // writeConfig called exactly once with the full next config carrying
+  // `activeTimer:{endEpochMs,selectedDomains}`. `endEpochMs` is computed
+  // INSIDE the enqueue (run time), so it's `~ now + durationMs`.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.domains).toStrictEqual([
+    { hostname: 'a.com', alwaysOn: true },
+  ]);
+  expect(written.activeTimer.endEpochMs).toBeGreaterThanOrEqual(before + TWENTY_FIVE_MIN_MS - 5);
+  expect(written.activeTimer.endEpochMs).toBeLessThanOrEqual(
+    Date.now() + TWENTY_FIVE_MIN_MS + 5,
+  );
+  expect(written.activeTimer.selectedDomains).toStrictEqual(['a.com', 'b.com']);
+  // writeHosts called exactly once with the union of always-on + timer-
+  // selected, deduped by apex. `a.com` is in BOTH; the dedupe means it's
+  // written ONCE (the spec's "apex is written ONCE" AC). Hosts lines use
+  // a single space separator (`0.0.0.0 <apex>`, `:: <apex>`), per
+  // `toHostsLines` at normalise.ts:114-125.
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  // The hosts lines must include the timer-selected domains (the Epic 4
+  // union contribution). Effective blocklist = alwaysOn ∪ activeTimer,
+  // deduped by apex. `a.com` is in BOTH (alwaysOn + timer-selected); the
+  // dedupe keeps it once but the apex token still appears in the lines.
+  // `b.com` is timer-selected only — without the Epic 4 union contribution
+  // `b.com` would be missing from the hosts lines.
+  expect(hostsLines.some((l: string) => l.includes('a.com'))).toBe(true);
+  expect(hostsLines.some((l: string) => l.includes('b.com'))).toBe(true);
+  // Pull out the apex names (the second whitespace-delimited token).
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1]),
+  );
+  // 2 apexes (a.com, b.com), each with `apex` and `www.<apex>` entries =
+  // 4 distinct apex tokens. `a.com` appears twice (apex + www.) but the
+  // dedupe collapses them — the assertion is on the SET of distinct
+  // hostnames.
+  expect(distinctApexes).toStrictEqual(new Set(['a.com', 'b.com', 'www.a.com', 'www.b.com']));
+  // committed.activeTimer advances to the new value.
+  expect(useDomainStore.getState().committed.activeTimer).toStrictEqual({
+    endEpochMs: written.activeTimer.endEpochMs,
+    selectedDomains: ['a.com', 'b.com'],
+  });
+  // applyStatus resets to idle on success.
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  // lastResult carries the writeHosts envelope.
+  expect(useDomainStore.getState().lastResult).toEqual({ ok: true });
+});
+
+test('stageStartTimer config-write failure: returns the envelope, does NOT call writeHosts, does NOT flip applyStatus, committed unchanged', async () => {
+  configNative.writeConfig.mockReturnValue({ ok: false, error: 'disk-full' });
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'a.com', alwaysOn: true }],
+    },
+    staged: null,
+    applyStatus: 'idle',
+  });
+
+  const result = await useDomainStore
+    .getState()
+    .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['a.com']) });
+
+  expect(result).toStrictEqual({ ok: false, error: 'config-write:disk-full' });
+  // writeConfig was called (and failed) -> writeHosts is NEVER called.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  // applyStatus is NOT flipped (strict order: config-write fail short-
+  // circuits before any elevation).
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  // committed.activeTimer stays null (no advance on failure).
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+});
+
+test('stageStartTimer hosts-deny: committed.activeTimer stays null (retry-safe); applyStatus resets to idle; lastResult carries the envelope', async () => {
+  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'a.com', alwaysOn: true }],
+    },
+    staged: null,
+    applyStatus: 'idle',
+  });
+
+  const result = await useDomainStore
+    .getState()
+    .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['a.com']) });
+
+  expect(result).toStrictEqual({ ok: false, error: 'admin-denied' });
+  // writeConfig ran (carrying the activeTimer write — accepted drift).
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  // writeHosts ran (admin denied).
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  // committed.activeTimer STAYS null (the spec's retry-safe invariant).
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  // applyStatus resets to idle after the hosts call settles.
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  // lastResult carries the denial envelope.
+  expect(useDomainStore.getState().lastResult).toStrictEqual({
+    ok: false,
+    error: 'admin-denied',
+  });
+});
+
+test('stageStartTimer queued behind an in-flight Apply: timer\'s writeConfig preserves the Apply\'s just-committed domains (no clobber)', async () => {
+  // Stage a domain and start an Apply whose writeHosts does not resolve
+  // until we release it, so the Apply stays in flight while stageStartTimer
+  // queues. After release, the Apply commits its staged domains first;
+  // stageStartTimer then runs and reads the run-time `committed` (now
+  // carrying the Apply's domains) — its writeConfig preserves them.
+  useDomainStore.setState({
+    committed: DEFAULT_CONFIG,
+    staged: null,
+    applyStatus: 'idle',
+  });
+  // Queue of pending writeHosts resolvers — each call enqueues a resolver
+  // and we drain them in order. The Apply's call comes first, the timer's
+  // second; this keeps the queue strictly FIFO so both calls settle.
+  const pendingResolvers: Array<(v: WriteResult) => void> = [];
+  shellNative.writeHosts.mockImplementation(
+    () =>
+      new Promise<WriteResult>((res) => {
+        pendingResolvers.push(res);
+      }),
+  );
+
+  // Stage and start the Apply.
+  useDomainStore.getState().stageDomainAdd('example.com');
+  const applyP = useDomainStore.getState().apply();
+  await flushMicrotasks();
+  expect(useDomainStore.getState().applyStatus).toBe('running');
+  expect(pendingResolvers).toHaveLength(1); // the Apply's writeHosts
+
+  // While the Apply is in flight, call stageStartTimer — it queues behind.
+  const timerP = useDomainStore
+    .getState()
+    .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['b.com']) });
+  await flushMicrotasks();
+  // The Apply has not settled, so stageStartTimer must NOT have run yet.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1); // Apply's only
+  expect(pendingResolvers).toHaveLength(1); // still just the Apply's
+
+  // Release the Apply: it commits the staged domain, THEN stageStartTimer
+  // runs and reaches its own `await writeHosts` (a 2nd pending resolver).
+  pendingResolvers.shift()!({ ok: true });
+  await flushMicrotasks();
+  // Apply has settled; the timer's writeConfig ran; the timer's writeHosts
+  // is the new pending entry.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(2);
+  expect(pendingResolvers).toHaveLength(1); // now the timer's writeHosts
+
+  // Release the timer's writeHosts: it settles the timer run.
+  pendingResolvers.shift()!({ ok: true });
+  const [applyRes, timerRes] = await Promise.all([applyP, timerP]);
+
+  expect(applyRes).toStrictEqual({ ok: true });
+  expect(timerRes).toEqual({ ok: true });
+  // The timer's writeConfig (second call) was built on the run-time
+  // committed — preserving the Apply's just-committed domain.
+  const timerWritten = JSON.parse(configNative.writeConfig.mock.calls[1][0]);
+  expect(timerWritten.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  expect(timerWritten.activeTimer).toBeDefined();
+  expect(timerWritten.activeTimer.selectedDomains).toStrictEqual(['b.com']);
+  // committed reflects both: the Apply's domain + the timer's activeTimer.
+  const state = useDomainStore.getState();
+  expect(state.committed.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  expect(state.committed.activeTimer).toBeDefined();
+  expect(state.committed.activeTimer?.selectedDomains).toStrictEqual(['b.com']);
+});
+
+test('stageStartTimer back-to-back: 2nd supersedes the 1st cleanly; 2nd\'s endEpochMs >= 1st\'s (computed at run time)', async () => {
+  useDomainStore.setState({
+    committed: DEFAULT_CONFIG,
+    staged: null,
+    applyStatus: 'idle',
+  });
+
+  const [r1, r2] = await Promise.all([
+    useDomainStore.getState().stageStartTimer({
+      durationMs: TWENTY_FIVE_MIN_MS,
+      selected: new Set(['a.com']),
+    }),
+    useDomainStore.getState().stageStartTimer({
+      durationMs: TWENTY_FIVE_MIN_MS,
+      selected: new Set(['b.com']),
+    }),
+  ]);
+
+  expect(r1).toEqual({ ok: true });
+  expect(r2).toEqual({ ok: true });
+  // Two serialized writeConfig calls; the second's activeTimer carries b.com.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(2);
+  const first = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  const second = JSON.parse(configNative.writeConfig.mock.calls[1][0]);
+  // The 2nd's endEpochMs >= the 1st's (computed at run time; both can land
+  // on the same millisecond when the queue drains without a wall-clock
+  // tick, so we allow >= not >).
+  expect(second.activeTimer.endEpochMs).toBeGreaterThanOrEqual(
+    first.activeTimer.endEpochMs,
+  );
+  // The 2nd supersedes the 1st: only `b.com` survives in the final committed
+  // state (stale `a.com` is trimmed by the second write carrying the new
+  // selection).
+  expect(useDomainStore.getState().committed.activeTimer?.selectedDomains).toStrictEqual([
+    'b.com',
+  ]);
+});
+
+test('stageStartTimer does NOT clobber staged Blocklist edits (staged is intact after the hosts write)', async () => {
+  // The user has a staged Blocklist edit (toggled alwaysOn for example.com)
+  // when they tap Start. Start's serialized run touches config.json AND
+  // hosts — but must NOT touch `staged`. The staged edit remains for a
+  // later Apply from Blocklist.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'example.com', alwaysOn: true },
+        { hostname: 'social.com', alwaysOn: false },
+      ],
+    },
+    staged: null,
+    applyStatus: 'idle',
+  });
+  // Stage a toggle: example.com becomes alwaysOn:false (the staged edit).
+  useDomainStore.getState().stageAlwaysOnToggle('example.com');
+  const stagedBefore = useDomainStore.getState().staged;
+  expect(stagedBefore).not.toBeNull();
+
+  await useDomainStore.getState().stageStartTimer({
+    durationMs: TWENTY_FIVE_MIN_MS,
+    selected: new Set(['social.com']),
+  });
+
+  // committed advanced to carry the timer's activeTimer (overwrite the
+  // committed domains with the same domains — the timer doesn't mutate
+  // `domains`).
+  expect(useDomainStore.getState().committed.activeTimer).toBeDefined();
+  // `staged` is INTACT — the same reference as before, untouched. The next
+  // Apply from Blocklist will commit this toggle alongside the running
+  // session.
+  expect(useDomainStore.getState().staged).toBe(stagedBefore);
+  expect(useDomainStore.getState().staged).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: false },
+    { hostname: 'social.com', alwaysOn: false },
+  ]);
+});
+
+// ===========================================================================
 // Story 3.2 — the reusable password gate: `requirePassword` /
 // `verifyPassword` / `closeGate` / `clearGateThrottle`. Runtime-only state
 // (`gateOpen`/`gateAction`/`gateAttempts`/`gateThrottleUntil`) — NOT persisted

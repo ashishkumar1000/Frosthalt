@@ -1,7 +1,7 @@
 /**
  * @format
  *
- * Story 4.1 — the Timer surface tests.
+ * Story 4.1 / 4.2 — the Timer surface tests.
  *
  * Renders `<Timer onOpenBlocklist={...}/>` with `react-test-renderer`
  * against a seeded `useDomainStore` (the store is a real Zustand store; the
@@ -21,11 +21,12 @@
  *   - Toggling a domain live-updates the "N of M selected" count.
  *   - Start precondition gates: invalid custom minutes / zero domains
  *     selected / applyStatus running -> Start disabled.
- *   - Start success path: stages per-domain alwaysOn flips for selected
- *     non-alwaysOn domains and fires `apply()` (mocked so the test asserts
- *     the staging sequence + the apply trigger, not the native write).
- *   - Start failure path (mocked `{ok:false}` from `apply`): staged draft is
- *     retained for retry, deny toast announced.
+ *   - Start success path (Story 4.2 engine swap): fires `stageStartTimer`
+ *     EXACTLY ONCE with `{durationMs, selected}`, asserts the new toast
+ *     copy. The store action itself is mocked so the test asserts the
+ *     component wiring, not the native write.
+ *   - Start failure path (mocked `{ok:false}` from `stageStartTimer`): deny
+ *     toast announced; `committed.activeTimer` stays null (retry-safe).
  *   - Running-timer placeholder: when `committed.activeTimer != null` at
  *     mount, the empty-state copy renders with "Open Blocklist" CTA
  *     (defensive, forward-compat with Story 4.3).
@@ -512,65 +513,104 @@ test('Start is disabled, busy, and reads "Starting…" while applyStatus is runn
 });
 
 // ---------------------------------------------------------------------------
-// Start success path: stages flips + fires apply
+// Start success path: single stageStartTimer call (Story 4.2 engine swap)
 // ---------------------------------------------------------------------------
 
-test('Start with valid duration + selection stages per-domain alwaysOn flips and fires apply (mocked apply)', async () => {
+test('Start with valid duration + selection fires stageStartTimer once with durationMs + the full selected Set (mocked store)', async () => {
   seedState({
     domains: [
       { hostname: 'a.com', alwaysOn: false },
-      { hostname: 'b.com', alwaysOn: true }, // already alwaysOn — selected but not staged
+      { hostname: 'b.com', alwaysOn: true }, // already alwaysOn — included in the session
       { hostname: 'c.com', alwaysOn: false },
     ],
   });
 
-  const toggleSpy = jest.spyOn(useDomainStore.getState(), 'stageAlwaysOnToggle');
-  const applySpy = jest
-    .spyOn(useDomainStore.getState(), 'apply')
+  const startSpy = jest
+    .spyOn(useDomainStore.getState(), 'stageStartTimer')
     .mockResolvedValue({ ok: true });
 
   const testRenderer = renderTimer();
 
-  // Default selection is {a.com, b.com, c.com}; b.com is already alwaysOn so
-  // it is NOT staged. Only a.com (false -> true) and c.com (false -> true)
-  // are flipped — stagedCount = 2, selectionCount = 3. The success toast
-  // announces the STAGED count (2), not the selection count (3) — pin the
-  // count to the staged subset (patch-2 contract).
-  const boxes = findCheckboxes(testRenderer.root);
-  // boxes[0] = a.com, boxes[1] = b.com, boxes[2] = c.com
-
-  // Press Start.
+  // Press Start (default preset is 25 min).
   const start = findStartButton(testRenderer.root, 'Start')!;
   await ReactTestRenderer.act(async () => {
     start.props.onPress();
     await Promise.resolve();
   });
 
-  // stageAlwaysOnToggle fires exactly twice: for a.com and c.com. b.com is
-  // already alwaysOn so it stays untouched (the clean-revert would clear
-  // staged if applied).
-  expect(toggleSpy).toHaveBeenCalledTimes(2);
-  expect(toggleSpy).toHaveBeenCalledWith('a.com');
-  expect(toggleSpy).toHaveBeenCalledWith('c.com');
-  // apply is called.
-  expect(applySpy).toHaveBeenCalledTimes(1);
-  // Success toast announces the staged count (2), NOT the selection count (3).
+  // `stageStartTimer` fires EXACTLY ONCE (4.2 engine swap: replaces the
+  // per-domain `stageAlwaysOnToggle` loop + `apply()` call pair).
+  expect(startSpy).toHaveBeenCalledTimes(1);
+  const [arg] = startSpy.mock.calls[0];
+  // Default preset is 25 min -> durationMs = 25 * 60_000.
+  expect(arg.durationMs).toBe(25 * 60_000);
+  // The full selection set is passed verbatim (the 4.2 engine writes the
+  // ENTIRE selection as `activeTimer.selectedDomains`, deduped by apex in
+  // `effectiveBlocklist` — including always-on domains if the user picked
+  // them; they're harmless duplicates).
+  expect(arg.selected).toBeInstanceOf(Set);
+  expect(Array.from(arg.selected).sort()).toStrictEqual([
+    'a.com',
+    'b.com',
+    'c.com',
+  ]);
+  // Success toast announces the selection count (3), not a staged subset.
   expect(announceForAccessibility).toHaveBeenCalledWith(
-    'Started blocking 2 domains.',
+    'Focus session started. 3 domains blocked.',
   );
 });
 
 // ---------------------------------------------------------------------------
-// Start failure path: staged retained + deny toast
+// Start success path — singular copy for n === 1 (Story 4.2 review — PATCH 5)
 // ---------------------------------------------------------------------------
 
-test('Start failure (apply {ok:false}) retains the staged draft and announces the deny toast', async () => {
+test('Start with a single selected domain announces the singular toast copy ("1 domain blocked")', async () => {
+  // Mirrors the plural test above but seeds exactly one domain and asserts the
+  // singular branch of `START_SUCCESS_TOAST` at Timer.tsx:90 (`n === 1 ?
+  // 'domain' : 'domains'`). The plural branch is covered above; the singular
+  // branch was untested — a regression that broke the `n === 1` check would
+  // announce "1 domains blocked" (bad grammar) and slip past the existing
+  // test.
+  seedState({
+    domains: [{ hostname: 'only.com', alwaysOn: false }],
+  });
+
+  const startSpy = jest
+    .spyOn(useDomainStore.getState(), 'stageStartTimer')
+    .mockResolvedValue({ ok: true });
+
+  const testRenderer = renderTimer();
+
+  // Press Start (default preset is 25 min).
+  const start = findStartButton(testRenderer.root, 'Start')!;
+  await ReactTestRenderer.act(async () => {
+    start.props.onPress();
+    await Promise.resolve();
+  });
+
+  // `stageStartTimer` fires EXACTLY ONCE carrying the single selection.
+  expect(startSpy).toHaveBeenCalledTimes(1);
+  const [arg] = startSpy.mock.calls[0];
+  expect(arg.selected).toBeInstanceOf(Set);
+  expect(Array.from(arg.selected)).toStrictEqual(['only.com']);
+  // Success toast announces the singular form (NOT "1 domains blocked").
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    'Focus session started. 1 domain blocked.',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Start failure path: stageStartTimer {ok:false} -> deny toast + activeTimer
+// stays null (retry-safe)
+// ---------------------------------------------------------------------------
+
+test('Start failure (stageStartTimer {ok:false}) announces the deny toast; committed.activeTimer stays null (retry-safe)', async () => {
   seedState({
     domains: [{ hostname: 'a.com', alwaysOn: false }],
   });
 
-  jest
-    .spyOn(useDomainStore.getState(), 'apply')
+  const startSpy = jest
+    .spyOn(useDomainStore.getState(), 'stageStartTimer')
     .mockResolvedValue({ ok: false, error: 'denied' });
 
   const testRenderer = renderTimer();
@@ -581,19 +621,16 @@ test('Start failure (apply {ok:false}) retains the staged draft and announces th
     await Promise.resolve();
   });
 
+  // `stageStartTimer` fired once with the user's selection.
+  expect(startSpy).toHaveBeenCalledTimes(1);
   // The deny toast is announced.
   expect(announceForAccessibility).toHaveBeenCalledWith(
     "Couldn't start the block. No changes made.",
   );
-  // Staged is retained (the real store's apply retains staged on failure;
-  // we mocked apply() to short-circuit, so we check the call happened with
-  // a non-null staged at call time — the store applies ran with a staged
-  // set in its queue).
-  // (The apply mock returns synchronously; `stageAlwaysOnToggle` ran first
-  // so `staged` is non-null at the point `apply` was called. We assert the
-  // call happened, not the post-state, because the mock short-circuits the
-  // real store logic.)
-  expect(useDomainStore.getState().apply).toBeDefined();
+  // committed.activeTimer stays null — the spec's retry-safe invariant (the
+  // mock short-circuits the real store logic, so we assert the call happened
+  // and the seed's `committed.activeTimer` is untouched).
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

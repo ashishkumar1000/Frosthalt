@@ -46,6 +46,14 @@
  *     row). Removal is STAGED (Apply commits, not password-gated).
  *   - `cancelStaged()` — discard staged back to last-committed.
  *   - `apply()` — enqueue a serialized Apply run; returns its envelope.
+ *   - `stageStartTimer({durationMs, selected})` (Story 4.2) — start a focus
+ *     session: writes `{activeTimer:{endEpochMs,selectedDomains}}` to
+ *     config.json, THEN `writeHosts(effectiveHostsLines(nextConfig))` —
+ *     strict config-then-hosts order, ONE admin prompt. Re-uses the shared
+ *     `enqueue`; mirrors `setPassword`'s run-time `committed` re-read and
+ *     `restoreSection`'s hosts-write + `applyStatus` flip. Hosts-deny
+ *     leaves `committed.activeTimer` null (retry-safe). Does NOT touch
+ *     `staged` — Start is its own atomic config write.
  *
  * Serialization: a single in-flight Promise + a micro-queue of pending
  * `apply()` intents; the queue drains one-at-a-time, never in parallel. This
@@ -132,6 +140,61 @@ export interface DomainState {
   stageDomainRemove: (hostname: string) => WriteResult;
   cancelStaged: () => void;
   apply: () => Promise<WriteResult>;
+  /**
+   * Start a focus session (Story 4.2). Engine swap from 4.1's per-domain
+   * `alwaysOn` flips: a SINGLE serialized run that writes
+   * `{activeTimer: {endEpochMs, selectedDomains}}` to `config.json` THEN
+   * `writeHosts(effectiveHostsLines(nextConfig))` — strict config-then-hosts
+   * order, ONE admin prompt. Mirrors `setPassword`'s run-time `committed`
+   * re-read (race-safe against an in-flight Apply) and `restoreSection`'s
+   * `applyStatus: 'running'` flip + hosts-write + state transition.
+   *
+   * - On `writeConfig` failure -> `{ok:false, error:'config-write:<detail>'}`
+   *   and return WITHOUT calling `writeHosts` / flipping `applyStatus` /
+   *   mutating `committed` (strict order — no admin prompt, no state advance).
+   * - On `writeConfig` ok -> flip `applyStatus:'running'`; compute
+   *   `effectiveHostsLines(nextConfig)` (always-on ∪ timer-selected, deduped
+   *   via `effectiveBlocklist`); call `writeHosts(lines)`.
+   * - On `writeHosts` ok -> advance `committed` to `nextConfig` (carrying
+   *   `activeTimer`), reset `applyStatus:'idle'`, set `lastResult`.
+   * - On `writeHosts` deny -> `committed.activeTimer` STAYS at pre-Start
+   *   value (null on fresh); reset `applyStatus:'idle'`; set `lastResult`.
+   *   This is the same model as `apply()`'s hosts-deny path (store.ts:372):
+   *   if `committed.activeTimer` advanced on denial, the UI would show
+   *   "session running" that the disk state cannot back. A future re-arm
+   *   (planned for Story 4.7) will resume from the disk state, so leaving
+   *   the advance gated on hosts-write success is the cleanest invariant
+   *   for this story. The on-disk config carries the `activeTimer` write as
+   *   accepted drift (config = intent, hosts = derived enforcement; mirrors
+   *   `apply.ts:13-16`); on next launch the planned 4.7 re-arm reads it,
+   *   and a successful retry syncs in-memory.
+   *
+   * `endEpochMs` is computed INSIDE the enqueue (at run time, not call time)
+   * so the user gets the full `durationMs` even after a queue wait. The
+   * queue is FIFO; if a long Apply is in flight when the user taps Start,
+   * `Date.now()` advances while we wait and the user's session is still the
+   * full duration.
+   *
+   * Does NOT touch `staged`. Pending Blocklist edits remain staged for the
+   * user's next Apply — Start is its own atomic config write, never a
+   * side-effect on `staged`.
+   *
+   * Does NOT route through `requirePassword` — Start is friction-free per
+   * OQ-1.
+   *
+   * Input-validation contract (Story 4.2 review — PATCH 1): invalid inputs
+   * fail BEFORE enqueueing, so no admin prompt fires and no write is
+   * attempted. Returns `{ok:false, error:'invalid-duration'}` when
+   * `durationMs` is not a positive finite number (0 / negative / NaN /
+   * Infinity would corrupt the persisted `endEpochMs` via `Date.now() +
+   * durationMs`). Returns `{ok:false, error:'empty-selection'}` when
+   * `selected` is empty OR not a `Set` instance (an Array would stringify;
+   * null would throw on `Array.from`).
+   */
+  stageStartTimer: (input: {
+    durationMs: number;
+    selected: Set<string>;
+  }) => Promise<WriteResult>;
   /**
    * Sync: read the managed section (`readHostsSection`) + compare to committed
    * (`computeDrift`) + set `drift`. Returns the result. No admin prompt.
@@ -478,6 +541,112 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
         set({ committed: nextConfig });
       }
       return result;
+    });
+  },
+
+  // ----- Story 4.2 — `stageStartTimer` (the timed-session engine swap) -----
+
+  stageStartTimer: ({ durationMs, selected }) => {
+    // Input guards (Story 4.2 review — PATCH 1): validate at the store layer
+    // BEFORE enqueueing so a malformed call neither flips `applyStatus` nor
+    // triggers an admin prompt nor writes to config.json / /etc/hosts.
+    //   - `durationMs` must be a positive finite number. A 0 / negative / NaN
+    //     / Infinity would flow through to `Date.now() + durationMs` and
+    //     corrupt the persisted `endEpochMs`.
+    //   - `selected` must be a non-empty Set. An empty Set would persist
+    //     `selectedDomains: []` with no effect (the dedupe loop yields
+    //     nothing); a non-Set (e.g. Array, null) would either stringify or
+    //     throw on `Array.from`.
+    // Both failures short-circuit BEFORE enqueue, returning a resolved
+    // `WriteResult` envelope so the caller sees `{ok:false, error}` and the
+    // UI can branch on it without unwrapping a thrown error.
+    if (!Number.isFinite(durationMs) || durationMs <= 0) {
+      return Promise.resolve({ ok: false, error: 'invalid-duration' } as WriteResult);
+    }
+    if (!(selected instanceof Set) || selected.size === 0) {
+      return Promise.resolve({ ok: false, error: 'empty-selection' } as WriteResult);
+    }
+    // Engine swap from 4.1's per-domain `alwaysOn` flips. The serialized run
+    // body mirrors `setPassword`'s run-time re-read of `committed` (race-
+    // safe against an in-flight Apply) + `restoreSection`'s hosts-write +
+    // `applyStatus` flip pattern. Parallel queue body — NOT a reuse of
+    // `runApply` — because we need a different `nextConfig` shape (carrying
+    // `activeTimer`, NOT `domains = staged`); keeping the strict
+    // config-then-hosts order auditable in one place.
+    return enqueue(async () => {
+      // Re-read committed at run time. If a long Apply was queued ahead of
+      // this Start, its just-committed domains are now in `committed` —
+      // building `nextConfig` on the run-time value preserves them in the
+      // activeTimer write (the spec's race-vs-Apply AC).
+      const committed = get().committed;
+      const nextConfig: Config = {
+        ...committed,
+        // `endEpochMs` computed INSIDE the enqueue (at run time) so the user
+        // gets the full `durationMs` even after a queue wait. The countdown
+        // ring (4.3) reads `endEpochMs - Date.now()`; this matches.
+        activeTimer: {
+          endEpochMs: Date.now() + durationMs,
+          selectedDomains: Array.from(selected),
+        },
+      };
+      // 1. Write config.json FIRST (strict order). On failure -> short-circuit
+      // BEFORE any elevation (no admin prompt, no `applyStatus` flip, no
+      // `committed` advance). Mirrors `runApply`'s order at apply.ts:13-16
+      // and `setPassword`'s `writeConfig`-only path at store.ts:467-481.
+      const cfg = writeConfig(nextConfig);
+      if (!cfg.ok) {
+        return {
+          ok: false,
+          error: `config-write:${cfg.error ?? 'unknown'}`,
+        } as WriteResult;
+      }
+      // 2. Flip `applyStatus` (gates the `liveApplyStatus` Start guard at
+      // Timer.tsx:255-258 — prevents double-tap from queuing two prompts)
+      // and compute the effective hosts lines from the just-committed
+      // `nextConfig`. `effectiveBlocklist` walks always-on AND
+      // `activeTimer.selectedDomains`, deduping by apex (Epic 4
+      // contribution). The timer's union rides through automatically —
+      // `effectiveHostsLines` is unchanged.
+      set({ applyStatus: 'running' });
+      // 3. Write the managed hosts section — ONE admin prompt. The native
+      // promise resolves (never rejects) per shellRunner's contract; errors
+      // ride inside the envelope. The try/catch wraps the post-`applyStatus`
+      // portion (Story 4.2 review — PATCH 2) as a defensive guard: shellRunner
+      // promises "never rejects", but JS Promises can still throw (e.g. a
+      // TypeError from a downstream change). Without this catch, an
+      // unexpected throw would leave `applyStatus === 'running'` forever and
+      // the Start button permanently disabled. The catch resets `applyStatus`
+      // and returns an envelope so the UI is recoverable.
+      try {
+        const lines = effectiveHostsLines(nextConfig);
+        const result = await writeHosts(lines);
+        if (result.ok) {
+          // Hosts ok -> advance `committed` to `nextConfig` (carrying
+          // `activeTimer`) + reset `applyStatus` + set `lastResult`. Same
+          // model as `apply()`'s success path at store.ts:354-371.
+          set({
+            committed: nextConfig,
+            applyStatus: 'idle',
+            lastResult: result,
+          });
+        } else {
+          // Hosts denied (or hard OS error) -> `committed.activeTimer` STAYS
+          // at the pre-Start value (null on fresh) — the spec's hosts-deny
+          // invariant. `applyStatus` resets to `idle`; `lastResult` carries
+          // the envelope for the UI status line. `config.json` on disk may
+          // carry the `activeTimer` write (accepted drift, mirrors
+          // `apply.ts:13-16`); A future re-arm (planned for Story 4.7) will
+          // resume from the disk state, and a successful retry syncs in-memory.
+          set({ applyStatus: 'idle', lastResult: result });
+        }
+        return result;
+      } catch (err) {
+        // Defensive — shellRunner's contract says the promise never rejects,
+        // but JS Promises can still throw; reset `applyStatus` so the UI is
+        // recoverable.
+        set({ applyStatus: 'idle' });
+        return { ok: false, error: `hosts-throw:${String(err)}` } as WriteResult;
+      }
     });
   },
 

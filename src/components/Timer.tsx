@@ -1,17 +1,24 @@
 /**
- * Timer — the Timer surface (surface 1, Story 4.1).
+ * Timer — the Timer surface (surface 1, Story 4.1, engine swap in 4.2).
  *
  * The Free-state surface: title + duration picker + domain-pick list +
  * Start button. Picker state is component-local (`useState` for duration
  * selection, custom minute text, and the selected hostname `Set`); nothing
- * in 4.1 lands in `committed` or `staged`. The Start handler stages
- * per-domain `alwaysOn` flips into the EXISTING staged-then-Apply pipeline
- * (reusing `stageAlwaysOnToggle` + `apply`), then fires one osascript admin
- * prompt through the shared serialized queue (AD-10).
+ * in 4.1 lands in `committed` or `staged`.
+ *
+ * Story 4.2 SWAP: the Start handler is a SINGLE `stageStartTimer({durationMs,
+ * selected})` call to the store, replacing 4.1's per-domain
+ * `stageAlwaysOnToggle` + `apply` chain. The new engine writes
+ * `activeTimer:{endEpochMs,selectedDomains}` to `config.json` THEN
+ * `writeHosts(effectiveHostsLines(nextConfig))` through the shared
+ * serialized queue — exactly one admin prompt. `endEpochMs` is computed
+ * inside the enqueue (run time), so the user gets the full `durationMs`
+ * even after a queue wait. Hosts-deny leaves `committed.activeTimer` null
+ * (retry-safe).
  *
  * Pre-check fallback (epic-4-context):
  *   - Persisted selection (committed.activeTimer?.selectedDomains) — used
- *     when present (4.2 will populate it; reading it now is the right hook).
+ *     when present. 4.2 populates it; reading it now is the right hook.
  *   - First-run default — when no persisted selection exists, every domain
  *     is pre-checked, giving the user a one-click "start a session on
  *     everything".
@@ -71,9 +78,16 @@ const INVALID_CUSTOM_TEXT = `Enter minutes (${DURATION_MIN_MINUTES}–${DURATION
 /** Start-button in-flight label (mirrors Blocklist's "Applying…"). */
 const STARTING_LABEL = 'Starting…';
 
-/** Success toast on Apply commit (toast is also a UX-DR15 surface cue). */
+/**
+ * Success toast on Start commit (toast is also a UX-DR15 surface cue). The
+ * `n` is the user-visible selection count (the domains the session covers)
+ * — the toast frames Start as a timed session, not a permanent block. The
+ * pre-4.2 copy read "Started blocking N domains." which reflected 4.1's
+ * per-domain `alwaysOn` engine; the 4.2 engine is time-bounded, so the copy
+ * follows.
+ */
 const START_SUCCESS_TOAST = (n: number): string =>
-  `Started blocking ${n} ${n === 1 ? 'domain' : 'domains'}.`;
+  `Focus session started. ${n} ${n === 1 ? 'domain' : 'domains'} blocked.`;
 /** Apply-denied toast (spec's I/O matrix row). */
 const START_DENIED_TOAST = "Couldn't start the block. No changes made.";
 
@@ -94,8 +108,7 @@ export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
   // ----- Store reads -----
   const committed = useDomainStore((s) => s.committed);
   const applyStatus = useDomainStore((s) => s.applyStatus);
-  const stageAlwaysOnToggle = useDomainStore((s) => s.stageAlwaysOnToggle);
-  const apply = useDomainStore((s) => s.apply);
+  const stageStartTimer = useDomainStore((s) => s.stageStartTimer);
 
   // ----- Derived gating -----
   const hasActiveTimer = committed.activeTimer != null;
@@ -242,44 +255,66 @@ export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
     }
   };
 
-  // The Start handler: stage per-domain `alwaysOn: true` flips for each
-  // selected domain that is not yet alwaysOn, then fire `apply()`. The
-  // Stage-then-Apply pipeline (Epic 1.6) writes both config.json and
-  // /etc/hosts through the shared serialized queue — exactly one admin
-  // prompt for the entire Start sequence.
+  // The Start handler: the engine swap from 4.1's per-domain `alwaysOn`
+  // flips to 4.2's single `stageStartTimer({durationMs, selected})` call.
+  // The store action handles `writeConfig` (carrying the new `activeTimer`)
+  // BEFORE `writeHosts(effectiveHostsLines(nextConfig))` through the shared
+  // serialized queue — exactly one admin prompt for the entire Start
+  // sequence. The selected set is the user-visible session selection
+  // (size = the toast's "N domains" count, which reflects the user's
+  // choice, NOT a staged-derivation subset).
   const handleStart = () => {
     // Re-read `applyStatus` at handler-call time so a same-tick race (e.g.
     // a Start tap while the previous run is just settling) cannot fire a
-    // second concurrent Apply. The render-time `canStart` check covers the
-    // common case; this guard catches the call-time edge.
+    // second concurrent `stageStartTimer`. The render-time `canStart` check
+    // covers the common case; this guard catches the call-time edge.
     const liveApplyStatus = useDomainStore.getState().applyStatus;
     if (!canStart || liveApplyStatus === 'running') {
       return;
     }
-    // Stage flips. We iterate in `committed.domains` order so the staged
-    // draft's sequence is predictable across Start invocations.
-    let stagedCount = 0;
-    for (const d of committed.domains) {
-      if (selected.has(d.hostname) && !d.alwaysOn) {
-        stageAlwaysOnToggle(d.hostname);
-        stagedCount += 1;
+    // The duration in ms for the timed session. Presets already carry a
+    // minute count (`duration.minutes`); custom carries the parsed minute
+    // count. Either way, `durationMs = minutes * 60_000` for the
+    // `endEpochMs = Date.now() + durationMs` computation the store does
+    // INSIDE the enqueue (so the user gets the full durationMs even after a
+    // queue wait). `canStart` gates Start on `durationValid`, which requires
+    // `customParse.ok === true` for the `custom` path — narrowing lets TS see
+    // `minutes` is reachable on both paths.
+    let minutes: number;
+    if (duration.kind === 'preset') {
+      minutes = duration.minutes;
+    } else {
+      // customParse is guaranteed non-null + ok when `duration.kind === 'custom'`
+      // AND `canStart` is true (the precondition the liveApplyStatus guard
+      // above enforces). Narrow defensively for TS.
+      const parsed = customParse;
+      if (parsed == null || parsed.ok !== true) {
+        return;
       }
+      minutes = parsed.minutes;
     }
-    void apply()
+    void stageStartTimer({
+      durationMs: minutes * 60_000,
+      selected,
+    })
       .then((result) => {
         if (result.ok) {
           // Toast via announceForAccessibility — there is no toast primitive
-          // in 4.1 (Epic 5 owns it); the announcement is the in-window cue.
+          // in 4.1/4.2 (Epic 5 owns it); the announcement is the in-window
+          // cue. The count is the user's selection count, not a
+          // staged-subset: the 4.2 engine writes the FULL selection as
+          // `activeTimer.selectedDomains`, so "N domains" is the user's
+          // visible choice.
           AccessibilityInfo.announceForAccessibility(
-            START_SUCCESS_TOAST(stagedCount),
+            START_SUCCESS_TOAST(selected.size),
           );
         } else {
           AccessibilityInfo.announceForAccessibility(START_DENIED_TOAST);
         }
       })
       .catch((err: unknown) => {
-        // Defensive: `runApply` never rejects, but the toast-primitive is
-        // deferred to Epic 5 (spec); keep the cue announce-only.
+        // Defensive: the store's queue never rejects, but the toast-primitive
+        // is deferred to Epic 5 (spec); keep the cue announce-only.
         AccessibilityInfo.announceForAccessibility(
           'Could not start block: ' + String(err),
         );
