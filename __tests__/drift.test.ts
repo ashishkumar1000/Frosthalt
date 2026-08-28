@@ -14,8 +14,9 @@
 
 import { computeDrift } from '../src/domain/drift';
 import type { DriftResult } from '../src/domain/drift';
+import { toHostsLines } from '../src/domain/normalise';
 import type { ReadSectionResult } from '../src/hosts/shellRunner';
-import type { Config, Domain } from '../src/config/types';
+import type { Config, Domain, Schedule } from '../src/config/types';
 import { DEFAULT_CONFIG } from '../src/config/types';
 
 const GOLDEN_LINES = [
@@ -249,6 +250,120 @@ test('multiple domains with one alwaysOn:false: only the alwaysOn domain contrib
     drift: false,
     reason: 'in-sync',
   });
+});
+
+// ===========================================================================
+// Story 5.3 — active schedules are part of the recomputed expectation.
+//
+// `computeDrift` calls `effectiveHostsLines(committed)` with the DEFAULT
+// `now` (call-time `new Date()`), so these tests pin the global Date
+// constructor for the duration of the comparison (other arities delegate to
+// the real one) and build the schedule fixtures against that same fixed
+// instant — deterministic regardless of when the suite runs.
+// ===========================================================================
+
+/** 2026-08-05 is a Wednesday (jsDay 3 -> config weekday 2). */
+const WEDNESDAY_IN_WINDOW = new Date(2026, 7, 5, 10, 30, 0);
+// The same Wednesday, 18:30 — after the 09:00-17:00 window.
+const WEDNESDAY_AFTER_WINDOW = new Date(2026, 7, 5, 18, 30, 0);
+
+/**
+ * Pin the global `Date` constructor so the no-arg `new Date()` inside
+ * `effectiveHostsLines` (the default `now`) observes `fixed`. The spy is
+ * restored in `finally`; `computeDrift` is synchronous, so the pinned
+ * instant is exactly what it sees.
+ *
+ * Twin of `withFixedNow` in `__tests__/apply.test.ts` — kept per-file: the
+ * react-native jest preset collects every file under `__tests__` as a suite,
+ * so a shared helper file would need testMatch config changes.
+ */
+function withFixedNow<T>(fixed: Date, fn: () => T): T {
+  const RealDate = globalThis.Date as unknown as new (...args: unknown[]) => Date;
+  const spy = jest.spyOn(globalThis, 'Date') as unknown as jest.SpyInstance;
+  spy.mockImplementation(((...args: unknown[]) =>
+    args.length === 0
+      ? fixed
+      : new RealDate(...args)) as unknown as (...a: unknown[]) => Date);
+  try {
+    return fn();
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+/** A committed config with the always-on golden domain plus an in-window schedule. */
+function configWithSchedule(overrides: Partial<Schedule> = {}): Config {
+  return {
+    ...DEFAULT_CONFIG,
+    domains: [{ hostname: 'example.com', alwaysOn: true }],
+    schedules: [
+      {
+        id: 'focus',
+        name: 'Focus',
+        weekdays: [2],
+        startTime: '09:00',
+        endTime: '17:00',
+        enabled: true,
+        domains: ['social.com'],
+        ...overrides,
+      },
+    ],
+  };
+}
+
+// The section body the payload SHOULD have while the schedule is in-window.
+const IN_WINDOW_BODY = [...GOLDEN_LINES, ...linesFor('social.com')];
+
+/**
+ * The 4 managed hosts lines for one apex — delegates to `toHostsLines` so the
+ * expected body can never silently drift from the real line producer.
+ */
+function linesFor(apex: string): string[] {
+  return toHostsLines(apex);
+}
+
+test('Story 5.3: in-window schedule + section missing its lines -> mismatch (drift)', () => {
+  const result = withFixedNow(WEDNESDAY_IN_WINDOW, () => {
+    const read: ReadSectionResult = { ok: true, section: GOLDEN_LINES };
+    return computeDrift(configWithSchedule(), read);
+  });
+  // The committed schedule is inside its window, so its social.com lines are
+  // part of the expectation; a section without them is drift (mismatch).
+  expect(result).toStrictEqual({ drift: true, reason: 'mismatch' });
+});
+
+test('Story 5.3: in-window schedule + section carrying the recomputed lines -> in-sync', () => {
+  const result = withFixedNow(WEDNESDAY_IN_WINDOW, () => {
+    const read: ReadSectionResult = { ok: true, section: IN_WINDOW_BODY };
+    return computeDrift(configWithSchedule(), read);
+  });
+  expect(result).toStrictEqual({ drift: false, reason: 'in-sync' });
+});
+
+test('Story 5.3: out-of-window schedule + section without its lines -> in-sync', () => {
+  const result = withFixedNow(WEDNESDAY_AFTER_WINDOW, () => {
+    const read: ReadSectionResult = { ok: true, section: GOLDEN_LINES };
+    return computeDrift(configWithSchedule(), read);
+  });
+  expect(result).toStrictEqual({ drift: false, reason: 'in-sync' });
+});
+
+test('Story 5.3: out-of-window schedule + section still carrying its lines -> mismatch', () => {
+  const result = withFixedNow(WEDNESDAY_AFTER_WINDOW, () => {
+    const read: ReadSectionResult = { ok: true, section: IN_WINDOW_BODY };
+    return computeDrift(configWithSchedule(), read);
+  });
+  // The window has closed, so the schedule's lines are now EXTRA on disk —
+  // an honest drift report (5.4's ticker closes the live gap).
+  expect(result).toStrictEqual({ drift: true, reason: 'mismatch' });
+});
+
+test('Story 5.3: a disabled schedule is never part of the expectation', () => {
+  const result = withFixedNow(WEDNESDAY_IN_WINDOW, () => {
+    const read: ReadSectionResult = { ok: true, section: GOLDEN_LINES };
+    return computeDrift(configWithSchedule({ enabled: false }), read);
+  });
+  expect(result).toStrictEqual({ drift: false, reason: 'in-sync' });
 });
 
 // Compile-time pin on the signature.

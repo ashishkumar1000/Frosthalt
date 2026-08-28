@@ -26,6 +26,15 @@
  * effective-blocklist order by `writeHosts`, so a reordering is a real drift.
  * Empty committed + absent section = `in-sync` (nothing to enforce) — this
  * avoids a noisy "Restore?" prompt on a fresh install with no domains.
+ *
+ * Story 5.3 (schedules in the expectation): the expected lines are recomputed
+ * at call time, so an in-window schedule's domains are part of `expected`.
+ * KNOWN + ACCEPTED at a window boundary: between a window opening/closing and
+ * the next hosts write, the on-disk section lags the recomputed expectation,
+ * so this comparator can report drift for schedule-only differences. The
+ * check runs only on HostsViewer mount, and Restore writes the correctly
+ * recomputed lines; Story 5.4's ticker closes the gap live. No special-case
+ * here — the boundary report is the honest comparison.
  */
 
 import type { Config } from '../config/types';

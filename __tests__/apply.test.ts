@@ -33,6 +33,7 @@ import { runApply } from '../src/domain/apply';
 import type { ApplyInput } from '../src/domain/apply';
 import { DEFAULT_CONFIG } from '../src/config/types';
 import type { Config, Domain, Schedule } from '../src/config/types';
+import { toHostsLines } from '../src/domain/normalise';
 import type { WriteResult } from '../src/hosts/shellRunner';
 
 type NativeConfigMock = { readConfig: jest.Mock; writeConfig: jest.Mock };
@@ -397,6 +398,176 @@ test('a domains-only Apply (stagedSchedules: null) preserves NON-EMPTY committed
   // The clean schedule slice leaves the NON-EMPTY committed.schedules
   // untouched in the written config — verbatim, not reset to [].
   expect(written.schedules).toStrictEqual(committedSchedules);
+});
+
+// ---------------------------------------------------------------------------
+// Story 5.3 — an in-window schedule's domains ride the SAME hosts payload.
+//
+// `runApply` calls `effectiveHostsLines(nextConfig)` with the DEFAULT `now`
+// (call-time `new Date()`), so these tests pin the global Date constructor
+// for the duration of the Apply (other arities delegate to the real one) and
+// build the schedule fixtures against that same fixed instant. The hosts
+// payload is then deterministic regardless of when the suite runs.
+// ---------------------------------------------------------------------------
+
+/** 2026-08-05 is a Wednesday (jsDay 3 -> config weekday 2). */
+const WEDNESDAY_IN_WINDOW = new Date(2026, 7, 5, 10, 30, 0);
+// The same Wednesday, 18:30 — after the 09:00-17:00 window.
+const WEDNESDAY_AFTER_WINDOW = new Date(2026, 7, 5, 18, 30, 0);
+
+/**
+ * Pin the global `Date` constructor so the no-arg `new Date()` inside
+ * `effectiveHostsLines` (the default `now`) observes `fixed`. The spy is
+ * restored in `finally`; `runApply` evaluates its payload synchronously
+ * before its first `await`, so the pinned instant is what it sees.
+ *
+ * Twin of `withFixedNow` in `__tests__/drift.test.ts` — kept per-file: the
+ * react-native jest preset collects every file under `__tests__` as a suite,
+ * so a shared helper file would need testMatch config changes.
+ */
+async function withFixedNow<T>(fixed: Date, fn: () => Promise<T>): Promise<T> {
+  const RealDate = globalThis.Date as unknown as new (...args: unknown[]) => Date;
+  const spy = jest.spyOn(globalThis, 'Date') as unknown as jest.SpyInstance;
+  spy.mockImplementation(((...args: unknown[]) =>
+    args.length === 0
+      ? fixed
+      : new RealDate(...args)) as unknown as (...a: unknown[]) => Date);
+  try {
+    return await fn();
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+/**
+ * The 4 managed hosts lines for one apex — delegates to `toHostsLines` so the
+ * expected payload can never silently drift from the real line producer.
+ */
+function linesFor(apex: string): string[] {
+  return toHostsLines(apex);
+}
+
+function scheduleFixture(overrides: Partial<Schedule> = {}): Schedule {
+  return {
+    id: 'focus',
+    name: 'Focus',
+    weekdays: [2],
+    startTime: '09:00',
+    endTime: '17:00',
+    enabled: true,
+    domains: ['social.com'],
+    ...overrides,
+  };
+}
+
+test('in-window staged schedule: the hosts payload includes its domains (strict order unchanged)', async () => {
+  await withFixedNow(WEDNESDAY_IN_WINDOW, async () => {
+    const result = await runApply({
+      committed: DEFAULT_CONFIG,
+      staged: null,
+      stagedSchedules: [scheduleFixture()],
+    });
+
+    expect(result).toStrictEqual({ ok: true });
+    expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+    expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+    // The schedule's domains appear in the written hosts section (a
+    // schedule-only blocklist -> only its lines), expanded by `toHostsLines`.
+    const [lines] = shellNative.writeHosts.mock.calls[0];
+    expect(lines).toStrictEqual(linesFor('social.com'));
+    // Strict order unchanged: the config write still precedes the hosts write.
+    expect(configNative.writeConfig.mock.invocationCallOrder[0]).toBeLessThan(
+      shellNative.writeHosts.mock.invocationCallOrder[0],
+    );
+  });
+});
+
+test('in-window schedule unions AFTER always-on in the written payload, deduped by apex', async () => {
+  await withFixedNow(WEDNESDAY_IN_WINDOW, async () => {
+    const committed: Config = {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+    };
+    await runApply({
+      committed,
+      staged: null,
+      stagedSchedules: [scheduleFixture({ domains: ['social.com', 'example.com'] })],
+    });
+
+    const [lines] = shellNative.writeHosts.mock.calls[0];
+    // Always-on first, then the schedule's new apex; the scheduled
+    // `example.com` does NOT duplicate the always-on one.
+    expect(lines).toStrictEqual([...linesFor('example.com'), ...linesFor('social.com')]);
+  });
+});
+
+test('out-of-window staged schedule: the hosts payload excludes its domains', async () => {
+  await withFixedNow(WEDNESDAY_AFTER_WINDOW, async () => {
+    await runApply({
+      committed: DEFAULT_CONFIG,
+      staged: null,
+      stagedSchedules: [scheduleFixture()],
+    });
+
+    expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+    const [lines] = shellNative.writeHosts.mock.calls[0];
+    // Nothing is active -> an empty managed section (markers, no lines).
+    expect(lines).toStrictEqual([]);
+  });
+});
+
+test('a disabled staged schedule (enabled:false) never reaches the hosts payload', async () => {
+  await withFixedNow(WEDNESDAY_IN_WINDOW, async () => {
+    await runApply({
+      committed: DEFAULT_CONFIG,
+      staged: null,
+      stagedSchedules: [scheduleFixture({ enabled: false })],
+    });
+
+    const [lines] = shellNative.writeHosts.mock.calls[0];
+    expect(lines).toStrictEqual([]);
+  });
+});
+
+test('committed-schedules path: an unrelated staged-domain Apply re-writes the committed active schedule lines', async () => {
+  // The mirror of the staged-schedule tests above: the schedule lives in the
+  // COMMITTED config (stagedSchedules is null — the schedule draft is clean)
+  // and only an unrelated staged-domain change rides the Apply. The payload
+  // must still re-write the active schedule's lines from committed config,
+  // never drop them — and the union stays deduped at the apply level.
+  await withFixedNow(WEDNESDAY_IN_WINDOW, async () => {
+    const committed: Config = {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'example.com', alwaysOn: true }],
+      schedules: [scheduleFixture({ domains: ['social.com', 'example.com'] })],
+    };
+
+    const result = await runApply({
+      committed,
+      staged: [{ hostname: 'added.com', alwaysOn: true }],
+      stagedSchedules: null,
+    });
+
+    expect(result).toStrictEqual({ ok: true });
+    expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+    expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+    const [lines] = shellNative.writeHosts.mock.calls[0];
+    // The staged domains slice REPLACES committed.domains, so `example.com`
+    // loses its always-on flag — but the committed schedule still carries it
+    // in its `domains`, so it stays blocked (the timer-precedent independence:
+    // blocklist membership and schedule membership are independent). Payload:
+    // staged always-on first, then the committed schedule's in-window apexes
+    // in config order, deduped (example.com appears ONCE, via the schedule).
+    expect(lines).toStrictEqual([
+      ...linesFor('added.com'),
+      ...linesFor('social.com'),
+      ...linesFor('example.com'),
+    ]);
+    // Strict order unchanged: config write before the hosts write.
+    expect(configNative.writeConfig.mock.invocationCallOrder[0]).toBeLessThan(
+      shellNative.writeHosts.mock.invocationCallOrder[0],
+    );
+  });
 });
 
 // Compile-time pin: runApply returns Promise<WriteResult>.
