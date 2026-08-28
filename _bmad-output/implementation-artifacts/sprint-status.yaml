@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-14-2026 00:19
-last_updated: 08-28-2026  # 4-7 done — Epic 4 complete (step-05 commit)
+last_updated: 08-28-2026  # 5-1 done (committed)
 
 project: Frosthalt
 project_key: NOKEY
@@ -72,8 +72,8 @@ development_status:
   4-7-closed-mid-session-persistence-and-re-arm-on-launch: done
   epic-4-retrospective: optional
 
-  epic-5: backlog
-  5-1-schedule-surface-with-enable-toggle-and-summary: backlog
+  epic-5: in-progress
+  5-1-schedule-surface-with-enable-toggle-and-summary: done
   5-2-schedule-editor-sheet: backlog
   5-3-active-window-blocking-schedule-in-effective-blocklist: backlog
   5-4-live-schedule-transitions-while-app-running: backlog

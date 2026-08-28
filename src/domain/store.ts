@@ -71,7 +71,7 @@
  */
 
 import { create } from 'zustand';
-import type { Config, Domain } from '../config/types';
+import type { Config, Domain, Schedule } from '../config/types';
 import { readConfig, writeConfig } from '../config/configStore';
 import { hashPassword, GATE_MAX_ATTEMPTS, GATE_THROTTLE_MS } from '../config/password';
 import { normaliseDomain } from './normalise';
@@ -82,6 +82,7 @@ import type { DriftResult } from './drift';
 import { readHostsSection, writeHosts } from '../hosts/shellRunner';
 import type { WriteResult } from '../hosts/shellRunner';
 import { useTimerStore } from './timerStore';
+import { scheduleValueKey } from './stagedScheduleChangeCount';
 
 export type ApplyStatus = 'idle' | 'running';
 
@@ -122,6 +123,15 @@ export interface VerifyResult {
 export interface DomainState {
   committed: Config;
   staged: Domain[] | null;
+  /**
+   * The staged schedule slice (Story 5.1) or `null` when the schedule draft
+   * is clean. A PARALLEL buffer to `staged` (the domains draft), NOT a
+   * widening of it: `staged` is `Domain[]` in three store actions, `apply.ts`
+   * and every Blocklist test, and the two surfaces each own their own
+   * clean-revert. Both buffers ride the ONE shared `apply()` — a single
+   * serialized config write carries both fields.
+   */
+  stagedSchedules: Schedule[] | null;
   applyStatus: ApplyStatus;
   lastResult: WriteResult | null;
   /**
@@ -168,7 +178,32 @@ export interface DomainState {
    * convention (store.ts:128). Re-normalising would be dead code.
    */
   stageDomainRemove: (hostname: string) => WriteResult;
+  /**
+   * Flip `enabled` for the schedule with the given id in the staged schedule
+   * draft (built on `stagedSchedules ?? committed.schedules`) — the
+   * schedule-shaped MIRROR of `stageAlwaysOnToggle` (Story 5.1). Always
+   * produces a NEW `stagedSchedules` array reference when it mutates (map +
+   * spread), so the apply-queue's mid-run-edit detection
+   * (`s.stagedSchedules === schedulesSnapshot`) still works. Clean-revert: if
+   * the resulting draft equals `committed.schedules` (compared by `id` + ALL
+   * fields, order-agnostic) `stagedSchedules` is cleared to `null` so a
+   * net-no-op toggle (off then on) fires no redundant admin prompt on the
+   * next Apply. Returns `{ ok: false, error: "not-found" }` without staging
+   * when the id is not in the draft.
+   *
+   * No port calls, no gate, no toast — a pure staging action, exactly like
+   * `stageAlwaysOnToggle`. Enable-toggle IS block-affecting (AD-6), so it
+   * rides the staged-then-Apply pipeline rather than committing directly.
+   */
+  stageScheduleEnabledToggle: (id: string) => WriteResult;
   cancelStaged: () => void;
+  /**
+   * Discard the staged SCHEDULE draft only (Story 5.1) — sets
+   * `stagedSchedules` to `null` and touches NOTHING else. The domain buffer
+   * (`staged`) is untouched, and vice versa: each surface's Cancel affects
+   * only its own buffer.
+   */
+  cancelStagedSchedules: () => void;
   apply: () => Promise<WriteResult>;
   /**
    * Start a focus session (Story 4.2). Engine swap from 4.1's per-domain
@@ -447,6 +482,8 @@ export interface DomainState {
 export const useDomainStore = create<DomainState>()((set, get) => ({
   committed: readConfig(),
   staged: null,
+  // Story 5.1 — the staged schedule draft, parallel to `staged` (domains).
+  stagedSchedules: null,
   applyStatus: 'idle',
   lastResult: null,
   drift: null,
@@ -559,16 +596,56 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
 
   cancelStaged: () => set({ staged: null }),
 
+  cancelStagedSchedules: () => set({ stagedSchedules: null }),
+
+  stageScheduleEnabledToggle: (id) => {
+    // Build on the current schedule draft (or committed, if clean). The exact
+    // mirror of `stageAlwaysOnToggle` (store.ts:498-526) with `id` as the PK
+    // and `enabled` as the flipped field. Optimistic: the checkbox flips
+    // immediately; Apply commits; Cancel reverts.
+    const base = get().stagedSchedules ?? get().committed.schedules;
+    const idx = base.findIndex((s) => s.id === id);
+    if (idx === -1) {
+      // Unknown id (not in the draft). No staging, no Apply, no prompt.
+      return { ok: false, error: 'not-found' };
+    }
+    // Produce a NEW array reference (map + spread) so the apply-queue's
+    // mid-run-edit detection (`s.stagedSchedules === schedulesSnapshot`)
+    // still works: a toggle that lands while an Apply is in flight is always
+    // a different reference from the snapshot the running Apply captured, so
+    // the success handler retains it rather than clobbering it.
+    const next = base.map((s, i) =>
+      i === idx ? { ...s, enabled: !s.enabled } : s,
+    );
+    // Clean-revert: if the resulting draft equals committed.schedules (same
+    // ids + all fields, order-agnostic — `scheduleDraftEqualsCommitted`
+    // below), clear `stagedSchedules` to `null`. This mirrors
+    // `stageAlwaysOnToggle`'s no-redundant-Apply principle — a net-no-op
+    // toggle (enable then disable) must NOT leave a dirty draft that would
+    // force an admin prompt to write an identical config.
+    if (scheduleDraftEqualsCommitted(next, get().committed.schedules)) {
+      set({ stagedSchedules: null });
+      return { ok: true };
+    }
+    set({ stagedSchedules: next });
+    return { ok: true };
+  },
+
   apply: () => {
-    // Capture the staged + committed snapshot at CALL time. This makes two
-    // rapid Apply clicks both run (each carries its own intent) — the queue
-    // then serializes them strictly one-at-a-time, never in parallel.
+    // Capture BOTH staged buffers + the committed snapshot at CALL time. This
+    // makes two rapid Apply clicks both run (each carries its own intent) —
+    // the queue then serializes them strictly one-at-a-time, never in
+    // parallel. Story 5.1 widened the snapshot to the schedule buffer too:
+    // ONE Apply run commits both staged slices in ONE config write.
     const stagedSnapshot = get().staged;
-    // A no-op Apply (nothing staged) short-circuits at CALL time, before
-    // enqueue, so it neither queues behind an in-flight run nor flips
-    // `applyStatus`. (A no-op queued behind a real run would just wait, then
-    // resolve to { ok: true }; doing so at call time is strictly better.)
-    if (stagedSnapshot == null) {
+    const schedulesSnapshot = get().stagedSchedules;
+    // A no-op Apply (nothing staged in EITHER buffer) short-circuits at CALL
+    // time, before enqueue, so it neither queues behind an in-flight run nor
+    // flips `applyStatus`. (A no-op queued behind a real run would just wait,
+    // then resolve to { ok: true }; doing so at call time is strictly
+    // better.) Each surface gates its own Apply button on its own buffer, but
+    // the shared action must handle either-or-both.
+    if (stagedSnapshot == null && schedulesSnapshot == null) {
       return Promise.resolve({ ok: true });
     }
     const committedSnapshot = get().committed;
@@ -577,30 +654,59 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
       const result = await runApply({
         committed: committedSnapshot,
         staged: stagedSnapshot,
+        stagedSchedules: schedulesSnapshot,
       });
       if (result.ok) {
-        // Commit: the staged slice becomes the new committed domains; clear
-        // staged only if no NEW edits were staged while this run was in
-        // flight. The reference-identity check (`s.staged === stagedSnapshot`)
-        // is what distinguishes "no newer draft" (same array reference as
-        // captured -> safe to clear) from "a newer edit arrived mid-run"
-        // (a different array reference -> retain it, do not clobber). This
-        // relies on `stageDomainAdd` always producing a NEW array reference
-        // when it mutates the draft (it spreads `base`), so a newer draft is
-        // always a different reference from `stagedSnapshot`. `runApply`
+        // Commit: each staged slice becomes the new committed counterpart;
+        // clear each buffer only if no NEW edits were staged in IT while this
+        // run was in flight. The per-field reference-identity check
+        // (`s.staged === stagedSnapshot` / `s.stagedSchedules ===
+        // schedulesSnapshot`) is what distinguishes "no newer draft" (same
+        // array reference as captured -> safe to clear) from "a newer edit
+        // arrived mid-run" (a different array reference -> retain it, do not
+        // clobber). This relies on every staging action always producing a
+        // NEW array reference when it mutates its draft (it spreads `base`).
+        // The guard is DUPLICATED PER FIELD: a mid-run domain edit must not
+        // suppress the schedule buffer's clear, and vice versa. `runApply`
         // never rejects (the ports' never-throw/never-reject contracts), so
         // both branches below always run and `applyStatus` always resets.
         set((s) => ({
-          committed: { ...s.committed, domains: stagedSnapshot },
+          committed: {
+            ...s.committed,
+            ...(stagedSnapshot != null ? { domains: stagedSnapshot } : {}),
+            ...(schedulesSnapshot != null
+              ? { schedules: schedulesSnapshot }
+              : {}),
+          },
           staged: s.staged === stagedSnapshot ? null : s.staged,
+          stagedSchedules:
+            s.stagedSchedules === schedulesSnapshot
+              ? null
+              : s.stagedSchedules,
           applyStatus: 'idle',
           lastResult: result,
         }));
       } else {
-        // Admin-denied or config-write failure: retain staged for retry. The
-        // queue advances past this run only once it has settled; the next
-        // queued Apply re-attempts `writeHosts` idempotently.
-        set({ applyStatus: 'idle', lastResult: result });
+        // Admin-denied or config-write failure: retain BOTH staged buffers
+        // for retry (untouched on the failure path). The queue advances past
+        // this run only once it has settled; the next queued Apply
+        // re-attempts `writeHosts` idempotently.
+        //
+        // The failure toast (5-1 review patch BH-1): the frozen matrix
+        // promises "Deny/throw: staged retained, applyStatus: 'idle',
+        // failure toast" for the Schedule Apply row, and the epic context
+        // states "admin-denied shows the standard toast with staged edits
+        // retained" — the same HOSTS_FAILURE_TOAST copy the timer-end
+        // actions raise. `apply()` previously set only `lastResult`, which
+        // nothing consumed, leaving a denied Apply silent. This is the
+        // SHARED Apply action, so a denied Blocklist Apply now toasts too —
+        // which is exactly the epic's "standard toast" behaviour, not a
+        // regression.
+        set({
+          applyStatus: 'idle',
+          lastResult: result,
+          toast: { message: HOSTS_FAILURE_TOAST, tone: 'error' },
+        });
       }
       return result;
     });
@@ -1295,6 +1401,38 @@ function draftEqualsCommitted(a: Domain[], b: Domain[]): boolean {
     const match = bByHost.get(d.hostname);
     if (match === undefined) return false;
     if (match !== d.alwaysOn) return false;
+  }
+  return true;
+}
+
+/**
+ * The schedule-shaped sibling of `draftEqualsCommitted` (Story 5.1): order-
+ * agnostic equality of two `Schedule[]` drafts, keyed by `id` (the Schedule
+ * PK) and compared across ALL fields (`name`, `weekdays`, `startTime`,
+ * `endTime`, `enabled`) — `stageScheduleEnabledToggle`'s clean-revert needs
+ * full-field equality so a net-no-op toggle reverts to `null`.
+ *
+ * The per-schedule value comparison is `scheduleValueKey` from
+ * `stagedScheduleChangeCount` (5-1 review EC-4/BH-9 patch): ONE canonical
+ * key definition shared by the hint counter and this clean-revert so they
+ * can never disagree on equality (previously the two helpers hand-rolled
+ * the same comparison with different separator rules — a divergence risk
+ * the review flagged, e.g. a name containing a `|` could make the counter
+ * and the clean-revert classify the same draft differently). `weekdays`
+ * compares as a SET inside the key; the JSON-encoding makes any string
+ * content collision-free.
+ */
+function scheduleDraftEqualsCommitted(a: Schedule[], b: Schedule[]): boolean {
+  if (a.length !== b.length) return false;
+  // Index `b` by id -> value key so each `a` entry compares in O(1),
+  // regardless of order. `id` is the PK (unique), so a per-id match is set
+  // equality once lengths are equal.
+  const bById = new Map<string, string>();
+  for (const s of b) {
+    bById.set(s.id, scheduleValueKey(s));
+  }
+  for (const s of a) {
+    if (bById.get(s.id) !== scheduleValueKey(s)) return false;
   }
   return true;
 }

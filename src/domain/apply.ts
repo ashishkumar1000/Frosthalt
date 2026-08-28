@@ -22,7 +22,7 @@
  * (AD-3/AD-5) and never imports `child_process`/`fs`/`os` (AD-1).
  */
 
-import type { Config, Domain } from '../config/types';
+import type { Config, Domain, Schedule } from '../config/types';
 import { writeConfig } from '../config/configStore';
 import { writeHosts } from '../hosts/shellRunner';
 import { effectiveHostsLines } from './effectiveBlocklist';
@@ -33,11 +33,18 @@ export interface ApplyInput {
   /** The last-committed config (before this Apply). */
   committed: Config;
   /**
-   * The staged domain slice to commit, or `null` when nothing is staged. A
-   * `null` staged slice short-circuits to `{ ok: true }` without touching
-   * either port — Apply is a no-op when there is nothing to commit.
+   * The staged domain slice to commit, or `null` when the domain draft is
+   * clean. A `null` staged slice leaves `committed.domains` untouched in the
+   * written config.
    */
   staged: Domain[] | null;
+  /**
+   * The staged schedule slice to commit (Story 5.1), or `null` when the
+   * schedule draft is clean. ONE `writeConfig` carries BOTH slices — domains
+   * and schedules ride the same single atomic config write, then the hosts
+   * write fires once. A `null` slice leaves `committed.schedules` untouched.
+   */
+  stagedSchedules: Schedule[] | null;
 }
 
 /**
@@ -45,7 +52,8 @@ export interface ApplyInput {
  * the `{ ok, error? }` envelope, consistent with the ports' never-throw
  * contract.
  *
- * - `staged == null` -> `{ ok: true }` (no-op; neither port called).
+ * - `staged == null && stagedSchedules == null` -> `{ ok: true }` (no-op;
+ *   neither port called).
  * - `writeConfig` fails -> `{ ok: false, error: "config-write:<detail>" }`;
  *   `writeHosts` is NOT called.
  * - `writeHosts` envelope -> returned verbatim (e.g. `admin-denied`).
@@ -53,14 +61,24 @@ export interface ApplyInput {
 export async function runApply({
   committed,
   staged,
+  stagedSchedules,
 }: ApplyInput): Promise<WriteResult> {
-  if (staged == null) {
-    // Nothing staged -> no-op; neither port is called (no admin prompt).
+  if (staged == null && stagedSchedules == null) {
+    // Nothing staged (either buffer) -> no-op; neither port is called (no
+    // admin prompt).
     return { ok: true };
   }
 
-  // 1. Commit staged -> config.json.
-  const nextConfig: Config = { ...committed, domains: staged };
+  // 1. Commit the staged slices -> config.json. ONE write carries BOTH
+  //    fields: each staged slice REPLACES its committed counterpart, while a
+  //    clean slice (`null`) leaves the committed field untouched in the
+  //    written config. Story 5.1 widened this from domains-only; the write
+  //    stays a single atomic config write.
+  const nextConfig: Config = {
+    ...committed,
+    ...(staged != null ? { domains: staged } : {}),
+    ...(stagedSchedules != null ? { schedules: stagedSchedules } : {}),
+  };
   const cfg = writeConfig(nextConfig);
   if (!cfg.ok) {
     // Strict order: a failed config write short-circuits before any elevation.

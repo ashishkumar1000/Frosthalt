@@ -137,6 +137,10 @@ afterEach(() => {
     useDomainStore.setState({
       committed: { ...DEFAULT_CONFIG },
       staged: null,
+      // Story 5.1 — the parallel schedule buffer is runtime state too; reset
+      // it so a prior test's staged schedule can't leak (a leftover non-null
+      // buffer would flip the surface-2 Return -> Apply gate).
+      stagedSchedules: null,
       gateOpen: false,
       gateAction: null,
       gateAttempts: 0,
@@ -404,10 +408,51 @@ test('⌘3 selects row 2 (Schedule) and announces "Schedule, 0 domains"', async 
   const rows = findRows(testRenderer.root);
   expect(rows[2].props.accessibilityState?.selected).toBe(true);
   expect(selectedRowCount(rows)).toBe(1);
-  expect(extractText(testRenderer.toJSON())).toContain('No schedule set');
+  // Story 5.1: Schedule is a real surface — with an empty store the empty
+  // state renders (the AC copy + the primary "Add…" placeholder button), and
+  // the old placeholder copy is gone.
+  expect(extractText(testRenderer.toJSON())).toContain(
+    'No schedules yet. Add one to block on a recurring weekly window.',
+  );
+  expect(extractText(testRenderer.toJSON())).toContain('Add…');
+  expect(extractText(testRenderer.toJSON())).not.toContain('No schedule set');
   expect(announceForAccessibility).toHaveBeenCalledWith(
     'Schedule, 0 domains',
   );
+});
+
+// 5-1 review BH-18: ⌘3 with a POPULATED config renders the schedule rows (the
+// empty-store variant above only proves the empty state).
+test('⌘3 with populated committed.schedules renders the schedule rows', async () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [
+        {
+          id: 'focus',
+          name: 'Focus',
+          weekdays: [0, 1, 2, 3, 4],
+          startTime: '09:00',
+          endTime: '17:00',
+          enabled: true,
+        },
+      ],
+    },
+  });
+  announceForAccessibility.mockClear();
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '3' } });
+  });
+
+  // The surface rendered the row (name + live summary via the frozen grammar)
+  // instead of the empty state.
+  const text = extractText(testRenderer.toJSON());
+  expect(text).toContain('Focus');
+  expect(text).toContain('Every Mon–Fri, 09:00–17:00');
+  expect(text).not.toContain('No schedules yet');
 });
 
 // I/O Matrix: Plain number (no ⌘) does NOT navigate.
@@ -1068,6 +1113,66 @@ test('bare Enter on surface 0 with the field blurred and staged != null fires ap
   });
 
   expect(applyMock).toHaveBeenCalledTimes(1);
+});
+
+// Story 5.1 (review BH-5): the Schedule surface's Apply is Return-bound too —
+// the epic context pins "Apply button on the Schedule surface is the default
+// (Return-bound)". Bare Return on surface 2 fires apply() when the SCHEDULE
+// buffer is dirty (no add-field guard there — surface 2 renders no field).
+test('bare Return on surface 2 with stagedSchedules != null fires apply()', async () => {
+  seedForReturn({ staged: null });
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      stagedSchedules: [
+        {
+          id: 'focus',
+          name: 'Focus',
+          weekdays: [0, 1, 2, 3, 4],
+          startTime: '09:00',
+          endTime: '17:00',
+          enabled: false,
+        },
+      ],
+    });
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  // Navigate to the Schedule surface first.
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '3' } });
+  });
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).toHaveBeenCalledTimes(1);
+});
+
+// The mirror negative: on surface 2 with a CLEAN schedule buffer, bare Return
+// must NOT fire apply() — even though a domain draft is staged (that draft
+// belongs to surface 0's own Return binding, which surface 2 does not share).
+test('bare Return on surface 2 with a clean schedule buffer does NOT fire apply()', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '3' } });
+  });
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).not.toHaveBeenCalled();
 });
 
 // I/O Matrix: Return (field focused) -> Add owns Return; apply() NOT fired.

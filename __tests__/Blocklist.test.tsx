@@ -679,6 +679,41 @@ test('the hint is absent when staged is null (clean config)', () => {
   expect(text).not.toContain('changes staged');
 });
 
+test('a staged SCHEDULE draft alone does not enable Blocklist Apply or show its hint (reverse isolation)', () => {
+  // 5-1 review BH-2: the Schedule surface's buffer must not make the
+  // BLOCKLIST surface look dirty. The two surfaces have separate Apply/Cancel
+  // controls (the frozen 5-1 boundary), so with `staged: null` but a dirty
+  // `stagedSchedules`, Blocklist's Apply stays disabled and its hint stays
+  // absent — even though the shared `apply()` would commit both fields.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [{ hostname: 'example.com', alwaysOn: true }],
+      },
+      staged: null,
+      stagedSchedules: [
+        {
+          id: 'focus',
+          name: 'Focus',
+          weekdays: [0, 1, 2, 3, 4],
+          startTime: '09:00',
+          endTime: '17:00',
+          enabled: false,
+        },
+      ],
+    });
+  });
+
+  const testRenderer = renderBlocklist();
+  const apply = findButtonByLabel(testRenderer.root, 'Apply');
+  expect(apply).toBeDefined();
+  expect(apply!.props.disabled).toBe(true);
+  const text = extractText(testRenderer.toJSON());
+  expect(text).not.toContain('change staged');
+  expect(text).not.toContain('changes staged');
+});
+
 test('the hint persists while running (staged is retained across an in-flight Apply)', () => {
   // The running state retains staged (the spec's I/O matrix: "hint persists
   // (staged retained)"). With 1 staged toggle, the hint reads "1 change staged"

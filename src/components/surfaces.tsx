@@ -46,7 +46,12 @@ const EMPTY_STATE_TEXT: Record<SurfaceIndex, string> = {
   // (`SURFACE_NAMES`) stays intact so the sidebar label + VoiceOver announce
   // are unchanged.
   1: '',
-  2: 'No schedule set. Create one to block on a recurring window.',
+  // Surface 2 (Schedule) is a real screen as of Story 5.1 — the placeholder
+  // copy is intentionally absent here so the placeholder is never rendered
+  // for it (the Shell routes surface 2 to <Schedule/>, which carries the
+  // empty state). The registry (`SURFACE_NAMES`) stays intact so the sidebar
+  // label + VoiceOver announce are unchanged.
+  2: '',
   // Surface 3 (Settings) is a real screen as of Story 3.1 — the placeholder
   // copy is intentionally absent here so the placeholder is never rendered
   // for it (the Shell routes surface 3 to <Settings/>). The registry

@@ -30,6 +30,7 @@ import { Sidebar } from './Sidebar';
 import { StatusHeader } from './StatusHeader';
 import { SurfacePlaceholder, SURFACE_NAMES, BLOCKLIST_SURFACE_INDEX, type SurfaceIndex } from './surfaces';
 import { Blocklist } from './Blocklist';
+import { Schedule } from './Schedule';
 import { Settings } from './Settings';
 import { Timer } from './Timer';
 import { HostsViewer } from './HostsViewer';
@@ -44,10 +45,11 @@ const TOAST_AUTO_DISMISS_MS = 8000;
 
 /**
  * ⌘1-⌘4 select the four surfaces; ⌘N focuses the add-domain field (Story 2.2);
- * bare Return / Enter fire Apply on the Blocklist surface when the add field is
- * blurred and there is a staged draft (Story 2.3); bare Escape closes the
- * read-only hosts viewer overlay when it is open (Story 2.6). Keys outside this
- * set are ignored (the native default applies).
+ * bare Return / Enter fire Apply on a surface with a staged draft — Blocklist
+ * (surface 0, Story 2.3, when the add field is blurred) or Schedule (surface
+ * 2, Story 5.1, when the schedule buffer is dirty); bare Escape closes the
+ * read-only hosts viewer overlay when it is open (Story 2.6). Keys outside
+ * this set are ignored (the native default applies).
  */
 const KEY_DOWN_EVENTS: HandledKeyEvent[] = [
   { key: '1', metaKey: true },
@@ -91,6 +93,7 @@ export function Shell(): React.ReactElement {
   // can fire `apply()` iff `staged != null`. Blocklist also reads these; both
   // may read the same store.
   const staged = useDomainStore((s) => s.staged);
+  const stagedSchedules = useDomainStore((s) => s.stagedSchedules);
   const apply = useDomainStore((s) => s.apply);
   // `committed` is read here so the nav announce (`selectRow`) can speak the
   // real effective blocked count (Story 2.5), replacing the hardcoded "0
@@ -197,14 +200,19 @@ export function Shell(): React.ReactElement {
       addFieldRef.current?.focus();
       return;
     }
-    // Bare Return / Enter fires Apply on the Blocklist surface (surface 0)
-    // when the add field is blurred and there is a staged draft (Story 2.3 —
-    // the default-button binding). The focused field ALWAYS owns Return (its
-    // `onSubmitEditing` -> Add); `addFieldFocused` is tracked via the
-    // AddDomain `onFocusChange` callback so this is deterministic, not reliant
-    // on uncertain Return bubble semantics. No ⌘Return (bare Return only,
-    // matching the macOS default-button contract). Placed before the ⌘1-⌘4
-    // branch because this is a bare-key (no metaKey) path.
+    // Bare Return / Enter fires Apply on a surface that has a staged draft
+    // (the default-button binding): surface 0 (Blocklist, Story 2.3) gates on
+    // the domain buffer (`staged != null`) and keeps the add-field guard —
+    // the focused field ALWAYS owns Return (its `onSubmitEditing` -> Add);
+    // `addFieldFocused` is tracked via the AddDomain `onFocusChange`
+    // callback so this is deterministic, not reliant on uncertain Return
+    // bubble semantics. Surface 2 (Schedule, Story 5.1 — review patch BH-5)
+    // gates on the schedule buffer (`stagedSchedules != null`); it renders no
+    // text field, so no field guard applies there. The epic context pins
+    // "Apply button on the Schedule surface is the default (Return-bound)".
+    // No ⌘Return (bare Return only, matching the macOS default-button
+    // contract). Placed before the ⌘1-⌘4 branch because this is a bare-key
+    // (no metaKey) path.
     //
     // Story 2.6: gated with `!viewerOpen` so bare Return does NOT fire Apply
     // while the read-only hosts viewer overlay is open (the overlay is a
@@ -213,7 +221,14 @@ export function Shell(): React.ReactElement {
     // Story 3.2: also gated with `!gateOpen` so bare Return does NOT fire
     // Apply while the password gate sheet is open (the gate is a window-level
     // inert surface; the gate's own field owns Return when focused).
-    if (!metaKey && (key === 'Return' || key === 'Enter') && surface === 0 && !addFieldFocused && staged != null && !viewerOpen && !gateOpen) {
+    if (
+      !metaKey &&
+      (key === 'Return' || key === 'Enter') &&
+      !viewerOpen &&
+      !gateOpen &&
+      ((surface === 0 && !addFieldFocused && staged != null) ||
+        (surface === 2 && stagedSchedules != null))
+    ) {
       void apply();
       return;
     }
@@ -290,6 +305,12 @@ export function Shell(): React.ReactElement {
           // component itself owns the Free-state UI + Start engine; the
           // Shell stays surface-routing-only.
           <Timer onOpenBlocklist={() => selectRow(BLOCKLIST_SURFACE_INDEX)} />
+        ) : surface === 2 ? (
+          // Story 5.1: the Schedule surface — rows + enable toggles riding
+          // the staged-then-Apply pipeline. The Shell stays surface-routing-
+          // only; the component owns its rows, Apply/Cancel controls, and
+          // empty state.
+          <Schedule />
         ) : surface === 3 ? (
           // Story 3-4: <Panic>'s success-toast "Re-enable your blocklist"
           // link navigates the user to Blocklist (row 0). Threading the

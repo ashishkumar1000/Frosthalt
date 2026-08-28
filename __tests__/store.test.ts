@@ -39,6 +39,7 @@ import { useTimerStore } from '../src/domain/timerStore';
 import * as shellRunner from '../src/hosts/shellRunner';
 import { stagedChangeCount } from '../src/domain/stagedChangeCount';
 import { DEFAULT_CONFIG } from '../src/config/types';
+import type { Schedule } from '../src/config/types';
 import {
   hashPassword,
   GATE_MAX_ATTEMPTS,
@@ -84,6 +85,9 @@ beforeEach(() => {
   useDomainStore.setState({
     committed: DEFAULT_CONFIG,
     staged: null,
+    // Story 5.1 — the staged schedule draft resets alongside the domain
+    // buffer so a prior test's schedule toggles can't leak into the next.
+    stagedSchedules: null,
     applyStatus: 'idle',
     lastResult: null,
     drift: null,
@@ -3188,4 +3192,492 @@ test('expireTimer hosts-throw also sets lastResult (4-5 defer re-pinned)', async
   } finally {
     spy.mockRestore();
   }
+});
+
+// ===========================================================================
+// Story 5.1 — the schedule buffer (`stagedSchedules`) + the widened Apply.
+// Mirrors the stageAlwaysOnToggle tests above, applied to the schedule slice:
+// toggle (new-ref, clean-revert, not-found), the one-write Apply carrying
+// BOTH fields, the per-field mid-run guard, deny retains staged, and
+// `cancelStagedSchedules` isolation.
+// ===========================================================================
+
+const FOCUS_SCHEDULE: Schedule = {
+  id: 'focus',
+  name: 'Focus',
+  weekdays: [0, 1, 2, 3, 4],
+  startTime: '09:00',
+  endTime: '17:00',
+  enabled: true,
+};
+
+const EVENINGS_SCHEDULE: Schedule = {
+  id: 'evenings',
+  name: 'Evenings',
+  weekdays: [5, 6],
+  startTime: '20:00',
+  endTime: '22:00',
+  enabled: false,
+};
+
+// ---------------------------------------------------------------------------
+// stageScheduleEnabledToggle
+// ---------------------------------------------------------------------------
+
+test('stageScheduleEnabledToggle flips enabled on a committed schedule and stages a new draft', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+
+  const result = useDomainStore.getState().stageScheduleEnabledToggle('focus');
+
+  expect(result).toStrictEqual({ ok: true });
+  // The staged draft carries the flipped enabled value.
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
+  // Committed is untouched — toggle is a STAGED edit, Apply commits.
+  expect(useDomainStore.getState().committed.schedules).toStrictEqual([
+    FOCUS_SCHEDULE,
+  ]);
+});
+
+test('stageScheduleEnabledToggle builds on the staged schedule draft when one exists', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE] },
+    stagedSchedules: [
+      { ...FOCUS_SCHEDULE, enabled: false }, // already toggled
+      EVENINGS_SCHEDULE,
+    ],
+  });
+
+  const result = useDomainStore
+    .getState()
+    .stageScheduleEnabledToggle('evenings');
+
+  expect(result).toStrictEqual({ ok: true });
+  // The draft now reflects BOTH toggles; committed is still the original.
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+    { ...EVENINGS_SCHEDULE, enabled: true },
+  ]);
+  expect(useDomainStore.getState().committed.schedules).toStrictEqual([
+    FOCUS_SCHEDULE,
+    EVENINGS_SCHEDULE,
+  ]);
+});
+
+test('stageScheduleEnabledToggle produces a NEW array reference on each toggle (preserves mid-run-edit detection)', () => {
+  // Mirrors the stageAlwaysOnToggle new-ref test: two domains are needed so
+  // the draft stays non-null across both toggles (a same-schedule double
+  // toggle would clean-revert to null).
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [
+        FOCUS_SCHEDULE, // enabled: true
+        EVENINGS_SCHEDULE, // enabled: false
+      ],
+    },
+    stagedSchedules: null,
+  });
+
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  const ref1 = useDomainStore.getState().stagedSchedules;
+  expect(ref1).not.toBeNull();
+
+  useDomainStore.getState().stageScheduleEnabledToggle('evenings');
+  const ref2 = useDomainStore.getState().stagedSchedules;
+  expect(ref2).not.toBe(ref1); // NEW array reference, not in-place mutation
+  expect(ref2).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+    { ...EVENINGS_SCHEDULE, enabled: true },
+  ]);
+});
+
+test('stageScheduleEnabledToggle clean-revert: toggling off then on reverts stagedSchedules to null', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+
+  const r1 = useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  expect(r1).toStrictEqual({ ok: true });
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
+
+  const r2 = useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  expect(r2).toStrictEqual({ ok: true });
+  // Net = committed -> the schedule buffer reverts to null. No redundant
+  // admin prompt on the next Apply (mirrors stageAlwaysOnToggle's clean-revert).
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleEnabledToggle clean-revert compares weekday SETS (a reordered list is not a change)', () => {
+  // Committed stores weekdays in a non-canonical order; toggling enabled off
+  // and on must still clean-revert (weekday order is not part of identity).
+  const committedSchedule: Schedule = { ...FOCUS_SCHEDULE, weekdays: [4, 0, 2] };
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [committedSchedule] },
+    stagedSchedules: null,
+  });
+
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  expect(useDomainStore.getState().stagedSchedules).not.toBeNull();
+
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleEnabledToggle clean-revert does NOT fire when other schedule edits keep the draft dirty', () => {
+  // committed has two schedules. Toggle BOTH (one off, one on) then the first
+  // back on — the draft still differs from committed (the second toggle) so
+  // the buffer stays.
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+
+  useDomainStore.getState().stageScheduleEnabledToggle('focus'); // off
+  useDomainStore.getState().stageScheduleEnabledToggle('evenings'); // on
+  useDomainStore.getState().stageScheduleEnabledToggle('focus'); // back on
+
+  expect(useDomainStore.getState().stagedSchedules).not.toBeNull();
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    FOCUS_SCHEDULE,
+    { ...EVENINGS_SCHEDULE, enabled: true },
+  ]);
+});
+
+test('stageScheduleEnabledToggle on an unknown id returns not-found and leaves the buffer unchanged', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+
+  const result = useDomainStore.getState().stageScheduleEnabledToggle('ghost');
+
+  expect(result).toStrictEqual({ ok: false, error: 'not-found' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleEnabledToggle on an unknown id with a staged draft leaves the draft unchanged', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: [{ ...FOCUS_SCHEDULE, enabled: false }],
+  });
+
+  const result = useDomainStore.getState().stageScheduleEnabledToggle('ghost');
+
+  expect(result).toStrictEqual({ ok: false, error: 'not-found' });
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
+});
+
+test('a schedule toggle never touches the domain buffer (parallel sibling buffers)', () => {
+  useDomainStore.getState().stageDomainAdd('example.com');
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+  const stagedBefore = useDomainStore.getState().staged;
+  expect(stagedBefore).not.toBeNull();
+
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+
+  expect(useDomainStore.getState().staged).toBe(stagedBefore);
+  expect(useDomainStore.getState().stagedSchedules).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// cancelStagedSchedules — isolation from the domain buffer
+// ---------------------------------------------------------------------------
+
+test('cancelStagedSchedules clears ONLY the schedule buffer; the staged domain draft is untouched', () => {
+  useDomainStore.getState().stageDomainAdd('example.com');
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: [{ ...FOCUS_SCHEDULE, enabled: false }],
+  });
+  const stagedDomains = useDomainStore.getState().staged;
+  expect(stagedDomains).not.toBeNull();
+
+  useDomainStore.getState().cancelStagedSchedules();
+
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+  expect(useDomainStore.getState().staged).toBe(stagedDomains);
+});
+
+test('cancelStagedSchedules is a safe no-op when the schedule buffer is already null', () => {
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+  useDomainStore.getState().cancelStagedSchedules();
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// apply() — one writeConfig carries BOTH fields
+// ---------------------------------------------------------------------------
+
+test('apply() commits BOTH fields in ONE writeConfig, advances both, and clears both buffers', async () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    staged: null,
+    stagedSchedules: null,
+  });
+  useDomainStore.getState().stageDomainAdd('example.com');
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+
+  const result = await useDomainStore.getState().apply();
+
+  expect(result).toStrictEqual({ ok: true });
+  // Exactly ONE config write — never two (one admin prompt per Apply).
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  // The write carried BOTH staged slices.
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  expect(written.schedules).toStrictEqual([{ ...FOCUS_SCHEDULE, enabled: false }]);
+  // committed advanced per field; both buffers cleared.
+  const state = useDomainStore.getState();
+  expect(state.staged).toBeNull();
+  expect(state.stagedSchedules).toBeNull();
+  expect(state.committed.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  expect(state.committed.schedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
+  expect(state.applyStatus).toBe('idle');
+  expect(state.lastResult).toStrictEqual({ ok: true });
+});
+
+test('apply() with ONLY a schedule draft (staged: null) keeps committed.domains in the write', async () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'kept.com', alwaysOn: true }],
+      schedules: [FOCUS_SCHEDULE],
+    },
+    staged: null,
+    stagedSchedules: null,
+  });
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+
+  const result = await useDomainStore.getState().apply();
+
+  expect(result).toStrictEqual({ ok: true });
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  // The clean domain slice leaves committed.domains untouched in the write.
+  expect(written.domains).toStrictEqual([{ hostname: 'kept.com', alwaysOn: true }]);
+  expect(written.schedules).toStrictEqual([{ ...FOCUS_SCHEDULE, enabled: false }]);
+  // In-memory committed advanced per field.
+  const state = useDomainStore.getState();
+  expect(state.committed.domains).toStrictEqual([
+    { hostname: 'kept.com', alwaysOn: true },
+  ]);
+  expect(state.committed.schedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
+  expect(state.stagedSchedules).toBeNull();
+});
+
+test('apply() with ONLY a domain draft preserves NON-EMPTY committed.schedules in the write (VG-1)', async () => {
+  // The store-level mirror of apply.test.ts's VG-1 pin: a domains-only
+  // Apply must carry non-empty committed.schedules into the written config
+  // verbatim — a regression to `schedules: stagedSchedules ?? []` wipes them
+  // on disk (surfacing on relaunch) while passing every empty-schedules test.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [FOCUS_SCHEDULE],
+    },
+    staged: null,
+    stagedSchedules: null,
+  });
+  useDomainStore.getState().stageDomainAdd('example.com');
+
+  const result = await useDomainStore.getState().apply();
+
+  expect(result).toStrictEqual({ ok: true });
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  // The clean schedule slice leaves the NON-EMPTY committed.schedules
+  // untouched — verbatim, not reset to [].
+  expect(written.schedules).toStrictEqual([FOCUS_SCHEDULE]);
+  const state = useDomainStore.getState();
+  expect(state.committed.schedules).toStrictEqual([FOCUS_SCHEDULE]);
+});
+
+test('apply() with both buffers clean-reverted to null is a no-op: neither port is called', async () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+  // Toggle off then on — the clean-revert leaves stagedSchedules null.
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+
+  const result = await useDomainStore.getState().apply();
+
+  expect(result).toStrictEqual({ ok: true });
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// apply() — failure retains the schedule draft
+// ---------------------------------------------------------------------------
+
+test('apply() admin-denied retains BOTH drafts, leaves committed unchanged, and forwards the envelope', async () => {
+  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+  useDomainStore.getState().stageDomainAdd('example.com');
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  const committedBefore = useDomainStore.getState().committed;
+
+  const result = await useDomainStore.getState().apply();
+
+  expect(result).toStrictEqual({ ok: false, error: 'admin-denied' });
+  const state = useDomainStore.getState();
+  expect(state.staged).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  expect(state.stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
+  expect(state.committed).toStrictEqual(committedBefore);
+  expect(state.applyStatus).toBe('idle');
+  // BH-1 patch: a denied Apply raises the standard failure toast (the frozen
+  // matrix's "Deny/throw: staged retained, applyStatus: 'idle', failure
+  // toast" row) — the same HOSTS_FAILURE_TOAST copy the timer-end actions
+  // raise.
+  expect(state.toast).toStrictEqual({
+    message: "Couldn't update /etc/hosts. No changes made.",
+    tone: 'error',
+  });
+});
+
+test('apply() config-write failure retains the schedule draft and skips writeHosts', async () => {
+  configNative.writeConfig.mockReturnValue({ ok: false, error: 'disk-full' });
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+
+  const result = await useDomainStore.getState().apply();
+
+  expect(result).toStrictEqual({ ok: false, error: 'config-write:disk-full' });
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
+  // BH-1 patch: a config-write failure also raises the failure toast.
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: "Couldn't update /etc/hosts. No changes made.",
+    tone: 'error',
+  });
+});
+
+// ---------------------------------------------------------------------------
+// apply() — per-field mid-run guard: a newer draft staged DURING an in-flight
+// Apply is retained for its OWN field while the other field commits + clears.
+// ---------------------------------------------------------------------------
+
+test('a newer schedule draft staged during an in-flight Apply is retained, not clobbered', async () => {
+  // committed has two schedules: focus (enabled) + evenings (disabled).
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE],
+    },
+    stagedSchedules: null,
+  });
+  // Stage the first toggle BEFORE the Apply so its snapshot is a real draft.
+  useDomainStore.getState().stageScheduleEnabledToggle('focus'); // off
+
+  let resolveFirst: ((v: WriteResult) => void) | null = null;
+  shellNative.writeHosts.mockImplementation(
+    () => new Promise<WriteResult>((res) => {
+      resolveFirst = res;
+    }),
+  );
+
+  const p = useDomainStore.getState().apply();
+  await flushMicrotasks();
+  expect(useDomainStore.getState().applyStatus).toBe('running');
+
+  // While the Apply is in flight, toggle the SECOND schedule on top of the
+  // draft. This produces a NEW stagedSchedules array reference (a re-toggle of
+  // the same schedule would clean-revert to null), distinct from the snapshot
+  // the running Apply captured — the success handler must retain it.
+  useDomainStore.getState().stageScheduleEnabledToggle('evenings'); // on
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+    { ...EVENINGS_SCHEDULE, enabled: true },
+  ]);
+
+  // Release the Apply. It commits the SNAPSHOT's intent (focus off, evenings
+  // untouched) and must leave the newer draft intact.
+  resolveFirst!({ ok: true });
+  await p;
+
+  const state = useDomainStore.getState();
+  expect(state.committed.schedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+    EVENINGS_SCHEDULE,
+  ]);
+  expect(state.stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+    { ...EVENINGS_SCHEDULE, enabled: true },
+  ]);
+  expect(state.applyStatus).toBe('idle');
+});
+
+test('a newer DOMAIN draft staged during an in-flight Apply is retained while the SCHEDULE slice commits + clears', async () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+  useDomainStore.getState().stageScheduleEnabledToggle('focus'); // off
+
+  let resolveFirst: ((v: WriteResult) => void) | null = null;
+  shellNative.writeHosts.mockImplementation(
+    () => new Promise<WriteResult>((res) => {
+      resolveFirst = res;
+    }),
+  );
+
+  const p = useDomainStore.getState().apply();
+  await flushMicrotasks();
+
+  // While the Apply is in flight, stage a domain edit (a NEW staged array
+  // reference, distinct from the null the running Apply captured for staged).
+  useDomainStore.getState().stageDomainAdd('social.com');
+
+  resolveFirst!({ ok: true });
+  await p;
+
+  const state = useDomainStore.getState();
+  // The SCHEDULE slice committed + cleared (its snapshot was current).
+  expect(state.committed.schedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
+  expect(state.stagedSchedules).toBeNull();
+  // The DOMAIN buffer is retained (the newer draft was NOT part of the run).
+  expect(state.staged).toStrictEqual([
+    { hostname: 'social.com', alwaysOn: true },
+  ]);
+  expect(state.committed.domains).toStrictEqual([]);
 });
