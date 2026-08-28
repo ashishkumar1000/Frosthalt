@@ -27,9 +27,14 @@
  *     component wiring, not the native write.
  *   - Start failure path (mocked `{ok:false}` from `stageStartTimer`): deny
  *     toast announced; `committed.activeTimer` stays null (retry-safe).
- *   - Running-timer placeholder: when `committed.activeTimer != null` at
- *     mount, the empty-state copy renders with "Open Blocklist" CTA
- *     (defensive, forward-compat with Story 4.3).
+ *   - Story 4.3 Blocked path: when `committed.activeTimer != null` at mount,
+ *     the surface renders the LIVE COUNTDOWN — "FOCUS SESSION" label, the
+ *     64×64 `CountdownRing` + tabular mm:ss numeral (derived from
+ *     `endEpochMs - now` via the scoped `useTimerStore` slice), the
+ *     "Locked until HH:mm" subtitle, the password-gated destructive
+ *     "End early" button and its hint. The slice starts on mount and stops
+ *     on unmount / Blocked→Free transition; the mount announce speaks the
+ *     remaining minutes/seconds.
  */
 
 jest.mock('../src/native/specs/NativeConfigStoreSpec', () => ({
@@ -92,6 +97,7 @@ import ReactTestRenderer from 'react-test-renderer';
 import { AccessibilityInfo } from 'react-native';
 import { Timer } from '../src/components/Timer';
 import { useDomainStore } from '../src/domain/store';
+import { useTimerStore, selectRemainingMs } from '../src/domain/timerStore';
 import { DEFAULT_CONFIG } from '../src/config/types';
 import type { ActiveTimer, Config, Domain } from '../src/config/types';
 
@@ -206,6 +212,14 @@ afterEach(() => {
     currentRenderer = null;
   }
   jest.restoreAllMocks();
+  // Story 4.3: force the scoped timer slice's refcount back to 0 and reset
+  // its state so a Blocked test can never leak a live per-second driver
+  // (or a stale `endEpochMs`) into another test. Extra stops are no-ops.
+  useTimerStore.getState().stop();
+  useTimerStore.setState({ nowMs: 0, endEpochMs: null, totalMs: null });
+  if (jest.isMockFunction(setTimeout)) {
+    jest.useRealTimers();
+  }
 });
 
 function renderTimer(onOpenBlocklist: () => void = jest.fn()) {
@@ -272,10 +286,10 @@ test('Timer renders the empty-blocklist empty state with an "Open Blocklist" CTA
 });
 
 // ---------------------------------------------------------------------------
-// Defensive running-timer placeholder (forward-compat with 4.3)
+// Story 4.3 — Blocked path: the live countdown (the ONLY active-timer path)
 // ---------------------------------------------------------------------------
 
-test('Timer renders the running-timer placeholder when committed.activeTimer is non-null at mount', () => {
+test('Blocked path renders the live countdown UI when committed.activeTimer is non-null at mount', () => {
   seedState({
     domains: [{ hostname: 'example.com', alwaysOn: false }],
     activeTimer: {
@@ -288,24 +302,34 @@ test('Timer renders the running-timer placeholder when committed.activeTimer is 
   const testRenderer = renderTimer(onOpenBlocklist);
   const text = extractText(testRenderer.toJSON());
 
-  expect(text).toContain('Timer running');
-  expect(text).toContain('Open Blocklist');
-  // No preset chips + no checkboxes — the placeholder is purely defensive.
+  // The 4.3 Blocked layout: label + numeral + subtitle + End early + hint.
+  // (No passwordHash in this seed -> requirePassword short-circuits, so the
+  // hint omits the password clause — review step-04 (d).)
+  expect(text).toContain('FOCUS SESSION');
+  expect(text).toContain('Locked until');
+  expect(text).toContain('End early');
+  expect(text).toContain('Timer ends automatically at');
+  expect(text).not.toContain('End early needs your password');
+  // The CountdownRing renders (its a11y-hidden SVG node).
+  const ring = testRenderer.root.findAll(
+    (node) => node.props && 'progress' in node.props,
+  )[0];
+  expect(ring).toBeDefined();
+
+  // No preset chips, no checkboxes, no Start, no Open Blocklist — Blocked is
+  // the ONLY path (spec Never clause).
   expect(findCheckboxes(testRenderer.root)).toHaveLength(0);
   expect(findPresetChip(testRenderer.root, '25 min')).toBeUndefined();
-
-  const cta = testRenderer.root.findAll(
+  expect(findStartButton(testRenderer.root, 'Start')).toBeUndefined();
+  const openBlocklistCta = testRenderer.root.findAll(
     (node) =>
       node.props &&
       typeof node.props.onPress === 'function' &&
       node.props.accessibilityRole === 'button' &&
       node.props.accessibilityLabel === 'Open Blocklist',
   )[0];
-  expect(cta).toBeDefined();
-  ReactTestRenderer.act(() => {
-    cta!.props.onPress();
-  });
-  expect(onOpenBlocklist).toHaveBeenCalledTimes(1);
+  expect(openBlocklistCta).toBeUndefined();
+  expect(onOpenBlocklist).not.toHaveBeenCalled();
 });
 
 // ---------------------------------------------------------------------------
@@ -343,10 +367,10 @@ test('Timer initial-selection derivation: with persisted selectedDomains, the se
   // In 4.1 no code path populates `activeTimer`, so this branch is forward-
   // compat for 4.2; here we exercise the derivation in isolation by reading
   // the initial selection computed by Timer against a seed that mirrors the
-  // 4.2 shape. Because the defensive running-timer placeholder also fires
-  // on `activeTimer != null`, this test asserts the DOMAIN list is hidden
-  // (placeholder wins) — pinning the precedence so a future change cannot
-  // silently drop the placeholder OR the derivation.
+  // 4.2 shape. Because the Story 4.3 Blocked countdown also fires on
+  // `activeTimer != null`, this test asserts the DOMAIN list is hidden
+  // (Blocked path wins) — pinning the precedence so a future change cannot
+  // silently drop the countdown OR the derivation.
   seedState({
     domains: [
       { hostname: 'a.com', alwaysOn: false },
@@ -360,9 +384,10 @@ test('Timer initial-selection derivation: with persisted selectedDomains, the se
   });
 
   const testRenderer = renderTimer();
-  // The defensive running-timer placeholder wins; no domain list rendered.
+  // The Blocked countdown wins; no domain list rendered.
   expect(findCheckboxes(testRenderer.root)).toHaveLength(0);
-  expect(extractText(testRenderer.toJSON())).toContain('Timer running');
+  expect(extractText(testRenderer.toJSON())).toContain('FOCUS SESSION');
+  expect(extractText(testRenderer.toJSON())).toContain('Locked until');
 });
 
 // ---------------------------------------------------------------------------
@@ -652,4 +677,361 @@ test('on mount, the "25 min" preset is selected by default', () => {
   expect(
     findPresetChip(testRenderer.root, '1h')!.props.accessibilityState,
   ).toEqual({ selected: false });
+});
+
+// ---------------------------------------------------------------------------
+// Story 4.3 — Blocked path: numeral derivation, announce, slice lifecycle,
+// End-early gate wiring
+// ---------------------------------------------------------------------------
+
+/** Fixed wall-clock epoch for the deterministic Blocked tests. */
+const T = 1_756_000_000_000;
+
+/** Locates the countdown numeral by its accessibility label. */
+function findNumeral(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance | undefined {
+  return root.findAll(
+    (node) => node.props && node.props.accessibilityLabel === 'Time remaining',
+  )[0];
+}
+
+/** Locates the End-early button by its accessibility label. */
+function findEndEarly(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance | undefined {
+  return root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onPress === 'function' &&
+      node.props.accessibilityRole === 'button' &&
+      node.props.accessibilityLabel === 'End early',
+  )[0];
+}
+
+/** Seeds a 25-minute Blocked session at the fixed clock and renders. */
+function renderBlocked(): ReturnType<typeof ReactTestRenderer.create> {
+  seedState({
+    domains: [{ hostname: 'a.com', alwaysOn: false }],
+    activeTimer: {
+      endEpochMs: T + 25 * 60_000,
+      selectedDomains: ['a.com'],
+    },
+  });
+  return renderTimer();
+}
+
+test('the numeral derives zero-padded mm:ss from endEpochMs - now and ticks per second', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  const testRenderer = renderBlocked();
+
+  const numeral = findNumeral(testRenderer.root);
+  expect(numeral).toBeDefined();
+  // Exactly 25 minutes remaining at the seeded clock -> "25:00". (The JSX
+  // `{mm}:{ss}` renders as a three-child array; extractText joins it.)
+  expect(extractText(numeral!.props.children)).toBe('25:00');
+  // Per-minute rollover cue (UX-DR17) rides the numeral node.
+  expect(numeral!.props.accessibilityLiveRegion).toBe('polite');
+
+  // The ring's progress starts at 0 (nothing elapsed yet).
+  const ring = testRenderer.root.findAll(
+    (node) => node.props && 'progress' in node.props,
+  )[0];
+  expect(ring).toBeDefined();
+  expect(ring!.props.progress).toBe(0);
+
+  // One tick -> the numeral re-renders AND the ring's progress decreases.
+  ReactTestRenderer.act(() => {
+    jest.advanceTimersByTime(1000);
+  });
+  expect(extractText(numeral!.props.children)).toBe('24:59');
+  expect(ring!.props.progress).toBeGreaterThan(0);
+});
+
+test('the "Locked until" subtitle and hint read the session end time', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  const testRenderer = renderBlocked();
+  const end = T + 25 * 60_000;
+  // Same derivation the component uses — asserts the derivation, not a
+  // timezone-pinned clock string.
+  const hhmm = new Date(end).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+  const text = extractText(testRenderer.toJSON());
+  expect(text).toContain(`Locked until ${hhmm}`);
+  // No passwordHash in the seed -> requirePassword short-circuits, so the
+  // hint drops the password clause (review step-04 (d)).
+  expect(text).toContain(`Timer ends automatically at ${hhmm}.`);
+  expect(text).not.toContain('End early needs your password');
+
+  // With a password set, the password clause returns.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...useDomainStore.getState().committed,
+        passwordHash: 'seed-hash',
+      },
+    });
+  });
+  expect(extractText(testRenderer.toJSON())).toContain(
+    `End early needs your password. Timer ends automatically at ${hhmm}.`,
+  );
+});
+
+test('Blocked entry announces the remaining minutes and seconds; ticks inside a minute do not re-announce', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  renderBlocked();
+
+  // Mount announce (hasActiveTimer=true branch), plural form.
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    'Timer running, 25 minutes 0 seconds remaining',
+  );
+  // The first tick crosses the `floor(minutes)` boundary (25 -> 24), which
+  // fires the explicit per-minute rollover announce (UX-DR17: the numeral's
+  // live region is Android-only, so macOS VoiceOver needs the announce).
+  announceForAccessibility.mockClear();
+  ReactTestRenderer.act(() => {
+    jest.advanceTimersByTime(1000);
+  });
+  expect(announceForAccessibility).toHaveBeenCalledTimes(1);
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    '24 minutes remaining',
+  );
+
+  // Ticks WITHIN the same minute bucket are silent — announce keyed on the
+  // minute value, not on the per-second tick.
+  announceForAccessibility.mockClear();
+  ReactTestRenderer.act(() => {
+    jest.advanceTimersByTime(5000);
+  });
+  expect(announceForAccessibility).not.toHaveBeenCalled();
+});
+
+test('the per-minute rollover announces on each minute-boundary crossing', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  renderBlocked();
+  announceForAccessibility.mockClear(); // drop the mount announce
+
+  // Cross the first minute bucket (25 -> 24 at the 1s tick).
+  ReactTestRenderer.act(() => {
+    jest.advanceTimersByTime(60_000);
+  });
+  expect(announceForAccessibility).toHaveBeenCalledTimes(1);
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    '24 minutes remaining',
+  );
+
+  // Cross the next bucket (24 -> 23 at the 61s tick).
+  ReactTestRenderer.act(() => {
+    jest.advanceTimersByTime(1000);
+  });
+  expect(announceForAccessibility).toHaveBeenCalledTimes(2);
+  expect(announceForAccessibility).toHaveBeenLastCalledWith(
+    '23 minutes remaining',
+  );
+});
+
+test('the mount announce handles singular minutes/seconds', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  seedState({
+    domains: [{ hostname: 'a.com', alwaysOn: false }],
+    activeTimer: { endEpochMs: T + 61_000, selectedDomains: ['a.com'] },
+  });
+  renderTimer();
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    'Timer running, 1 minute 1 second remaining',
+  );
+});
+
+test('the scoped slice starts on Blocked mount and parks on unmount', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  const setIntervalSpy = jest.spyOn(globalThis, 'setInterval');
+  const clearIntervalSpy = jest.spyOn(globalThis, 'clearInterval');
+
+  const testRenderer = renderBlocked();
+
+  // The slice mirrors the session's absolute end time.
+  expect(useTimerStore.getState().endEpochMs).toBe(T + 25 * 60_000);
+  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+  expect(clearIntervalSpy).not.toHaveBeenCalled();
+
+  // Unmount -> the effect cleanup's stop() hits refcount 0 -> driver cleared.
+  ReactTestRenderer.act(() => {
+    testRenderer.unmount();
+  });
+  expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
+  // The parked nowMs no longer advances (no driver).
+  jest.setSystemTime(T + 60_000);
+  const parked = useTimerStore.getState().nowMs;
+  expect(parked).toBeLessThanOrEqual(T + 1000);
+});
+
+test('Blocked -> Free transition stops the slice and restores the picker', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  const clearIntervalSpy = jest.spyOn(globalThis, 'clearInterval');
+
+  const testRenderer = renderBlocked();
+  expect(findPresetChip(testRenderer.root, '25 min')).toBeUndefined();
+
+  // The privileged expiry path (Story 4.5) clears committed.activeTimer; the
+  // surface must leave Blocked, the slice must stop, and VoiceOver must hear
+  // the Free announce (review step-04 (a)).
+  announceForAccessibility.mockClear();
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...useDomainStore.getState().committed,
+        activeTimer: null,
+      },
+    });
+  });
+
+  expect(findPresetChip(testRenderer.root, '25 min')).toBeDefined();
+  expect(findNumeral(testRenderer.root)).toBeUndefined();
+  expect(clearIntervalSpy).toHaveBeenCalled();
+  expect(announceForAccessibility).toHaveBeenCalledWith('Timer, free');
+});
+
+test('Blocked path at an already-expired endEpochMs: numeral reads 00:00, ring empty, Blocked UI stays', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+
+  seedState({
+    domains: [{ hostname: 'a.com', alwaysOn: false }],
+    activeTimer: {
+      endEpochMs: T - 1000, // expired 1s before mount
+      selectedDomains: ['a.com'],
+    },
+  });
+  const testRenderer = renderTimer();
+
+  // Expiry handling is 4.5's job — 4.3 still renders the Blocked UI (I/O
+  // matrix row 2: the surface cannot trigger the unblock itself).
+  expect(extractText(testRenderer.toJSON())).toContain('FOCUS SESSION');
+  const numeral = findNumeral(testRenderer.root);
+  expect(extractText(numeral!.props.children)).toBe('00:00');
+
+  const ring = testRenderer.root.findAll(
+    (node) => node.props && 'progress' in node.props,
+  )[0];
+  expect(ring).toBeDefined();
+  expect(ring.props.progress).toBe(0);
+
+  // The slice parked immediately at mount: remaining clamps to 0 and no
+  // per-second driver runs (the expired park is pinned in timerStore tests).
+  expect(selectRemainingMs(useTimerStore.getState())).toBe(0);
+});
+
+test('End early with no password set short-circuits to the announce (gate never opens)', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  const testRenderer = renderBlocked();
+  announceForAccessibility.mockClear(); // drop the mount announce
+
+  const endEarly = findEndEarly(testRenderer.root);
+  expect(endEarly).toBeDefined();
+  ReactTestRenderer.act(() => {
+    endEarly!.props.onPress();
+  });
+
+  // No passwordHash in the seed -> requirePassword ran the action inline.
+  // (Review step-04 (c): user language, no story jargon in VoiceOver copy.)
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    'End early is not available yet — the session ends automatically at its end time.',
+  );
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+});
+
+test('End early with a password set opens the gate; the stashed action announces on verify', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  // A password IS set: requirePassword must open the gate instead of running.
+  seedState({ domains: [{ hostname: 'a.com', alwaysOn: false }] });
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...useDomainStore.getState().committed,
+        passwordHash: 'seed-hash',
+        activeTimer: { endEpochMs: T + 25 * 60_000, selectedDomains: ['a.com'] },
+      },
+    });
+  });
+  const testRenderer = renderTimer();
+  announceForAccessibility.mockClear(); // drop the mount announce
+
+  const endEarly = findEndEarly(testRenderer.root);
+  expect(endEarly).toBeDefined();
+  ReactTestRenderer.act(() => {
+    endEarly!.props.onPress();
+  });
+
+  // Gate-first: the flip is STASHED, not run (Panic pattern).
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+  const action = useDomainStore.getState().gateAction;
+  expect(typeof action).toBe('function');
+  expect(announceForAccessibility).not.toHaveBeenCalled();
+
+  // Simulate a verified gate exactly as the Shell's runGateAction does.
+  ReactTestRenderer.act(() => {
+    action!();
+    useDomainStore.getState().closeGate();
+  });
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    'End early is not available yet — the session ends automatically at its end time.',
+  );
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+});
+
+// Review step-04 (b): End early is WIRING ONLY in 4.3 — even after the gate
+// verifies, NO privileged write may happen (4.6 owns it): the persisted
+// `activeTimer` is untouched and nothing is staged.
+test('End early after a verified gate performs NO config write (activeTimer unchanged, nothing staged)', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  // A password IS set so the press routes through the gate.
+  seedState({ domains: [{ hostname: 'a.com', alwaysOn: false }] });
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...useDomainStore.getState().committed,
+        passwordHash: 'seed-hash',
+        activeTimer: { endEpochMs: T + 25 * 60_000, selectedDomains: ['a.com'] },
+      },
+    });
+  });
+  const testRenderer = renderTimer();
+  announceForAccessibility.mockClear(); // drop the mount announce
+
+  const activeTimerBefore = useDomainStore.getState().committed.activeTimer;
+
+  // Press End early, then verify the gate (the Shell's runGateAction path).
+  const endEarly = findEndEarly(testRenderer.root);
+  expect(endEarly).toBeDefined();
+  ReactTestRenderer.act(() => {
+    endEarly!.props.onPress();
+  });
+  const action = useDomainStore.getState().gateAction;
+  expect(typeof action).toBe('function');
+  ReactTestRenderer.act(() => {
+    action!();
+    useDomainStore.getState().closeGate();
+  });
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+
+  // The action body was the announce ONLY — no persisted write, no staged
+  // change, no apply run.
+  expect(useDomainStore.getState().committed.activeTimer).toEqual(
+    activeTimerBefore,
+  );
+  expect(useDomainStore.getState().staged).toBeNull();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
 });

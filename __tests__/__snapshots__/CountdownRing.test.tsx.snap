@@ -1,0 +1,301 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`CountdownRing progress snapshots progress 0 — empty ring (expired) 1`] = `
+<RNSVGSvgView
+  accessibilityElementsHidden={true}
+  bbHeight={64}
+  bbWidth={64}
+  focusable={false}
+  height={64}
+  importantForAccessibility="no"
+  style={
+    [
+      {
+        "backgroundColor": "transparent",
+        "borderWidth": 0,
+      },
+      {
+        "flex": 0,
+        "height": 64,
+        "width": 64,
+      },
+    ]
+  }
+  width={64}
+>
+  <RNSVGGroup
+    fill={
+      {
+        "payload": 4278190080,
+        "type": 0,
+      }
+    }
+  >
+    <RNSVGGroup
+      fill={
+        {
+          "payload": 4278190080,
+          "type": 0,
+        }
+      }
+      matrix={
+        [
+          6.123233995736766e-17,
+          -1,
+          1,
+          6.123233995736766e-17,
+          0,
+          64,
+        ]
+      }
+    >
+      <RNSVGCircle
+        cx={32}
+        cy={32}
+        fill={null}
+        propList={
+          [
+            "fill",
+            "stroke",
+            "strokeWidth",
+          ]
+        }
+        r={30}
+        stroke={
+          {
+            "payload": {
+              "semantic": [
+                "systemRedColor",
+              ],
+            },
+            "type": 0,
+          }
+        }
+        strokeWidth={4}
+      />
+    </RNSVGGroup>
+  </RNSVGGroup>
+</RNSVGSvgView>
+`;
+
+exports[`CountdownRing progress snapshots progress 0.5 — half ring (mid-session) 1`] = `
+<RNSVGSvgView
+  accessibilityElementsHidden={true}
+  bbHeight={64}
+  bbWidth={64}
+  focusable={false}
+  height={64}
+  importantForAccessibility="no"
+  style={
+    [
+      {
+        "backgroundColor": "transparent",
+        "borderWidth": 0,
+      },
+      {
+        "flex": 0,
+        "height": 64,
+        "width": 64,
+      },
+    ]
+  }
+  width={64}
+>
+  <RNSVGGroup
+    fill={
+      {
+        "payload": 4278190080,
+        "type": 0,
+      }
+    }
+  >
+    <RNSVGGroup
+      fill={
+        {
+          "payload": 4278190080,
+          "type": 0,
+        }
+      }
+      matrix={
+        [
+          6.123233995736766e-17,
+          -1,
+          1,
+          6.123233995736766e-17,
+          0,
+          64,
+        ]
+      }
+    >
+      <RNSVGCircle
+        cx={32}
+        cy={32}
+        fill={null}
+        propList={
+          [
+            "fill",
+            "stroke",
+            "strokeWidth",
+          ]
+        }
+        r={30}
+        stroke={
+          {
+            "payload": {
+              "semantic": [
+                "systemRedColor",
+              ],
+            },
+            "type": 0,
+          }
+        }
+        strokeWidth={4}
+      />
+      <RNSVGCircle
+        cx={32}
+        cy={32}
+        fill={null}
+        propList={
+          [
+            "fill",
+            "stroke",
+            "strokeWidth",
+            "strokeDasharray",
+            "strokeLinecap",
+          ]
+        }
+        r={30}
+        stroke={
+          {
+            "payload": {
+              "semantic": [
+                "controlAccentColor",
+              ],
+            },
+            "type": 0,
+          }
+        }
+        strokeDasharray={
+          [
+            "94.24777960769379",
+            "188.49555921538757",
+          ]
+        }
+        strokeLinecap={1}
+        strokeWidth={4}
+      />
+    </RNSVGGroup>
+  </RNSVGGroup>
+</RNSVGSvgView>
+`;
+
+exports[`CountdownRing progress snapshots progress 1 — full ring (session just started) 1`] = `
+<RNSVGSvgView
+  accessibilityElementsHidden={true}
+  bbHeight={64}
+  bbWidth={64}
+  focusable={false}
+  height={64}
+  importantForAccessibility="no"
+  style={
+    [
+      {
+        "backgroundColor": "transparent",
+        "borderWidth": 0,
+      },
+      {
+        "flex": 0,
+        "height": 64,
+        "width": 64,
+      },
+    ]
+  }
+  width={64}
+>
+  <RNSVGGroup
+    fill={
+      {
+        "payload": 4278190080,
+        "type": 0,
+      }
+    }
+  >
+    <RNSVGGroup
+      fill={
+        {
+          "payload": 4278190080,
+          "type": 0,
+        }
+      }
+      matrix={
+        [
+          6.123233995736766e-17,
+          -1,
+          1,
+          6.123233995736766e-17,
+          0,
+          64,
+        ]
+      }
+    >
+      <RNSVGCircle
+        cx={32}
+        cy={32}
+        fill={null}
+        propList={
+          [
+            "fill",
+            "stroke",
+            "strokeWidth",
+          ]
+        }
+        r={30}
+        stroke={
+          {
+            "payload": {
+              "semantic": [
+                "systemRedColor",
+              ],
+            },
+            "type": 0,
+          }
+        }
+        strokeWidth={4}
+      />
+      <RNSVGCircle
+        cx={32}
+        cy={32}
+        fill={null}
+        propList={
+          [
+            "fill",
+            "stroke",
+            "strokeWidth",
+            "strokeDasharray",
+            "strokeLinecap",
+          ]
+        }
+        r={30}
+        stroke={
+          {
+            "payload": {
+              "semantic": [
+                "controlAccentColor",
+              ],
+            },
+            "type": 0,
+          }
+        }
+        strokeDasharray={
+          [
+            "188.49555921538757",
+            "188.49555921538757",
+          ]
+        }
+        strokeLinecap={1}
+        strokeWidth={4}
+      />
+    </RNSVGGroup>
+  </RNSVGGroup>
+</RNSVGSvgView>
+`;

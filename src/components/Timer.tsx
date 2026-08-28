@@ -1,14 +1,14 @@
 /**
- * Timer — the Timer surface (surface 1, Story 4.1, engine swap in 4.2).
+ * Timer — the Timer surface (surface 1; Story 4.1 picker, 4.2 engine swap,
+ * 4.3 live countdown).
  *
  * The Free-state surface: title + duration picker + domain-pick list +
  * Start button. Picker state is component-local (`useState` for duration
  * selection, custom minute text, and the selected hostname `Set`); nothing
- * in 4.1 lands in `committed` or `staged`.
+ * lands in `committed` or `staged`.
  *
- * Story 4.2 SWAP: the Start handler is a SINGLE `stageStartTimer({durationMs,
- * selected})` call to the store, replacing 4.1's per-domain
- * `stageAlwaysOnToggle` + `apply` chain. The new engine writes
+ * Story 4.2 engine: the Start handler is a SINGLE `stageStartTimer({durationMs,
+ * selected})` call to the store. The engine writes
  * `activeTimer:{endEpochMs,selectedDomains}` to `config.json` THEN
  * `writeHosts(effectiveHostsLines(nextConfig))` through the shared
  * serialized queue — exactly one admin prompt. `endEpochMs` is computed
@@ -16,30 +16,49 @@
  * even after a queue wait. Hosts-deny leaves `committed.activeTimer` null
  * (retry-safe).
  *
+ * Story 4.3 Blocked path: when `committed.activeTimer != null` the surface
+ * replaces the old defensive placeholder with the live countdown — the
+ * "FOCUS SESSION" label, a 64×64 `CountdownRing` + tabular `mm:ss` numeral,
+ * "Locked until HH:mm", a password-gated `End early` button, and the hint
+ * line. The countdown value comes from the SCOPED `useTimerStore` slice
+ * (`src/domain/timerStore.ts`) via the selector-scoped
+ * `selectRemainingMs` subscription — unrelated surfaces never re-render on
+ * a tick. The slice lifecycle is owned here for 4.3: `start(endEpochMs)` on
+ * a live `activeTimer`, `stop()` on cleanup (the slice's internal refcount
+ * lets 4.4 / 6.2 keep it alive across surface navigation later).
+ *
+ * End early is WIRED, not implemented (4.6 owns the privileged write): the
+ * button calls `requirePassword` — the same Epic 3 gate Panic and
+ * Change-password use, accessed lazily via `useDomainStore.getState()`
+ * (NOT a subscribed selector) — and the verified action body is the 4.3
+ * no-op announce. No config write, no hosts write.
+ *
  * Pre-check fallback (epic-4-context):
  *   - Persisted selection (committed.activeTimer?.selectedDomains) — used
- *     when present. 4.2 populates it; reading it now is the right hook.
+ *     when present.
  *   - First-run default — when no persisted selection exists, every domain
  *     is pre-checked, giving the user a one-click "start a session on
  *     everything".
- *
- * Defensive running-timer placeholder: when committed.activeTimer is non-
- * null at mount, render a minimal "see Blocklist for the countdown"
- * placeholder with an Open Blocklist CTA. 4.3 owns the full Blocked UI;
- * this story stays forward-compatible by NOT trying to render the Blocked
- * UI. The placeholder uses the same shape as the empty-blocklist empty
- * state so the user lands somewhere safe either way.
  *
  * Empty-blocklist empty state: "Add some domains on Blocklist first." +
  * an "Open Blocklist" CTA that calls `onOpenBlocklist` (the Shell threads
  * `selectRow(0)` here). Presets + checkbox list + Start are hidden.
  *
- * VoiceOver: surface mount announces "Timer, free" — single-fire on mount
- * via `useEffect(..., [])`, matching the Blocklist mount announce pattern
- * (Blocklist.tsx:127-136).
+ * VoiceOver: the surface-mount announce is keyed on `hasActiveTimer` —
+ * "Timer running, N minutes M seconds remaining" on Blocked entry, "Timer,
+ * free" on the Free path (single-fire per transition; the per-minute
+ * rollover gets an explicit announce AND rides the numeral's
+ * `accessibilityLiveRegion="polite"` — the live region is Android-only, so
+ * the announce is the macOS VoiceOver path, UX-DR17).
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   AccessibilityInfo,
   Pressable,
@@ -48,8 +67,14 @@ import {
   View,
 } from 'react-native';
 import { useDomainStore } from '../domain/store';
+import {
+  useTimerStore,
+  selectRemainingMs,
+  type TimerState,
+} from '../domain/timerStore';
 import { tokens } from '../theme/tokens';
 import { ApplyButton } from './ApplyButton';
+import { CountdownRing } from './CountdownRing';
 import {
   TimerDurationPicker,
   PRESET_MINUTES,
@@ -68,9 +93,40 @@ import {
 const EMPTY_BLOCKLIST_TEXT = 'Add some domains on Blocklist first.';
 const OPEN_BLOCKLIST_LABEL = 'Open Blocklist';
 
-/** Defensive: committed.activeTimer is set (a session is running). */
-const RUNNING_PLACEHOLDER_TEXT =
-  'Timer running. Switch to Blocklist to see the countdown.';
+// ----- Blocked-state copy (Story 4.3) -----
+
+/** Small uppercase status label above the hybrid countdown. */
+const FOCUS_SESSION_LABEL = 'FOCUS SESSION';
+/** Subtitle under the countdown row (local time, deterministic). */
+const lockedUntilLabel = (endEpochMs: number): string =>
+  `Locked until ${new Date(endEpochMs).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })}`;
+/** Destructive escape button (password-gated; 4.6 owns the actual end). */
+const END_EARLY_LABEL = 'End early';
+/**
+ * Hint line under the End-early button. The password clause is conditional
+ * on `requirePassword`'s actual behaviour: with no password set the gate
+ * short-circuits and the action runs immediately, so "needs your password"
+ * would be a lie on a password-less install.
+ */
+const endEarlyHint = (endEpochMs: number, hasPassword: boolean): string =>
+  `${hasPassword ? 'End early needs your password. ' : ''}Timer ends automatically at ${new Date(
+    endEpochMs,
+  ).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })}.`;
+/**
+ * The End-early action's announce for 4.3 — the gate wiring IS the
+ * deliverable; the privileged config/hosts end lands in Story 4.6. User
+ * language, no story jargon.
+ */
+const END_EARLY_PLACEHOLDER_TOAST =
+  'End early is not available yet — the session ends automatically at its end time.';
 
 /** Inline error when the custom input is invalid (covers all reject reasons). */
 const INVALID_CUSTOM_TEXT = `Enter minutes (${DURATION_MIN_MINUTES}–${DURATION_MAX_MINUTES}).`;
@@ -104,14 +160,59 @@ export interface TimerProps {
   onOpenBlocklist: () => void;
 }
 
+/**
+ * The ring's progress, derived INSIDE the slice selector so stroke + numeral
+ * derive from the exact same `nowMs` / `endEpochMs` pair and can never
+ * desync. DURING A LIVE SESSION both derived numbers change every tick, so
+ * the Blocked subtree re-renders once per second — that is by design (the
+ * numeral and the ring arc must move). What the SCOPING buys is isolation:
+ * the Blocklist / Settings / Schedule / Sidebar trees never touch this
+ * store, so a tick re-renders ONLY this surface's Blocked path.
+ * `progress = 1 - remaining/total`: 1 = just started, 0 = empty/expired.
+ */
+const selectProgress = (s: TimerState): number => {
+  const total = s.totalMs ?? 0;
+  if (total <= 0) {
+    return 0;
+  }
+  return Math.min(1, Math.max(0, 1 - selectRemainingMs(s) / total));
+};
+
 export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
   // ----- Store reads -----
   const committed = useDomainStore((s) => s.committed);
   const applyStatus = useDomainStore((s) => s.applyStatus);
   const stageStartTimer = useDomainStore((s) => s.stageStartTimer);
+  // The scoped countdown slice. TWO numeric selectors (remaining for the
+  // numeral, progress for the ring) — both change EVERY tick during a live
+  // session, so the Blocked subtree re-renders once per second by design;
+  // the scoping keeps every OTHER surface (Blocklist / Settings / Schedule /
+  // Sidebar / Shell) out of the tick entirely (spec's per-tick isolation).
+  const remainingMs = useTimerStore(selectRemainingMs);
+  const progress = useTimerStore(selectProgress);
 
   // ----- Derived gating -----
-  const hasActiveTimer = committed.activeTimer != null;
+  // Defensive normalisation (review step-04): `readConfig` validates
+  // config.json top-level only, so a malformed `activeTimer.endEpochMs`
+  // (non-numeric) must NOT put the surface into Blocked — gate, announce and
+  // slice lifecycle all key on the normalised value so they agree.
+  const rawEndEpochMs = committed.activeTimer?.endEpochMs ?? null;
+  const activeEndEpochMs =
+    rawEndEpochMs != null && Number.isFinite(rawEndEpochMs)
+      ? rawEndEpochMs
+      : null;
+  const hasActiveTimer = committed.activeTimer != null && activeEndEpochMs != null;
+
+  // ----- Countdown derivation (mm:ss + locked-until) -----
+  // Zero-padded, tabular numerals (tokens.typography.countdown) so the digit
+  // width never jitters across the countdown.
+  const remainingSec = Math.floor(remainingMs / 1000);
+  const mm = Math.floor(remainingSec / 60)
+    .toString()
+    .padStart(2, '0');
+  const ss = (remainingSec % 60).toString().padStart(2, '0');
+  const lockedUntil =
+    activeEndEpochMs != null ? lockedUntilLabel(activeEndEpochMs) : null;
   // The pick list always reads `committed.domains` (per spec: "renders
   // against the canonical blocklist, never the staged overlay"). A staged
   // draft from a prior Blocklist toggle does NOT leak into the picker —
@@ -208,14 +309,76 @@ export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
     selectedCount > 0 &&
     !running;
 
-  // ----- Mount announce: "Timer, free" -----
-  // Single-fire on mount, matching Blocklist's announce pattern. Story 4.1
-  // owns the Free-state announce only; 4.4 owns the running-state announce.
+  // ----- Slice lifecycle (Story 4.3) -----
+  // The Timer surface is the slice's FIRST subscriber: `start(endEpochMs)`
+  // when a session is mirrored, `stop()` on cleanup. The slice's internal
+  // refcount makes this safe for the future co-subscribers (4.4 status
+  // header, 6.2 menu bar); for 4.3 alone the slice parks when this surface
+  // unmounts (the ring pauses across surface navigation). Keyed on the
+  // mirrored `endEpochMs` so a superseding session re-arms the driver.
+  // useLayoutEffect (review step-04): a plain useEffect runs AFTER first
+  // paint, so every Blocked mount would flash 00:00 / an empty ring for one
+  // frame before the first `start()` updates the slice. Starting in the
+  // layout phase sets the slice state before paint.
+  useLayoutEffect(() => {
+    if (activeEndEpochMs == null) {
+      return;
+    }
+    useTimerStore.getState().start(activeEndEpochMs);
+    return () => {
+      useTimerStore.getState().stop();
+    };
+  }, [activeEndEpochMs]);
+
+  // ----- Per-minute rollover announce (UX-DR17) -----
+  // `accessibilityLiveRegion` is Android-only and a no-op on macOS, so the
+  // minute boundary gets an EXPLICIT announce here: "4 minutes remaining".
+  // Keyed on the minute value (not `remainingSec`) so it fires once per
+  // minute, not per tick; a ref guard skips the first run so it never
+  // doubles the mount announce. Silent at 0 (expiry is 4.5's story) and only
+  // while the Blocked path is actually visible.
+  const minutesRemaining = Math.floor(remainingSec / 60);
+  const didMountRef = useRef(false);
   useEffect(() => {
-    AccessibilityInfo.announceForAccessibility('Timer, free');
-    // Mount-only.
+    if (activeEndEpochMs == null) {
+      return;
+    }
+    if (!didMountRef.current) {
+      didMountRef.current = true;
+      return;
+    }
+    if (minutesRemaining > 0) {
+      AccessibilityInfo.announceForAccessibility(
+        `${minutesRemaining} minute${minutesRemaining === 1 ? '' : 's'} remaining`,
+      );
+    }
+  }, [minutesRemaining, activeEndEpochMs]);
+
+  // ----- Mount announce: running vs free -----
+  // Keyed on `hasActiveTimer` — single-fire per transition (not per tick).
+  // Blocked entry speaks "Timer running, N minutes M seconds remaining";
+  // the Free path keeps 4.1's "Timer, free". Subsequent ticks do NOT
+  // re-announce — the numeral's accessibilityLiveRegion="polite" carries
+  // the per-minute rollover (UX-DR17).
+  useEffect(() => {
+    if (hasActiveTimer) {
+      const end = useDomainStore.getState().committed.activeTimer?.endEpochMs;
+      const remainingSec = Math.max(
+        0,
+        Math.floor(((end ?? Date.now()) - Date.now()) / 1000),
+      );
+      const minutes = Math.floor(remainingSec / 60);
+      const seconds = remainingSec % 60;
+      AccessibilityInfo.announceForAccessibility(
+        `Timer running, ${minutes} minute${minutes === 1 ? '' : 's'} ` +
+          `${seconds} second${seconds === 1 ? '' : 's'} remaining`,
+      );
+    } else {
+      AccessibilityInfo.announceForAccessibility('Timer, free');
+    }
+    // Keyed on the hasActiveTimer transition only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [hasActiveTimer]);
 
   // ----- Handlers -----
   const handleToggleDomain = (hostname: string) => {
@@ -321,25 +484,65 @@ export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
       });
   };
 
-  // ----- Defensive: running-timer placeholder (forward-compat with 4.3) -----
-  if (hasActiveTimer) {
+  // ----- End early (Story 4.3 wiring; 4.6 owns the privileged write) -----
+  // Lazy access pattern (mirrors Panic.tsx / ChangePassword.tsx): call
+  // `requirePassword` via `useDomainStore.getState()`, NOT a subscribed
+  // selector — the Shell's single <PasswordGate> opens when a password is
+  // set; with none set the gate short-circuits and the action body runs
+  // immediately. The body IS the 4.3 deliverable: an announce only. No
+  // config write, no hosts write (4.6 owns both).
+  const handleEndEarly = () => {
+    useDomainStore.getState().requirePassword(() => {
+      AccessibilityInfo.announceForAccessibility(END_EARLY_PLACEHOLDER_TOAST);
+    });
+  };
+
+  // ----- Blocked path: the live countdown (Story 4.3) -----
+  // The ONLY path a running session sees — the picker / presets / checkboxes
+  // / Start are all hidden (spec Never clause). Layout (top to bottom):
+  // small uppercase "FOCUS SESSION" label → flex-row with the 64×64 ring on
+  // the left and the tabular mm:ss numeral on the right → "Locked until
+  // HH:mm" subtitle → destructive outlined End early → hint line. NOT
+  // centred — left-aligned per the UX spine (UX-DR15).
+  if (hasActiveTimer && activeEndEpochMs != null) {
     return (
       <View style={styles.container}>
         <Text style={styles.title}>Timer</Text>
-        <Text style={styles.body}>{RUNNING_PLACEHOLDER_TEXT}</Text>
+        <Text style={styles.statusLabel}>{FOCUS_SESSION_LABEL}</Text>
+        <View style={styles.countdownRow}>
+          <CountdownRing
+            size={64}
+            strokeWidth={4}
+            trackColor={tokens.status.blocked}
+            remainingColor={tokens.primary}
+            progress={progress}
+          />
+          <Text
+            style={styles.numeral}
+            accessibilityLabel="Time remaining"
+            // Per-minute rollover cue (UX-DR17); per-second ticks are silent.
+            accessibilityLiveRegion="polite"
+          >
+            {mm}:{ss}
+          </Text>
+        </View>
+        <Text style={styles.subtitle}>{lockedUntil}</Text>
         <Pressable
-          onPress={onOpenBlocklist}
+          onPress={handleEndEarly}
           focusable
           enableFocusRing
           accessibilityRole="button"
-          accessibilityLabel={OPEN_BLOCKLIST_LABEL}
+          accessibilityLabel={END_EARLY_LABEL}
           style={({ pressed }) => [
-            styles.cta,
-            pressed && styles.ctaPressed,
+            styles.endEarly,
+            pressed && styles.endEarlyPressed,
           ]}
         >
-          <Text style={styles.ctaLabel}>{OPEN_BLOCKLIST_LABEL}</Text>
+          <Text style={styles.endEarlyLabel}>{END_EARLY_LABEL}</Text>
         </Pressable>
+        <Text style={styles.hint}>
+          {endEarlyHint(activeEndEpochMs, committed.passwordHash != null)}
+        </Text>
       </View>
     );
   }
@@ -462,5 +665,51 @@ const styles = StyleSheet.create({
   ctaLabel: {
     ...tokens.typography.body,
     color: tokens.primaryForeground,
+  },
+  // ----- Blocked path (Story 4.3) -----
+  // Small uppercase status label. `tokens.typography.label` carries NO
+  // letterSpacing, so the letter-spaced premium treatment is a LOCAL style
+  // here (tokens stay untouched); opacity gives the secondary-colour read
+  // without a new token.
+  statusLabel: {
+    ...tokens.typography.label,
+    letterSpacing: 1.5,
+    textTransform: 'uppercase',
+    opacity: 0.7,
+    marginBottom: tokens.spacing.sm,
+  },
+  countdownRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: tokens.spacing.md,
+    marginBottom: tokens.spacing.xs,
+  },
+  numeral: {
+    ...tokens.typography.countdown,
+  },
+  subtitle: {
+    ...tokens.typography.body,
+    opacity: 0.7,
+    marginBottom: tokens.spacing.md,
+  },
+  // Outlined DESTRUCTIVE — never primary-filled, never the surface default.
+  // A plain Pressable carries no Return binding; the Shell's Return→Apply
+  // branch fires only on surface 0, so Return does nothing here (UX-DR16:
+  // the destructive choice is deliberate, reached via Tab).
+  endEarly: {
+    paddingHorizontal: tokens.spacing.md,
+    paddingVertical: tokens.spacing.sm,
+    borderRadius: tokens.rounded.md,
+    borderWidth: 1,
+    borderColor: tokens.destructive,
+    alignSelf: 'flex-start',
+    marginBottom: tokens.spacing.sm,
+  },
+  endEarlyPressed: {
+    opacity: 0.85,
+  },
+  endEarlyLabel: {
+    ...tokens.typography.body,
+    color: tokens.destructive,
   },
 });

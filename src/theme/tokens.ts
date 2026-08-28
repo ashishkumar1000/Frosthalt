@@ -34,8 +34,13 @@ export const statusColorNames = {
 
 export type StatusKey = keyof typeof statusColorNames;
 
-/** Opaque PlatformColor return type (resolves to a native color at render time). */
-type PlatformColorOutput = ReturnType<typeof PlatformColor>;
+/**
+ * Opaque PlatformColor return type (resolves to a native color at render
+ * time). Exported so presentational primitives that take colour props (the
+ * Story 4.3 CountdownRing) stay on the `tokens.*` indirection without
+ * re-deriving the type.
+ */
+export type PlatformColorOutput = ReturnType<typeof PlatformColor>;
 
 export interface Tokens {
   /** Brand accent — follows the user's System Settings Accent Color. */
