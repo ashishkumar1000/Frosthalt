@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-14-2026 00:19
-last_updated: 08-28-2026  # 4-5 done (step-04 review trusted)
+last_updated: 08-28-2026  # 4-6 done (step-04 review trusted)
 
 project: Frosthalt
 project_key: NOKEY
@@ -68,7 +68,7 @@ development_status:
   4-3-live-countdown-hybrid-ring-scoped-slice: done
   4-4-countdown-in-the-status-header: done
   4-5-auto-unblock-on-expiry-unless-also-always-on: done
-  4-6-end-early-password-gated: backlog
+  4-6-end-early-password-gated: done
   4-7-closed-mid-session-persistence-and-re-arm-on-launch: backlog
   epic-4-retrospective: optional
 

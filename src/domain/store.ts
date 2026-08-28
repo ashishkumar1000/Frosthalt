@@ -56,7 +56,11 @@
  *     `staged` — Start is its own atomic config write.
  *   - `expireTimer()` (Story 4.5) — the auto-unblock on expiry: the MIRROR of
  *     `stageStartTimer`'s body with `activeTimer: null`. See its JSDoc below;
- *     Stories 4.6 (end-early) and 4.7 (launch re-arm) call it directly.
+ *     Story 4.7 (launch re-arm) calls it directly.
+ *   - `endEarly()` (Story 4.6) — the password-gated early escape: the MIRROR
+ *     of `expireTimer`'s body with a LOOSER guard (an active session, no
+ *     expiry requirement). See its JSDoc below; only the Timer surface calls
+ *     it.
  *
  * Serialization: a single in-flight Promise + a micro-queue of pending
  * `apply()` intents; the queue drains one-at-a-time, never in parallel. This
@@ -82,11 +86,12 @@ import { useTimerStore } from './timerStore';
 export type ApplyStatus = 'idle' | 'running';
 
 /**
- * The failure toast copy (Story 4.5) — shared by BOTH expireTimer failure
- * branches (hosts deny + the defensive hosts-throw catch). Kept as a module
- * constant so the copy exists in exactly one place in this file. Panic's own
- * success toast copy in Panic.tsx is a SEPARATE, component-local string and
- * is deliberately not touched by this.
+ * The failure toast copy (Story 4.5) — shared by the hosts-deny and
+ * hosts-throw failure branches of the timer-end actions (`expireTimer` and
+ * Story 4.6's `endEarly`). Kept as a module constant so the copy exists in
+ * exactly one place in this file. Panic's own success toast copy in Panic.tsx
+ * is a SEPARATE, component-local string and is deliberately not touched by
+ * this.
  */
 const HOSTS_FAILURE_TOAST = "Couldn't update /etc/hosts. No changes made.";
 
@@ -270,11 +275,73 @@ export interface DomainState {
    * caught), so the module-level trigger below can call it without a
    * `.catch`.
    *
-   * JSDoc contract for later stories: Story 4.6 (end-early) and Story 4.7
-   * (launch re-arm when `now >= end-time`) call THIS action directly — they
-   * must not fork a parallel hosts-write path.
+   * JSDoc contract for later stories: Story 4.7 (launch re-arm when
+   * `now >= end-time`) calls THIS action directly — it must not fork a
+   * parallel hosts-write path. Story 4.6's end-early is its own sibling
+   * action (`endEarly` below) with the looser guard; it does NOT call this.
    */
   expireTimer: () => Promise<WriteResult>;
+  /**
+   * End the running session early (Story 4.6) — the MIRROR of `expireTimer`'s
+   * body (the action directly above in this file) with a LOOSER queue-time
+   * guard: the only requirement is `committed.activeTimer != null` — a LIVE
+   * session is exactly the target, so there is no `Date.now() >= endEpochMs`
+   * check (and a malformed end time does not block the write; only the
+   * Timer surface's `hasActiveTimer` finite check keeps a corrupt session out
+   * of the Blocked UI). The mirror idiom — sibling actions sharing one body
+   * shape, each with its own readable guard — is the repo's established shape
+   * since 4.2. Runs through the SAME shared `enqueue` chain; a parallel
+   * hosts-write path is as forbidden here as it is everywhere else.
+   *
+   * The two siblings differ ONLY in the guard and the toast copy:
+   *   - `expireTimer` requires the session to have actually reached its end
+   *     (the trigger fires on the slice's expired-parked transition) and
+   *     raises the fixed "Session ended. Domains unblocked." toast.
+   *   - `endEarly` fires on a live session and counts the N in
+   *     "Session ended. N domains unblocked." — the selected domains whose
+   *     normalised apex is NOT always-on (always-on domains stay blocked and
+   *     are not counted; `normaliseDomain`-level comparison so a selected
+   *     "www.twitter.com" still matches an always-on "twitter.com").
+   *
+   * Queue-time guard + re-read (the same Always clause `expireTimer` carries):
+   * `committed` is read INSIDE the enqueue — at the moment this job acquires
+   * the queue, never from a call-time snapshot. `activeTimer == null` →
+   * `{ok:false, error:'no-active-session'}` WITHOUT touching any port (no
+   * config write, no admin prompt, no `applyStatus` flip, no toast) — the
+   * idempotency guard that absorbs a double press and an expiry job queued
+   * ahead that already cleared the session (a queue-time re-read is
+   * authoritative).
+   *
+   * Body order mirrors `expireTimer` exactly:
+   *   1. `writeConfig({...committed, activeTimer: null})` FIRST. On failure ->
+   *      `{ok:false, error:'config-write:<detail>'}` and return BEFORE any
+   *      hosts write, BEFORE flipping `applyStatus`, BEFORE advancing
+   *      `committed` (strict order — no admin prompt, no state change, no
+   *      toast).
+   *   2. Flip `applyStatus: 'running'`.
+   *   3. `writeHosts(effectiveHostsLines(nextConfig))` in try/catch. With
+   *      `activeTimer: null` the payload is the ALWAYS-ON lines only — an
+   *      also-always-on selected domain REMAINS blocked purely by union
+   *      precedence (no removal code path). On deny -> `committed.activeTimer`
+   *      INTACT (memory keeps the session; config.json on disk already says
+   *      "no session" — the accepted-drift mirror of Start/expiry,
+   *      over-blocking never a leak) + `applyStatus: 'idle'` + the failure
+   *      toast. On throw -> same + `hosts-throw:<detail>` envelope.
+   *   4. On hosts ok -> advance `committed` to `nextConfig`, reset
+   *      `applyStatus: 'idle'`, set `lastResult`, and raise the success toast
+   *      "Session ended. N domains unblocked." (or "Session ended." when N=0).
+   *
+   * The toast is RUNTIME state (never persisted); the Shell renders it and
+   * auto-dismisses it via `clearToast()`. Fire-and-forget-safe: never rejects
+   * (the enqueue body is fully guarded + caught), so the Timer surface can
+   * call it with a bare `.catch` no-op.
+   *
+   * JSDoc contract for later stories: Story 4.7's launch re-arm does NOT call
+   * this — re-arm uses `expireTimer` (an already-expired session on relaunch
+   * is an expiry, not a user-verified escape). Nothing calls `endEarly`
+   * outside the Timer surface.
+   */
+  endEarly: () => Promise<WriteResult>;
   /**
    * Clear the Shell-level toast (Story 4.5). Called by the Shell's 8 s
    * auto-dismiss timer. Runtime-only: no config write, no hosts write.
@@ -740,8 +807,13 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
       } catch (err) {
         // Defensive — shellRunner's contract says the promise never rejects,
         // but JS Promises can still throw; reset `applyStatus` so the UI is
-        // recoverable.
-        set({ applyStatus: 'idle' });
+        // recoverable. Story 4.6 closes the 4-5 defer: `lastResult` now
+        // carries the throw envelope, matching what this action's deny
+        // branch already sets (all three hosts-throw catches are aligned).
+        set({
+          applyStatus: 'idle',
+          lastResult: { ok: false, error: `hosts-throw:${String(err)}` },
+        });
         return { ok: false, error: `hosts-throw:${String(err)}` } as WriteResult;
       }
     });
@@ -846,9 +918,12 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
       } catch (err) {
         // Defensive — shellRunner's contract says the promise never rejects,
         // but JS Promises can still throw; reset `applyStatus`, keep
-        // `committed.activeTimer` intact, raise the failure toast.
+        // `committed.activeTimer` intact, raise the failure toast. Story 4.6
+        // closes the 4-5 defer: `lastResult` carries the throw envelope,
+        // matching what the deny branch above already sets.
         set({
           applyStatus: 'idle',
+          lastResult: { ok: false, error: `hosts-throw:${String(err)}` },
           toast: {
             message: HOSTS_FAILURE_TOAST,
             tone: 'error',
@@ -863,6 +938,118 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     // Runtime-only: clear the Shell-level toast. Called by the Shell's 8 s
     // auto-dismiss timer. No config write, no hosts write.
     set({ toast: null });
+  },
+
+  // ----- Story 4.6 — `endEarly` (the password-gated early escape) -----
+
+  endEarly: () => {
+    // The MIRROR of `expireTimer`'s body with the LOOSER guard — see the
+    // interface JSDoc above for the full contract (why a sibling action and
+    // not a flag on `expireTimer`: the guards differ in kind — expiry
+    // requires the session to have reached its end; end-early must fire on a
+    // LIVE session — and two siblings keep each guard readable). Through the
+    // shared `enqueue` chain only: no parallel hosts-write path, never
+    // concurrent with an Apply (one osascript prompt at a time).
+    return enqueue(async () => {
+      // Queue-time guard + re-read (the spec's Always clause): `committed` is
+      // read INSIDE the enqueue — at the moment this job ACQUIRES the queue.
+      // The ONLY requirement is an active session: no `Date.now()` /
+      // finiteness checks (a live session is the target, and a malformed end
+      // time must not block the user's verified escape). Out-of-guard return
+      // WITHOUT touching any port — this is the idempotency guard that
+      // absorbs a double press, and the re-read is authoritative when an
+      // expiry job queued ahead already cleared the session.
+      const committed = get().committed;
+      const active = committed.activeTimer;
+      if (active == null) {
+        return { ok: false, error: 'no-active-session' } as WriteResult;
+      }
+      const nextConfig: Config = {
+        ...committed,
+        activeTimer: null,
+      };
+      // 1. Write config.json FIRST (strict order, mirrors `expireTimer`'s
+      // accepted-drift order). On failure -> short-circuit BEFORE any
+      // elevation: no admin prompt, NO `applyStatus` flip, NO `committed`
+      // advance, NO toast. Over-blocking direction: a config-write failure
+      // leaves everything exactly as it was — hosts still blocks the session
+      // domains, memory still says the session runs.
+      const cfg = writeConfig(nextConfig);
+      if (!cfg.ok) {
+        return {
+          ok: false,
+          error: `config-write:${cfg.error ?? 'unknown'}`,
+        } as WriteResult;
+      }
+      // 2. Flip `applyStatus: 'running'` (the same UI gate the Start/Apply/
+      // expiry paths use) and compute the effective hosts lines from the
+      // JUST-BUILT `nextConfig` — always-on only, because the active-timer
+      // set lifts (`effectiveBlocklist`'s Epic 4 loop contributes nothing
+      // when `activeTimer == null`). The always-on loop alone keeps an
+      // also-always-on selected domain blocked — union precedence by
+      // construction, no removal code path.
+      set({ applyStatus: 'running' });
+      // 3. Write the managed hosts section — ONE admin prompt. The native
+      // promise resolves (never rejects) per shellRunner's contract; the
+      // try/catch is the same defensive guard `stageStartTimer`/`expireTimer`
+      // carry: an unexpected throw must never leave
+      // `applyStatus === 'running'` forever.
+      try {
+        const lines = effectiveHostsLines(nextConfig);
+        const result = await writeHosts(lines);
+        if (result.ok) {
+          // Hosts ok -> advance `committed` to `nextConfig` (`activeTimer`
+          // cleared) + reset `applyStatus` + set `lastResult` + raise the
+          // success toast. The badge/countdown consumers derive everything
+          // from `committed.activeTimer`, so they revert with zero changes
+          // to the surfaces.
+          set({
+            committed: nextConfig,
+            applyStatus: 'idle',
+            lastResult: result,
+            toast: {
+              message: endEarlySuccessToast(
+                active.selectedDomains,
+                nextConfig.domains,
+              ),
+              tone: 'info',
+            },
+          });
+        } else {
+          // Hosts denied (or hard OS error) -> `committed.activeTimer` INTACT
+          // in memory (config.json on disk already says "no session" — the
+          // accepted-drift mirror of Start/expiry; over-blocking, never a
+          // leak). `applyStatus` resets to `idle`; `lastResult` carries the
+          // envelope; the failure toast shows. Retry = a new session, or
+          // relaunch (4.7 re-arm).
+          set({
+            applyStatus: 'idle',
+            lastResult: result,
+            toast: {
+              message: HOSTS_FAILURE_TOAST,
+              tone: 'error',
+            },
+          });
+        }
+        return result;
+      } catch (err) {
+        // Defensive — shellRunner's contract says the promise never rejects,
+        // but JS Promises can still throw; reset `applyStatus`, keep
+        // `committed.activeTimer` intact, raise the failure toast. Story 4.6
+        // closes the 4-5 defer: `lastResult` carries the throw envelope,
+        // matching what the deny branch above already sets (all three
+        // hosts-throw catches are aligned).
+        set({
+          applyStatus: 'idle',
+          lastResult: { ok: false, error: `hosts-throw:${String(err)}` },
+          toast: {
+            message: HOSTS_FAILURE_TOAST,
+            tone: 'error',
+          },
+        });
+        return { ok: false, error: `hosts-throw:${String(err)}` } as WriteResult;
+      }
+    });
   },
 
   // ----- Story 3.2 — the reusable password gate actions -----
@@ -1029,6 +1216,49 @@ function enqueue(run: () => Promise<WriteResult>): Promise<WriteResult> {
     () => ({ ok: false }) as WriteResult,
   );
   return next;
+}
+
+/**
+ * Story 4.6 — the end-early success toast copy: "Session ended. N domains
+ * unblocked.", where N counts ONLY the session's selected domains that
+ * actually lift — a selected domain whose normalised apex is ALSO always-on
+ * stays blocked and is NOT counted. N = 0 (every selection always-on, or an
+ * empty/absent selection) degrades to the bare "Session ended.".
+ *
+ * The comparison is `normaliseDomain`-level, matching how `effectiveBlocklist`
+ * dedupes: a selected "www.twitter.com" against an always-on "twitter.com"
+ * counts as still-blocked. A selected entry that fails normalisation is
+ * skipped from the count — `effectiveBlocklist` never wrote it, so there is
+ * nothing for it to lift.
+ */
+function endEarlySuccessToast(selected: string[], domains: Domain[]): string {
+  const alwaysOnApexes = new Set<string>();
+  for (const d of domains) {
+    if (!d || !d.alwaysOn) {
+      continue;
+    }
+    const apex = normaliseDomain(d.hostname);
+    if (apex != null) {
+      alwaysOnApexes.add(apex);
+    }
+  }
+  // Counted per DISTINCT normalised apex (a Set), not per `selected` element:
+  // `selectedDomains` is stored raw, so `['b.com', 'www.b.com']` both
+  // normalise to `b.com` and lift ONE domain between them.
+  const liftedApexes = new Set<string>();
+  if (Array.isArray(selected)) {
+    for (const hostname of selected) {
+      const apex = normaliseDomain(hostname);
+      if (apex != null && !alwaysOnApexes.has(apex)) {
+        liftedApexes.add(apex);
+      }
+    }
+  }
+  const lifted = liftedApexes.size;
+  if (lifted === 0) {
+    return 'Session ended.';
+  }
+  return `Session ended. ${lifted} ${lifted === 1 ? 'domain' : 'domains'} unblocked.`;
 }
 
 /**

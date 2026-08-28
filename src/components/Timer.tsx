@@ -27,11 +27,14 @@
  * owner: the status header (always mounted on every surface) owns the slice
  * lifecycle, so the driver keeps counting after this surface unmounts.
  *
- * End early is WIRED, not implemented (4.6 owns the privileged write): the
- * button calls `requirePassword` — the same Epic 3 gate Panic and
- * Change-password use, accessed lazily via `useDomainStore.getState()`
- * (NOT a subscribed selector) — and the verified action body is the 4.3
- * no-op announce. No config write, no hosts write.
+ * End early (Story 4.6): the button is gate-first via `requirePassword` —
+ * the same Epic 3 gate Panic and Change-password use, accessed lazily via
+ * `useDomainStore.getState()` (NOT a subscribed selector). The verified
+ * action body is a single `endEarly()` call — the store's serialized mirror
+ * of `expireTimer` that writes config + hosts and raises the Shell-level
+ * toast. No gate code lives here and no hosts/config write happens here
+ * (the store owns both); with no password set the gate short-circuits and
+ * `endEarly()` runs immediately (the Panic pattern).
  *
  * Pre-check fallback (epic-4-context):
  *   - Persisted selection (committed.activeTimer?.selectedDomains) — used
@@ -105,7 +108,7 @@ const lockedUntilLabel = (endEpochMs: number): string =>
     minute: '2-digit',
     hour12: false,
   })}`;
-/** Destructive escape button (password-gated; 4.6 owns the actual end). */
+/** Destructive escape button (password-gated; the store's `endEarly` is the actual end). */
 const END_EARLY_LABEL = 'End early';
 /**
  * Hint line under the End-early button. The password clause is conditional
@@ -121,13 +124,6 @@ const endEarlyHint = (endEpochMs: number, hasPassword: boolean): string =>
     minute: '2-digit',
     hour12: false,
   })}.`;
-/**
- * The End-early action's announce for 4.3 — the gate wiring IS the
- * deliverable; the privileged config/hosts end lands in Story 4.6. User
- * language, no story jargon.
- */
-const END_EARLY_PLACEHOLDER_TOAST =
-  'End early is not available yet — the session ends automatically at its end time.';
 
 /** Inline error when the custom input is invalid (covers all reject reasons). */
 const INVALID_CUSTOM_TEXT = `Enter minutes (${DURATION_MIN_MINUTES}–${DURATION_MAX_MINUTES}).`;
@@ -477,16 +473,29 @@ export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
       });
   };
 
-  // ----- End early (Story 4.3 wiring; 4.6 owns the privileged write) -----
-  // Lazy access pattern (mirrors Panic.tsx / ChangePassword.tsx): call
-  // `requirePassword` via `useDomainStore.getState()`, NOT a subscribed
-  // selector — the Shell's single <PasswordGate> opens when a password is
-  // set; with none set the gate short-circuits and the action body runs
-  // immediately. The body IS the 4.3 deliverable: an announce only. No
-  // config write, no hosts write (4.6 owns both).
+  // ----- End early (Story 4.6) -----
+  // Gate-first via the shared Epic 3 gate (the Panic pattern): lazy access
+  // (mirrors Panic.tsx / ChangePassword.tsx) — call `requirePassword` via
+  // `useDomainStore.getState()`, NOT a subscribed selector — so the Shell's
+  // single <PasswordGate> opens when a password is set; with none set the
+  // gate short-circuits and the action body runs immediately. The verified
+  // body is a single `endEarly()` call: the store's serialized mirror of
+  // `expireTimer` writes config + hosts and raises the Shell-level toast
+  // ("Session ended. N domains unblocked." / the hosts-failure copy), so
+  // there is NO announce here — the Shell's toast effect carries the cue.
+  // The promise never rejects (the enqueue body is fully guarded), but the
+  // fire-and-forget keeps a bare defensive `.catch` like Panic's.
   const handleEndEarly = () => {
+    // Apply-queue backpressure: while an end-early job is already in flight
+    // (e.g. waiting at an unanswered admin prompt), a second press would
+    // queue a duplicate config write + admin prompt + failure toast. The
+    // deny path leaves `activeTimer` intact, so the button is still rendered
+    // and pressable — gate the re-entry here instead.
+    if (useDomainStore.getState().applyStatus === 'running') {
+      return;
+    }
     useDomainStore.getState().requirePassword(() => {
-      AccessibilityInfo.announceForAccessibility(END_EARLY_PLACEHOLDER_TOAST);
+      void useDomainStore.getState().endEarly().catch(() => {});
     });
   };
 

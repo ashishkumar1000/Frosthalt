@@ -2042,3 +2042,111 @@ test('Shell-level expiry with a denied hosts write keeps the session and shows t
     "Couldn't update /etc/hosts. No changes made.",
   );
 });
+
+// ===========================================================================
+// Story 4.6 — the real end-early flow through the Shell: press -> (no
+// password set, so requirePassword short-circuits) -> config write ->
+// hosts write -> toast + announce -> badge/countdown revert. The component
+// tests mock `endEarly`; this is the only test of the REAL action wired
+// through the rendered surface.
+// ===========================================================================
+
+test('Shell-level end-early e2e: press -> config write (activeTimer:null) -> hosts write -> "Session ended. 1 domain unblocked." toast, announced, Free badge, countdown gone', async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  const configNative = require('../src/native/specs/NativeConfigStoreSpec')
+    .default as { writeConfig: jest.Mock };
+  const shellNative = require('../src/native/specs/NativeShellRunnerSpec')
+    .default as { writeHosts: jest.Mock };
+  configNative.writeConfig.mockReturnValue({ ok: true });
+  shellNative.writeHosts.mockResolvedValue({ ok: true });
+
+  // A LIVE session with NO password set (DEFAULT_CONFIG carries no
+  // passwordHash): requirePassword must short-circuit straight into
+  // endEarly() — no gate detour. a.com is always-on, b.com rides the
+  // session; ending early lifts b.com (N = 1) and keeps a.com.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'a.com', alwaysOn: true },
+          { hostname: 'b.com', alwaysOn: false },
+        ],
+        activeTimer: {
+          endEpochMs: T + 5 * 60_000,
+          selectedDomains: ['a.com', 'b.com'],
+        },
+      },
+      applyStatus: 'idle',
+    });
+  });
+
+  const testRenderer = renderShell();
+  // Live session: Blocked badge, 05:00, 2 domains.
+  expect(extractText(testRenderer.toJSON())).toContain('05:00');
+  expect(extractText(testRenderer.toJSON())).toContain('2 domains');
+
+  // Clear the shared mocks' history (see the expiry e2e above) so the
+  // call-count assertions count only THIS test's end-early run.
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+
+  // The unblock fires on any surface: navigate OFF the Timer surface to
+  // Settings (⌘4) first, then back to Timer (⌘2) where the End early
+  // button lives.
+  const container = findKeyDownContainer(testRenderer.root);
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '4' } });
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '2' } });
+  });
+
+  // Press End early and drain the enqueued run (config -> hosts -> state).
+  const endEarlyButton = testRenderer.root.findAll(
+    (node) => node.props && node.props.accessibilityLabel === 'End early',
+  )[0];
+  expect(endEarlyButton).toBeDefined();
+  announceForAccessibility.mockClear();
+  await ReactTestRenderer.act(async () => {
+    endEarlyButton.props.onPress();
+    await drainAsync();
+  });
+
+  // The store ran the real end-early path end-to-end.
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.activeTimer).toBeNull();
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  // Only the always-on domain remains blocked; b.com lifted.
+  expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
+
+  // The header reverted with zero surface changes: Free badge, the count
+  // dropped to the always-on domain only, and the countdown numeral is gone.
+  const text = extractText(testRenderer.toJSON());
+  const badgeByLabel = (label: string) =>
+    testRenderer.root.findAll(
+      (node) => node.props && node.props.accessibilityLabel === label,
+    );
+  expect(badgeByLabel('Status: Free').length).toBeGreaterThanOrEqual(1);
+  expect(badgeByLabel('Status: Blocked')).toHaveLength(0);
+  expect(text).toContain('1 domain');
+  expect(text).not.toContain('05:00');
+
+  // The Shell-level success toast rendered + was announced to VoiceOver.
+  expect(text).toContain('Session ended. 1 domain unblocked.');
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    'Session ended. 1 domain unblocked.',
+  );
+
+  // 8 s later the toast auto-dismisses (Shell's clearToast timer).
+  await ReactTestRenderer.act(async () => {
+    jest.advanceTimersByTime(8_000);
+  });
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(extractText(testRenderer.toJSON())).not.toContain(
+    'Session ended. 1 domain unblocked.',
+  );
+});

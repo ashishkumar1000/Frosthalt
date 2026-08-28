@@ -204,6 +204,15 @@ function seedState(overrides: {
 
 let currentRenderer: ReturnType<typeof ReactTestRenderer.create> | null = null;
 
+// Story 4.6: the real `endEarly` action, captured BEFORE any test can mock it.
+// Mocks are installed with `setState({ endEarly: spy })`, not `jest.spyOn`:
+// a spy mutates the current state object and every later `setState` merge
+// spread-copies that mock into new state objects, where `restoreAllMocks`
+// cannot reach it — the next `jest.spyOn` would then re-use the stale mock
+// (with its old recorded calls) instead of wrapping the real action.
+const realEndEarly = useDomainStore.getState().endEarly;
+const realRequirePassword = useDomainStore.getState().requirePassword;
+
 afterEach(() => {
   if (currentRenderer) {
     ReactTestRenderer.act(() => {
@@ -212,6 +221,9 @@ afterEach(() => {
     currentRenderer = null;
   }
   jest.restoreAllMocks();
+  // Story 4.6: put the real `endEarly`/`requirePassword` back even if a test
+  // swapped them via setState (see above — restoreAllMocks cannot undo those).
+  useDomainStore.setState({ endEarly: realEndEarly, requirePassword: realRequirePassword });
   // Story 4.3: force the scoped timer slice's refcount back to 0 and reset
   // its state so a Blocked test can never leak a live per-second driver
   // (or a stale `endEpochMs`) into another test. Extra stops are no-ops.
@@ -940,27 +952,33 @@ test('Blocked path at an already-expired endEpochMs: numeral reads 00:00, ring e
   // store.test.ts and StatusHeader.test.tsx's expired-at-mount test).
 });
 
-test('End early with no password set short-circuits to the announce (gate never opens)', () => {
+test('End early with no password set runs endEarly() immediately (gate never opens, body not deferred)', async () => {
   jest.useFakeTimers();
   jest.setSystemTime(T);
   const testRenderer = renderBlocked();
-  announceForAccessibility.mockClear(); // drop the mount announce
+
+  // Spy on the store action: the component-level test asserts the WIRING
+  // (press -> requirePassword -> body), not the store logic (pinned in
+  // store.test.ts's 4.6 matrix).
+  const endEarlySpy = jest.fn().mockResolvedValue({ ok: true });
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ endEarly: endEarlySpy });
+  });
 
   const endEarly = findEndEarly(testRenderer.root);
   expect(endEarly).toBeDefined();
-  ReactTestRenderer.act(() => {
+  await ReactTestRenderer.act(async () => {
     endEarly!.props.onPress();
+    await Promise.resolve();
   });
 
-  // No passwordHash in the seed -> requirePassword ran the action inline.
-  // (Review step-04 (c): user language, no story jargon in VoiceOver copy.)
-  expect(announceForAccessibility).toHaveBeenCalledWith(
-    'End early is not available yet — the session ends automatically at its end time.',
-  );
+  // No passwordHash in the seed -> requirePassword short-circuited and the
+  // action body fired the real store action exactly once.
+  expect(endEarlySpy).toHaveBeenCalledTimes(1);
   expect(useDomainStore.getState().gateOpen).toBe(false);
 });
 
-test('End early with a password set opens the gate; the stashed action announces on verify', () => {
+test('End early with a password set opens the gate; the stashed action fires endEarly() on verify', async () => {
   jest.useFakeTimers();
   jest.setSystemTime(T);
   // A password IS set: requirePassword must open the gate instead of running.
@@ -975,7 +993,11 @@ test('End early with a password set opens the gate; the stashed action announces
     });
   });
   const testRenderer = renderTimer();
-  announceForAccessibility.mockClear(); // drop the mount announce
+
+  const endEarlySpy = jest.fn().mockResolvedValue({ ok: true });
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ endEarly: endEarlySpy });
+  });
 
   const endEarly = findEndEarly(testRenderer.root);
   expect(endEarly).toBeDefined();
@@ -983,27 +1005,23 @@ test('End early with a password set opens the gate; the stashed action announces
     endEarly!.props.onPress();
   });
 
-  // Gate-first: the flip is STASHED, not run (Panic pattern).
+  // Gate-first: the action is STASHED, not run (Panic pattern).
   expect(useDomainStore.getState().gateOpen).toBe(true);
   const action = useDomainStore.getState().gateAction;
   expect(typeof action).toBe('function');
-  expect(announceForAccessibility).not.toHaveBeenCalled();
+  expect(endEarlySpy).not.toHaveBeenCalled();
 
   // Simulate a verified gate exactly as the Shell's runGateAction does.
-  ReactTestRenderer.act(() => {
+  await ReactTestRenderer.act(async () => {
     action!();
+    await Promise.resolve();
     useDomainStore.getState().closeGate();
   });
-  expect(announceForAccessibility).toHaveBeenCalledWith(
-    'End early is not available yet — the session ends automatically at its end time.',
-  );
+  expect(endEarlySpy).toHaveBeenCalledTimes(1);
   expect(useDomainStore.getState().gateOpen).toBe(false);
 });
 
-// Review step-04 (b): End early is WIRING ONLY in 4.3 — even after the gate
-// verifies, NO privileged write may happen (4.6 owns it): the persisted
-// `activeTimer` is untouched and nothing is staged.
-test('End early after a verified gate performs NO config write (activeTimer unchanged, nothing staged)', () => {
+test('End early deny-at-gate (Esc/cancel without a verify): the action never fires and the session is untouched', async () => {
   jest.useFakeTimers();
   jest.setSystemTime(T);
   // A password IS set so the press routes through the gate.
@@ -1018,29 +1036,66 @@ test('End early after a verified gate performs NO config write (activeTimer unch
     });
   });
   const testRenderer = renderTimer();
-  announceForAccessibility.mockClear(); // drop the mount announce
 
-  const activeTimerBefore = useDomainStore.getState().committed.activeTimer;
+  const endEarlySpy = jest.fn().mockResolvedValue({ ok: true });
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ endEarly: endEarlySpy });
+  });
 
-  // Press End early, then verify the gate (the Shell's runGateAction path).
   const endEarly = findEndEarly(testRenderer.root);
-  expect(endEarly).toBeDefined();
   ReactTestRenderer.act(() => {
     endEarly!.props.onPress();
   });
-  const action = useDomainStore.getState().gateAction;
-  expect(typeof action).toBe('function');
+  expect(useDomainStore.getState().gateOpen).toBe(true);
+
+  // The user cancels (Esc / the gate's Cancel -> the Shell calls closeGate).
+  // The stashed action must be discarded WITHOUT running.
   ReactTestRenderer.act(() => {
-    action!();
     useDomainStore.getState().closeGate();
   });
-  expect(useDomainStore.getState().gateOpen).toBe(false);
 
-  // The action body was the announce ONLY — no persisted write, no staged
-  // change, no apply run.
-  expect(useDomainStore.getState().committed.activeTimer).toEqual(
-    activeTimerBefore,
-  );
+  expect(endEarlySpy).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+  // The session is intact — no end, no staged change, no apply run.
+  expect(useDomainStore.getState().committed.activeTimer).toStrictEqual({
+    endEpochMs: T + 25 * 60_000,
+    selectedDomains: ['a.com'],
+  });
   expect(useDomainStore.getState().staged).toBeNull();
   expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+test('End early is guarded while applyStatus is running: a press neither opens the gate nor fires endEarly()', async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  // Live session + an end-early job already in flight (applyStatus
+  // 'running'): the deny path keeps `activeTimer` set, so the button is
+  // still rendered and pressable — the handler must drop the press instead
+  // of queueing a duplicate job (second config write, second admin prompt).
+  seedState({
+    domains: [{ hostname: 'a.com', alwaysOn: false }],
+    applyStatus: 'running',
+    activeTimer: { endEpochMs: T + 25 * 60_000, selectedDomains: ['a.com'] },
+  });
+  const testRenderer = renderTimer();
+
+  const requirePasswordSpy = jest.fn();
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ requirePassword: requirePasswordSpy });
+  });
+  const endEarlySpy = jest.fn().mockResolvedValue({ ok: true });
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({ endEarly: endEarlySpy });
+  });
+
+  const endEarly = findEndEarly(testRenderer.root);
+  ReactTestRenderer.act(() => {
+    endEarly!.props.onPress();
+  });
+
+  // No gate, no stashed action, no queued job — the press was a no-op.
+  expect(requirePasswordSpy).not.toHaveBeenCalled();
+  expect(endEarlySpy).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().gateOpen).toBe(false);
+  expect(useDomainStore.getState().gateAction).toBeNull();
 });

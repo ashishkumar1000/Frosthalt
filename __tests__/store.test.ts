@@ -2681,3 +2681,511 @@ test('the 4.5 trigger stays silent while a LIVE session ticks (false->false upda
 
   resetTimerSlice();
 });
+
+// ===========================================================================
+// Story 4.6 — `endEarly` (the password-gated early escape).
+//
+// The MIRROR of `expireTimer` with the LOOSER guard: only
+// `committed.activeTimer != null` is required — a LIVE session is the
+// target, so there is no expiry check. Covers the I/O matrix: success
+// (config-then-hosts order, always-on-only payload, N count incl. the
+// also-always-on exclusion + the www.-subdomain apex match +
+// singular/plural/zero toast), hosts-deny, hosts-throw (lastResult NOW set —
+// the 4-5 defer), config-write fail, the no-active-session guard,
+// double-fire idempotency, and the queue-behind-Apply re-read.
+// ===========================================================================
+
+/**
+ * Seed a committed config carrying a LIVE (unexpired) focus session — the
+ * expired-session seed's analog with a FUTURE end time (the guard must not
+ * care either way; the future end is what makes this genuinely "end early").
+ */
+function seedLiveSession(opts?: {
+  alwaysOn?: Array<string>;
+  selected?: Array<string>;
+  endEpochMs?: number;
+}): number {
+  const end = opts?.endEpochMs ?? Date.now() + 10 * 60_000;
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'a.com', alwaysOn: true },
+        { hostname: 'b.com', alwaysOn: false },
+        ...(opts?.alwaysOn ?? []).map((hostname) => ({ hostname, alwaysOn: true })),
+      ],
+      activeTimer: {
+        endEpochMs: end,
+        selectedDomains: opts?.selected ?? ['a.com', 'b.com'],
+      },
+    },
+    applyStatus: 'idle',
+  });
+  return end;
+}
+
+test('endEarly success on a LIVE session: writeConfig (activeTimer:null) BEFORE writeHosts, hosts payload = always-on lines only, committed.activeTimer cleared, N toast', async () => {
+  const end = seedLiveSession();
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toEqual({ ok: true });
+  // Strict order: writeConfig fires once BEFORE writeHosts.
+  const writeConfigOrder = configNative.writeConfig.mock.invocationCallOrder[0];
+  const writeHostsOrder = shellNative.writeHosts.mock.invocationCallOrder[0];
+  expect(writeConfigOrder).toBeLessThan(writeHostsOrder);
+  // writeConfig called exactly once with the full config carrying
+  // `activeTimer: null` on top of the committed domains.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.domains).toStrictEqual([
+    { hostname: 'a.com', alwaysOn: true },
+    { hostname: 'b.com', alwaysOn: false },
+  ]);
+  expect(written.activeTimer).toBeNull();
+  // writeHosts called exactly once with the ALWAYS-ON lines only — the
+  // timer-selected `b.com` (alwaysOn:false) lifts, `a.com` stays (always-on).
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
+  // `committed.activeTimer` is cleared in memory (badge/countdown revert).
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  // applyStatus resets to idle; lastResult carries the envelope.
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().lastResult).toEqual({ ok: true });
+  // The success toast: N = 1 (b.com lifts; a.com is always-on, not counted) —
+  // singular form.
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. 1 domain unblocked.',
+    tone: 'info',
+  });
+  // `staged` is untouched by end-early — the staging pipeline is a separate
+  // concern, and a successful end must not disturb it (the deny test below
+  // pins the same invariant).
+  expect(useDomainStore.getState().staged).toBeNull();
+  // Sanity: the seed was genuinely LIVE (a future end) — this really is an
+  // EARLY end, not an expiry.
+  expect(end).toBeGreaterThan(Date.now());
+});
+
+test('endEarly N count excludes always-on domains (plural) and the toast uses the plural form', async () => {
+  // Selected: b.com + c.com (both non-always-on, so both lift -> N = 2);
+  // a.com is always-on but NOT selected, so it contributes nothing to N.
+  seedLiveSession({ alwaysOn: [], selected: ['b.com', 'c.com'] });
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toEqual({ ok: true });
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. 2 domains unblocked.',
+    tone: 'info',
+  });
+  // Both lifted domains are gone from the hosts payload; a.com stays.
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
+});
+
+test('endEarly with every selected domain also always-on: payload still the always-on lines (unchanged content), N = 0 -> bare "Session ended."', async () => {
+  // `b.com` is in the session selection AND alwaysOn. It remains blocked and
+  // contributes 0 to N — the whole N count.
+  seedLiveSession({ selected: ['b.com'], alwaysOn: ['b.com'] });
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toEqual({ ok: true });
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.activeTimer).toBeNull();
+  // `alwaysOn` is NOT touched — the domain entry survives untouched.
+  expect(written.domains).toContainEqual({ hostname: 'b.com', alwaysOn: true });
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  // Both always-on domains stay blocked after the session lifts.
+  expect(distinctApexes).toStrictEqual(
+    new Set(['a.com', 'www.a.com', 'b.com', 'www.b.com']),
+  );
+  // N = 0 -> the bare copy (no "0 domains" grammar).
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended.',
+    tone: 'info',
+  });
+});
+
+test('endEarly N count matches at normaliseDomain level: a selected www.-subdomain vs an always-on apex is still-blocked and not counted', async () => {
+  // The selected entry is a SUBDOMAIN of the always-on apex. The
+  // `normaliseDomain`-level comparison (the same one `effectiveBlocklist`
+  // dedupes by) must count it as still-blocked: N = 0, and the hosts payload
+  // keeps twitter.com.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'twitter.com', alwaysOn: true }],
+      activeTimer: {
+        endEpochMs: Date.now() + 10 * 60_000,
+        selectedDomains: ['www.twitter.com'],
+      },
+    },
+    applyStatus: 'idle',
+  });
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toEqual({ ok: true });
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  expect(distinctApexes).toStrictEqual(
+    new Set(['twitter.com', 'www.twitter.com']),
+  );
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended.',
+    tone: 'info',
+  });
+});
+
+test('endEarly hosts-deny: committed.activeTimer stays INTACT, applyStatus resets to idle, error toast', async () => {
+  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  const end = seedLiveSession();
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toStrictEqual({ ok: false, error: 'admin-denied' });
+  // writeConfig ran (carrying the activeTimer:null write — accepted drift).
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  // `committed.activeTimer` INTACT in memory (the over-blocking mirror;
+  // retry-safe — retry = a new session, or relaunch via 4.7 re-arm).
+  expect(useDomainStore.getState().committed.activeTimer).toStrictEqual({
+    endEpochMs: end,
+    selectedDomains: ['a.com', 'b.com'],
+  });
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().lastResult).toStrictEqual({
+    ok: false,
+    error: 'admin-denied',
+  });
+  // The failure toast (error tone) — the shared hosts-failure copy.
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: "Couldn't update /etc/hosts. No changes made.",
+    tone: 'error',
+  });
+});
+
+test('endEarly hosts-throw: returns a hosts-throw envelope, keeps activeTimer intact, resets applyStatus, sets lastResult (4-5 defer closed), error toast', async () => {
+  // The same shellRunner-namespace spy the expireTimer throw test uses —
+  // the native mock's rejection would be converted to an envelope by the
+  // port, but the store's DEFENSIVE try/catch must be exercised directly.
+  const spy = jest
+    .spyOn(shellRunner, 'writeHosts')
+    .mockRejectedValue(new Error('osascript exploded'));
+  try {
+    seedLiveSession();
+
+    const result = await useDomainStore.getState().endEarly();
+
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toContain('hosts-throw:');
+    // applyStatus NOT left running; committed.activeTimer INTACT; toast error.
+    expect(useDomainStore.getState().applyStatus).toBe('idle');
+    expect(useDomainStore.getState().committed.activeTimer).not.toBeNull();
+    expect(useDomainStore.getState().toast).toStrictEqual({
+      message: "Couldn't update /etc/hosts. No changes made.",
+      tone: 'error',
+    });
+    // The 4-5 defer closed: lastResult carries the throw envelope, matching
+    // what the deny branch already sets.
+    expect(useDomainStore.getState().lastResult!.ok).toBe(false);
+    expect(String(useDomainStore.getState().lastResult!.error)).toContain(
+      'hosts-throw:',
+    );
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test('endEarly config-write failure: short-circuits BEFORE elevation — no writeHosts, applyStatus untouched, committed unchanged, NO toast', async () => {
+  configNative.writeConfig.mockReturnValue({ ok: false, error: 'disk-full' });
+  const end = seedLiveSession();
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toStrictEqual({ ok: false, error: 'config-write:disk-full' });
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  // Strict order: a config-write fail short-circuits before the elevation.
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().committed.activeTimer).toStrictEqual({
+    endEpochMs: end,
+    selectedDomains: ['a.com', 'b.com'],
+  });
+  // NO toast on a config-write failure.
+  expect(useDomainStore.getState().toast).toBeNull();
+});
+
+test('endEarly no-active-session guard: null activeTimer -> no-active-session, zero ports, no toast (idempotent)', async () => {
+  useDomainStore.setState({ committed: DEFAULT_CONFIG, applyStatus: 'idle' });
+
+  const r1 = await useDomainStore.getState().endEarly();
+
+  expect(r1).toStrictEqual({ ok: false, error: 'no-active-session' });
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().toast).toBeNull();
+});
+
+test('endEarly double-fire idempotency: the 2nd call after a successful end no-ops with no-active-session', async () => {
+  seedLiveSession();
+
+  const r1 = await useDomainStore.getState().endEarly();
+  expect(r1).toEqual({ ok: true });
+  const r2 = await useDomainStore.getState().endEarly();
+
+  expect(r2).toStrictEqual({ ok: false, error: 'no-active-session' });
+  // Exactly ONE writeConfig + ONE writeHosts across both calls.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  // The success toast is still the ONE toast (not replaced by a failure).
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. 1 domain unblocked.',
+    tone: 'info',
+  });
+});
+
+test('endEarly queued behind an in-flight Apply: re-reads committed at queue time (hosts payload includes the Apply\'s just-committed domain)', async () => {
+  useDomainStore.setState({
+    committed: DEFAULT_CONFIG,
+    staged: null,
+    applyStatus: 'idle',
+  });
+  const pendingResolvers: Array<(v: WriteResult) => void> = [];
+  shellNative.writeHosts.mockImplementation(
+    () =>
+      new Promise<WriteResult>((res) => {
+        pendingResolvers.push(res);
+      }),
+  );
+
+  // Start an Apply committing `example.com` as alwaysOn.
+  useDomainStore.getState().stageDomainAdd('example.com');
+  const applyP = useDomainStore.getState().apply();
+  await flushMicrotasks();
+  expect(pendingResolvers).toHaveLength(1); // the Apply's writeHosts
+
+  // While the Apply is in flight, endEarly queues behind it.
+  seedLiveSession();
+  const endEarlyP = useDomainStore.getState().endEarly();
+  await flushMicrotasks();
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1); // Apply's only
+  expect(pendingResolvers).toHaveLength(1);
+
+  // Release the Apply: it commits `example.com` to `committed` FIRST; the
+  // end-early job then acquires the queue, reads the run-time `committed`
+  // (now carrying `example.com` + the live activeTimer) and builds its
+  // payload from THAT — not from the pre-Apply snapshot.
+  pendingResolvers.shift()!({ ok: true });
+  await flushMicrotasks();
+  // The end-early job's own writeHosts is the new pending entry — release it.
+  expect(pendingResolvers).toHaveLength(1);
+  pendingResolvers.shift()!({ ok: true });
+  const [applyRes, endEarlyRes] = await Promise.all([applyP, endEarlyP]);
+
+  expect(applyRes).toStrictEqual({ ok: true });
+  expect(endEarlyRes).toEqual({ ok: true });
+  // Two writeConfig calls (the Apply's, then end-early's). The end-early's
+  // preserves the Apply's just-committed domain and carries activeTimer:null.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(2);
+  const endEarlyWritten = JSON.parse(configNative.writeConfig.mock.calls[1][0]);
+  expect(endEarlyWritten.domains).toContainEqual({
+    hostname: 'example.com',
+    alwaysOn: true,
+  });
+  expect(endEarlyWritten.activeTimer).toBeNull();
+  // The end-early hosts payload = the ALWAYS-ON lines of the post-Apply
+  // committed: `example.com` (the Apply's just-committed alwaysOn domain).
+  // A stale pre-Apply snapshot would have produced the seed's `a.com`
+  // payload instead — the re-read is the whole point of this test.
+  const hostsLines = shellNative.writeHosts.mock.calls[1][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  expect(distinctApexes).toStrictEqual(
+    new Set(['example.com', 'www.example.com']),
+  );
+  // The live session is cleared.
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+});
+
+test('endEarly queue-behind-Expiry re-read is authoritative: an expiry job queued AHEAD clears the session and end-early no-ops with no-active-session', async () => {
+  // The session is BOTH live-by-selection and already past its end, so both
+  // actions are eligible. The expiry queues first and its writeHosts is held
+  // pending; end-early queues BEHIND it. When the expiry settles, the
+  // end-early job acquires the queue, re-reads `committed` and must see
+  // `activeTimer == null` — no second write, no second toast.
+  seedLiveSession({ endEpochMs: Date.now() - 1_000 });
+  const pendingResolvers: Array<(v: WriteResult) => void> = [];
+  shellNative.writeHosts.mockImplementation(
+    () =>
+      new Promise<WriteResult>((res) => {
+        pendingResolvers.push(res);
+      }),
+  );
+
+  const expireP = useDomainStore.getState().expireTimer();
+  await flushMicrotasks();
+  expect(pendingResolvers).toHaveLength(1); // the expiry's writeHosts
+
+  // Queue end-early behind the in-flight expiry.
+  const endEarlyP = useDomainStore.getState().endEarly();
+  await flushMicrotasks();
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1); // expiry's only
+  expect(pendingResolvers).toHaveLength(1);
+
+  // Release the expiry; then drain the end-early job (which must no-op
+  // WITHOUT reaching writeHosts).
+  pendingResolvers.shift()!({ ok: true });
+  const [expireRes, endEarlyRes] = await Promise.all([expireP, endEarlyP]);
+
+  expect(expireRes).toEqual({ ok: true });
+  expect(endEarlyRes).toStrictEqual({ ok: false, error: 'no-active-session' });
+  // Only the expiry's writeConfig + writeHosts ever ran.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  // The toast is still the expiry's ONE success toast.
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. Domains unblocked.',
+    tone: 'info',
+  });
+});
+
+test('endEarly N count dedupes by apex: selected ["b.com", "www.b.com"] lifts ONE domain -> singular toast', async () => {
+  // Two raw entries normalising to the same apex count once — the toast must
+  // not double-report a single lifted domain.
+  seedLiveSession({ selected: ['b.com', 'www.b.com'] });
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toEqual({ ok: true });
+  // N = 1 (both entries collapse to the b.com apex; a.com is always-on) —
+  // singular form, not "2 domains".
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. 1 domain unblocked.',
+    tone: 'info',
+  });
+  // The hosts payload is still correct: the whole b.com apex lifted (both
+  // entries map to the same apex), only the always-on a.com lines remain.
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
+});
+
+test('endEarly with an EMPTY selectedDomains on a live session: zero branch -> bare "Session ended."', async () => {
+  seedLiveSession({ selected: [] });
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toEqual({ ok: true });
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended.',
+    tone: 'info',
+  });
+  // The hosts payload still rewrites to the always-on lines (a full clear of
+  // the timer-selected block — of which there were none).
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
+});
+
+test('endEarly fires on an EXPIRED-but-uncleared session: the guard checks PRESENCE only, not expiry', async () => {
+  // The end time is in the past but the expiry trigger has not run yet, so
+  // `activeTimer` is still set. The looser guard (vs expireTimer's
+  // Date.now/finiteness checks) must let end-early through and clear it.
+  seedLiveSession({ endEpochMs: Date.now() - 1_000 });
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toEqual({ ok: true });
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(JSON.parse(configNative.writeConfig.mock.calls[0][0]).activeTimer).toBeNull();
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. 1 domain unblocked.',
+    tone: 'info',
+  });
+});
+
+test('endEarly tolerates a malformed (NaN) endEpochMs: a NaN end does NOT block the write', async () => {
+  // end-early is not a guard of timer health (that is expireTimer's job) — a
+  // corrupted endEpochMs must still let the user end the session.
+  seedLiveSession({ endEpochMs: NaN });
+
+  const result = await useDomainStore.getState().endEarly();
+
+  expect(result).toEqual({ ok: true });
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. 1 domain unblocked.',
+    tone: 'info',
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 4.6 — the 4-5 defer closed: the OTHER two hosts-throw catches now set
+// `lastResult` too. (`endEarly`'s throw catch is pinned in its own test
+// above; these cover `stageStartTimer` (4.2) and re-pin `expireTimer`.)
+// ---------------------------------------------------------------------------
+
+test('stageStartTimer hosts-throw: lastResult now carries the throw envelope (4-5 defer closed for the Start path)', async () => {
+  const spy = jest
+    .spyOn(shellRunner, 'writeHosts')
+    .mockRejectedValue(new Error('osascript exploded'));
+  try {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [{ hostname: 'a.com', alwaysOn: true }],
+      },
+      staged: null,
+      applyStatus: 'idle',
+    });
+
+    const result = await useDomainStore
+      .getState()
+      .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['a.com']) });
+
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toContain('hosts-throw:');
+    // applyStatus NOT left running; committed.activeTimer NOT advanced.
+    expect(useDomainStore.getState().applyStatus).toBe('idle');
+    expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+    // The 4-5 defer: the throw envelope lands in `lastResult`, matching the
+    // deny branch.
+    expect(useDomainStore.getState().lastResult!.ok).toBe(false);
+    expect(String(useDomainStore.getState().lastResult!.error)).toContain(
+      'hosts-throw:',
+    );
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test('expireTimer hosts-throw also sets lastResult (4-5 defer re-pinned)', async () => {
+  const spy = jest
+    .spyOn(shellRunner, 'writeHosts')
+    .mockRejectedValue(new Error('osascript exploded'));
+  try {
+    seedExpiredSession();
+
+    await useDomainStore.getState().expireTimer();
+
+    expect(useDomainStore.getState().applyStatus).toBe('idle');
+    expect(useDomainStore.getState().lastResult!.ok).toBe(false);
+    expect(String(useDomainStore.getState().lastResult!.error)).toContain(
+      'hosts-throw:',
+    );
+  } finally {
+    spy.mockRestore();
+  }
+});
