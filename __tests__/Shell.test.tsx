@@ -73,6 +73,7 @@ import { AccessibilityInfo } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { Shell } from '../src/components/Shell';
 import { useDomainStore } from '../src/domain/store';
+import { useTimerStore } from '../src/domain/timerStore';
 import { DEFAULT_CONFIG } from '../src/config/types';
 import { hashPassword } from '../src/config/password';
 import type { Domain } from '../src/config/types';
@@ -119,6 +120,11 @@ afterEach(() => {
     });
     currentRenderer = null;
   }
+  // Story 4.4 — the timer tests spy on `setInterval` with jest.spyOn, which
+  // survives the unmount (spies are not torn down by the renderer). Restore
+  // every spy here so a leaked spy can never change a later test's timer
+  // behaviour (correctness must not depend on test ordering).
+  jest.restoreAllMocks();
   // Story 2.5 — the domain count + nav announce read `committed`, so a leaked
   // seed from a test that fails before its inline restore would silently flip
   // later tests' count assertions (the old nav tests assert "0 domains", which
@@ -137,6 +143,16 @@ afterEach(() => {
       gateThrottleUntil: null,
     });
   });
+  // Story 4.4 — the status header now subscribes to the scoped timer slice,
+  // so a live-session test can leave a per-second driver (or a stale
+  // `endEpochMs`) behind. Force the refcount back to 0 and wipe the slice so
+  // no driver leaks into a later test. Extra stops are no-ops.
+  useTimerStore.getState().stop();
+  useTimerStore.getState().stop();
+  useTimerStore.setState({ nowMs: 0, endEpochMs: null, totalMs: null });
+  if (jest.isMockFunction(setTimeout)) {
+    jest.useRealTimers();
+  }
 });
 
 function renderShell() {
@@ -1766,4 +1782,67 @@ test('Shell-level e2e: Panic success toast "Re-enable your blocklist" navigates 
   );
   expect(rows[0].props.accessibilityState?.selected).toBe(true);
   expect(selectedRowCount(rows)).toBe(1);
+});
+
+// ===========================================================================
+// Story 4.4 — status header countdown integration: with a LIVE
+// `committed.activeTimer` the header (always mounted, above every surface)
+// shows the `Blocked` badge + a tabular `mm:ss` countdown derived from the
+// scoped `useTimerStore` slice — while the static "no active timer"
+// placeholder is gone. The existing no-session assertions at the Story 2.5
+// header tests above stay untouched and green (the no-session form is
+// preserved byte-for-byte).
+// ===========================================================================
+
+test('the status header shows the Blocked badge and a live mm:ss countdown while a session runs', async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(1_756_000_000_000);
+  const setIntervalSpy = jest.spyOn(globalThis, 'setInterval');
+
+  // Seed a live 5-minute session (2 always-on domains -> effective count 2).
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'a.com', alwaysOn: true },
+          { hostname: 'b.com', alwaysOn: true },
+        ],
+        activeTimer: {
+          endEpochMs: 1_756_000_000_000 + 5 * 60_000,
+          selectedDomains: ['a.com'],
+        },
+      },
+    });
+  });
+
+  const testRenderer = renderShell();
+  const text = extractText(testRenderer.toJSON());
+
+  // The header row: the Blocked BADGE ELEMENT (StatusBadge's accessibility
+  // label — asserting the element, not just the word "Blocked" in the text
+  // soup), the effective count, the live countdown — and the placeholder gone.
+  const badgeByLabel = (label: string) =>
+    testRenderer.root.findAll(
+      (node) => node.props && node.props.accessibilityLabel === label,
+    );
+  expect(badgeByLabel('Status: Blocked').length).toBeGreaterThanOrEqual(1);
+  expect(badgeByLabel('Status: Free')).toHaveLength(0);
+  expect(text).toContain('2 domains');
+  expect(text).not.toContain('no active timer');
+  // Exactly 5 minutes remaining at the seeded clock -> "05:00".
+  expect(text).toContain('05:00');
+
+  // The header owns the slice lifecycle: exactly ONE driver, mirroring the
+  // session end — and it ticks with the header mounted on surface 0.
+  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+  expect(useTimerStore.getState().endEpochMs).toBe(
+    1_756_000_000_000 + 5 * 60_000,
+  );
+
+  // One fake tick -> the header's countdown decrements (still on Blocklist).
+  ReactTestRenderer.act(() => {
+    jest.advanceTimersByTime(1000);
+  });
+  expect(extractText(testRenderer.toJSON())).toContain('04:59');
 });

@@ -23,9 +23,9 @@
  * line. The countdown value comes from the SCOPED `useTimerStore` slice
  * (`src/domain/timerStore.ts`) via the selector-scoped
  * `selectRemainingMs` subscription — unrelated surfaces never re-render on
- * a tick. The slice lifecycle is owned here for 4.3: `start(endEpochMs)` on
- * a live `activeTimer`, `stop()` on cleanup (the slice's internal refcount
- * lets 4.4 / 6.2 keep it alive across surface navigation later).
+ * a tick. Since 4.4 this surface is a CO-SUBSCRIBER, not the lifecycle
+ * owner: the status header (always mounted on every surface) owns the slice
+ * lifecycle, so the driver keeps counting after this surface unmounts.
  *
  * End early is WIRED, not implemented (4.6 owns the privileged write): the
  * button calls `requirePassword` — the same Epic 3 gate Panic and
@@ -70,7 +70,8 @@ import { useDomainStore } from '../domain/store';
 import {
   useTimerStore,
   selectRemainingMs,
-  type TimerState,
+  selectProgress,
+  formatMmSs,
 } from '../domain/timerStore';
 import { tokens } from '../theme/tokens';
 import { ApplyButton } from './ApplyButton';
@@ -161,23 +162,16 @@ export interface TimerProps {
 }
 
 /**
- * The ring's progress, derived INSIDE the slice selector so stroke + numeral
- * derive from the exact same `nowMs` / `endEpochMs` pair and can never
- * desync. DURING A LIVE SESSION both derived numbers change every tick, so
- * the Blocked subtree re-renders once per second — that is by design (the
- * numeral and the ring arc must move). What the SCOPING buys is isolation:
- * the Blocklist / Settings / Schedule / Sidebar trees never touch this
- * store, so a tick re-renders ONLY this surface's Blocked path.
- * `progress = 1 - remaining/total`: 1 = just started, 0 = empty/expired.
+ * The ring's progress + the mm:ss numeral now come from the SHARED slice
+ * exports (`selectProgress` / `formatMmSs`, `timerStore.ts`) — Story 4.4
+ * moved the local math there so the Timer surface, the status header and the
+ * menu bar (6.2) all derive from ONE source and can never desync. DURING A
+ * LIVE SESSION both derived numbers change every tick, so the Blocked
+ * subtree re-renders once per second — that is by design (the numeral and
+ * the ring arc must move). What the SCOPING buys is isolation: the
+ * Blocklist / Settings / Schedule / Sidebar trees never touch this store, so
+ * a tick re-renders ONLY this surface's Blocked path (and the 4.4 header).
  */
-const selectProgress = (s: TimerState): number => {
-  const total = s.totalMs ?? 0;
-  if (total <= 0) {
-    return 0;
-  }
-  return Math.min(1, Math.max(0, 1 - selectRemainingMs(s) / total));
-};
-
 export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
   // ----- Store reads -----
   const committed = useDomainStore((s) => s.committed);
@@ -204,13 +198,11 @@ export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
   const hasActiveTimer = committed.activeTimer != null && activeEndEpochMs != null;
 
   // ----- Countdown derivation (mm:ss + locked-until) -----
-  // Zero-padded, tabular numerals (tokens.typography.countdown) so the digit
-  // width never jitters across the countdown.
+  // The numeral is the shared slice formatter (zero-padded, tabular numerals
+  // via the style token — the digit width never jitters). `remainingSec` is
+  // kept for the per-minute rollover announce bucket below.
   const remainingSec = Math.floor(remainingMs / 1000);
-  const mm = Math.floor(remainingSec / 60)
-    .toString()
-    .padStart(2, '0');
-  const ss = (remainingSec % 60).toString().padStart(2, '0');
+  const countdownText = formatMmSs(remainingMs);
   const lockedUntil =
     activeEndEpochMs != null ? lockedUntilLabel(activeEndEpochMs) : null;
   // The pick list always reads `committed.domains` (per spec: "renders
@@ -309,12 +301,13 @@ export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
     selectedCount > 0 &&
     !running;
 
-  // ----- Slice lifecycle (Story 4.3) -----
-  // The Timer surface is the slice's FIRST subscriber: `start(endEpochMs)`
-  // when a session is mirrored, `stop()` on cleanup. The slice's internal
-  // refcount makes this safe for the future co-subscribers (4.4 status
-  // header, 6.2 menu bar); for 4.3 alone the slice parks when this surface
-  // unmounts (the ring pauses across surface navigation). Keyed on the
+  // ----- Slice lifecycle (Story 4.3; co-subscriber since 4.4) -----
+  // The Timer surface acquires a subscriber slot: `start(endEpochMs)` when a
+  // session is mirrored, `stop()` on cleanup. The slice's internal refcount
+  // makes this safe for co-subscribers (the 4.4 status header — the
+  // always-mounted lifecycle OWNER — and 6.2's menu bar): unmounting this
+  // surface drops the refcount (2 -> 1) and the header keeps counting; the
+  // slice parks only when the LAST subscriber leaves. Keyed on the
   // mirrored `endEpochMs` so a superseding session re-arms the driver.
   // useLayoutEffect (review step-04): a plain useEffect runs AFTER first
   // paint, so every Blocked mount would flash 00:00 / an empty ring for one
@@ -523,7 +516,7 @@ export function Timer({ onOpenBlocklist }: TimerProps): React.ReactElement {
             // Per-minute rollover cue (UX-DR17); per-second ticks are silent.
             accessibilityLiveRegion="polite"
           >
-            {mm}:{ss}
+            {countdownText}
           </Text>
         </View>
         <Text style={styles.subtitle}>{lockedUntil}</Text>

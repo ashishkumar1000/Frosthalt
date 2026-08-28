@@ -28,6 +28,8 @@
 import {
   useTimerStore,
   selectRemainingMs,
+  selectProgress,
+  formatMmSs,
   type TimerState,
 } from '../src/domain/timerStore';
 
@@ -252,4 +254,77 @@ test('selectRemainingMs clamps at 0 and reads 0 when no session is mirrored', ()
   expect(
     selectRemainingMs({ nowMs: T0, endEpochMs: T0 + 1500 } as TimerState),
   ).toBe(1500);
+});
+// ===========================================================================
+// Story 4.4 — the SHARED derivation helpers moved to the slice so every
+// countdown consumer (Timer surface, status header, later the menu bar)
+// reads ONE source. Pure-function unit tests: no rendering, no driver —
+// `formatMmSs` is a pure function; `selectProgress` is seeded through
+// `useTimerStore.setState` (the slice reset in afterEach restores a clean
+// state after each).
+// ===========================================================================
+
+describe('formatMmSs (shared mm:ss formatter)', () => {
+  test('formats a 5-minute remaining as 05:00', () => {
+    expect(formatMmSs(300_000)).toBe('05:00');
+  });
+
+  test('does NOT cap minutes at two digits (a 24 h session renders 1440:00)', () => {
+    expect(formatMmSs(86_400_000)).toBe('1440:00');
+  });
+
+  test('clamps a negative remaining to 00:00 (never a negative numeral)', () => {
+    expect(formatMmSs(-1)).toBe('00:00');
+  });
+
+  test('renders a non-finite (NaN) input as 00:00 — never NaN:NaN', () => {
+    expect(formatMmSs(Number.NaN)).toBe('00:00');
+  });
+
+  test('renders a non-finite (Infinity) input as 00:00', () => {
+    expect(formatMmSs(Infinity)).toBe('00:00');
+  });
+});
+
+describe('selectProgress (shared ring progress)', () => {
+  test('reads 0 when no session is mirrored (totalMs null)', () => {
+    useTimerStore.setState({ nowMs: T0, endEpochMs: null, totalMs: null });
+    expect(selectProgress(useTimerStore.getState() as TimerState)).toBe(0);
+  });
+
+  test('reads 0 when totalMs is 0 (the expired park)', () => {
+    useTimerStore.setState({
+      nowMs: T0,
+      endEpochMs: T0,
+      totalMs: 0,
+    });
+    expect(selectProgress(useTimerStore.getState() as TimerState)).toBe(0);
+  });
+
+  test('derives the elapsed fraction (25s elapsed of a 100s session -> 0.25)', () => {
+    useTimerStore.setState({
+      nowMs: T0 + 25_000,
+      endEpochMs: T0 + 100_000,
+      totalMs: 100_000,
+    });
+    expect(selectProgress(useTimerStore.getState() as TimerState)).toBe(0.25);
+  });
+
+  test('clamps to 0 when remaining exceeds total (a drifted nowMs)', () => {
+    useTimerStore.setState({
+      nowMs: T0, // remaining = 100_000 > totalMs 60_000
+      endEpochMs: T0 + 100_000,
+      totalMs: 60_000,
+    });
+    expect(selectProgress(useTimerStore.getState() as TimerState)).toBe(0);
+  });
+
+  test('clamps to 1 when remaining is negative (nowMs beyond endEpochMs)', () => {
+    useTimerStore.setState({
+      nowMs: T0 + 120_000, // 60s past the end
+      endEpochMs: T0 + 60_000,
+      totalMs: 60_000,
+    });
+    expect(selectProgress(useTimerStore.getState() as TimerState)).toBe(1);
+  });
 });

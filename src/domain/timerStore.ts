@@ -73,6 +73,47 @@ export interface TimerState {
 export const selectRemainingMs = (s: TimerState): number =>
   Math.max(0, (s.endEpochMs ?? 0) - s.nowMs);
 
+/**
+ * The ring's progress fraction, `0..1` (`1 - remaining/total`): 1 = just
+ * started (full ring), 0 = empty/expired. Derived INSIDE the slice so stroke
+ * + numeral + ring stay single-derivation (the 4.3 design note) — every
+ * countdown consumer (Timer surface 4.3, status header 4.4, menu bar 6.2)
+ * reads the exact same pair and can never desync.
+ *
+ * `total <= 0` (no session mirrored / expired park) reads 0 — an empty ring,
+ * never a NaN or a negative dash. The result is clamped defensively so a
+ * drifted value never over- or under-draws the dash.
+ */
+export const selectProgress = (s: TimerState): number => {
+  const total = s.totalMs ?? 0;
+  if (total <= 0) {
+    return 0;
+  }
+  return Math.min(1, Math.max(0, 1 - selectRemainingMs(s) / total));
+};
+
+/**
+ * The shared zero-padded `mm:ss` formatter (Story 4.4 moved Timer.tsx's
+ * inline math here so the numeral is single-derivation too). Minutes are NOT
+ * capped at two digits: a 24 h session renders `1440:00` — the same string
+ * the Timer surface numeral has always shown (frozen-spec-conformant). The
+ * input is clamped at 0 so a negative remaining (defensive) renders `00:00`,
+ * never a negative numeral; a NON-FINITE input (NaN / Infinity — unreachable
+ * through the current consumers, but this is the shared derivation source)
+ * also renders `00:00`, never `NaN:NaN`.
+ */
+export const formatMmSs = (remainingMs: number): string => {
+  if (!Number.isFinite(remainingMs)) {
+    return '00:00';
+  }
+  const remainingSec = Math.max(0, Math.floor(remainingMs / 1000));
+  const mm = Math.floor(remainingSec / 60)
+    .toString()
+    .padStart(2, '0');
+  const ss = (remainingSec % 60).toString().padStart(2, '0');
+  return `${mm}:${ss}`;
+};
+
 // ----- Module-level driver state (NOT reactive — the interval handle and the
 // subscriber refcount are implementation details; putting them in the store
 // would make every tick a state churn for no consumer benefit). -----
