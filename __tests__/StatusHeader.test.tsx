@@ -318,10 +318,30 @@ test('a malformed (string) endEpochMs renders the no-session form too', () => {
 // I/O Matrix: expired at mount — Blocked + 00:00 + empty ring, no tick loop
 // ---------------------------------------------------------------------------
 
-test('an expired-at-mount session renders Blocked + 00:00 with an empty ring and parks the slice (no tick loop)', () => {
+test('an expired-at-mount session renders Blocked + 00:00 with an empty ring, parks the slice (no tick loop), and fires the 4.5 expiry trigger through the real mount path', async () => {
   jest.useFakeTimers();
   jest.setSystemTime(T);
   const setIntervalSpy = jest.spyOn(globalThis, 'setInterval');
+  // Story 4.5 — seed BOTH ports to succeed so the module-level expiry
+  // trigger (park -> expireTimer) can run its full config-then-hosts path
+  // through the header's real start() -> immediate-park hop.
+  // NOTE: this file declares `require` locally as `(id: string) => unknown`
+  // (the RN tsconfig ships no @types/node), so cast the require RESULT, then
+  // take `.default` — the same mocks Shell.test.tsx seeds for its e2e.
+  const configNative = (
+    require('../src/native/specs/NativeConfigStoreSpec') as {
+      default: { writeConfig: jest.Mock };
+    }
+  ).default;
+  const shellNative = (
+    require('../src/native/specs/NativeShellRunnerSpec') as {
+      default: { writeHosts: jest.Mock };
+    }
+  ).default;
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+  configNative.writeConfig.mockReturnValue({ ok: true });
+  shellNative.writeHosts.mockResolvedValue({ ok: true });
   seedState({
     domains: [{ hostname: 'a.com', alwaysOn: true }],
     activeTimer: {
@@ -353,6 +373,26 @@ test('an expired-at-mount session renders Blocked + 00:00 with an empty ring and
   expect(
     extractText(findNumeral(testRenderer.root)!.props.children),
   ).toBe('00:00');
+
+  // Story 4.5 — the park fires the store's module-level expiry trigger
+  // through the header's REAL start() mount path (the hop 4.7's re-arm
+  // builds on). Drain the microtask chain so the enqueued expireTimer run
+  // settles, then assert it ran: config written with `activeTimer: null`,
+  // `committed.activeTimer` cleared, and the header reverted to the Epic-2
+  // Free form (numeral gone).
+  await ReactTestRenderer.act(async () => {
+    for (let i = 0; i < 8; i++) {
+      await Promise.resolve();
+    }
+  });
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.activeTimer).toBeNull();
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  const postText = extractText(testRenderer.toJSON());
+  expect(postText).toContain('no active timer');
+  expect(postText).not.toContain('Blocked');
+  expect(findNumeral(testRenderer.root)).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------
@@ -708,7 +748,7 @@ type NodePath = {
   sep: string;
 };
 
-test('only the header, the Timer surface and the slice itself reference useTimerStore in src/', () => {
+test('only the header, the Timer surface, the slice itself and the 4.5 expiry trigger in store.ts reference useTimerStore in src/', () => {
   const fs = require('fs') as NodeFs;
   const path = require('path') as NodePath;
   // Walk src/ recursively, collecting every .ts/.tsx file that mentions
@@ -734,13 +774,21 @@ test('only the header, the Timer surface and the slice itself reference useTimer
   };
   walk(srcDir);
 
-  // The exact allowlist: the status header (4.4), the Timer surface (4.3)
-  // and the slice's own definition. Story 6.2's menu bar will JOIN this
-  // allowlist when it subscribes — updating the list should be a conscious
-  // act, not a silent widening of the tick's blast radius.
+  // The exact allowlist: the status header (4.4), the Timer surface (4.3),
+  // the slice's own definition — and, since Story 4.5, the domain store,
+  // whose module-level expiry trigger subscribes to the slice's expired-park
+  // transition (`store.ts`'s `useTimerStore.subscribe` — a ONE-WAY
+  // store -> timerStore import, no cycle). The store subscription reads the
+  // slice's STATE TRANSITION, never `nowMs` per tick, so the tick's re-render
+  // blast radius is unchanged; the allowlist entry is a conscious widening
+  // (the spec's Design Notes: "Why the trigger lives in store.ts (not a
+  // component)"). Story 6.2's menu bar will JOIN this allowlist when it
+  // subscribes — updating the list should be a conscious act, not a silent
+  // widening of the tick's blast radius.
   expect(found.sort()).toEqual([
     'src/components/StatusHeader.tsx',
     'src/components/Timer.tsx',
+    'src/domain/store.ts',
     'src/domain/timerStore.ts',
   ]);
 });

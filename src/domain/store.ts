@@ -54,6 +54,9 @@
  *     `restoreSection`'s hosts-write + `applyStatus` flip. Hosts-deny
  *     leaves `committed.activeTimer` null (retry-safe). Does NOT touch
  *     `staged` — Start is its own atomic config write.
+ *   - `expireTimer()` (Story 4.5) — the auto-unblock on expiry: the MIRROR of
+ *     `stageStartTimer`'s body with `activeTimer: null`. See its JSDoc below;
+ *     Stories 4.6 (end-early) and 4.7 (launch re-arm) call it directly.
  *
  * Serialization: a single in-flight Promise + a micro-queue of pending
  * `apply()` intents; the queue drains one-at-a-time, never in parallel. This
@@ -74,8 +77,30 @@ import { computeDrift } from './drift';
 import type { DriftResult } from './drift';
 import { readHostsSection, writeHosts } from '../hosts/shellRunner';
 import type { WriteResult } from '../hosts/shellRunner';
+import { useTimerStore } from './timerStore';
 
 export type ApplyStatus = 'idle' | 'running';
+
+/**
+ * The failure toast copy (Story 4.5) — shared by BOTH expireTimer failure
+ * branches (hosts deny + the defensive hosts-throw catch). Kept as a module
+ * constant so the copy exists in exactly one place in this file. Panic's own
+ * success toast copy in Panic.tsx is a SEPARATE, component-local string and
+ * is deliberately not touched by this.
+ */
+const HOSTS_FAILURE_TOAST = "Couldn't update /etc/hosts. No changes made.";
+
+/**
+ * A runtime-only toast message (Story 4.5). NOT persisted to `config.json` and
+ * NOT in `Config`/`types.ts` — the same precedent as Story 3.2's gate state
+ * (runtime-only, resets on relaunch). `tone` selects the colour: `'info'` is
+ * the neutral success copy, `'error'` is the destructive-coloured failure
+ * copy. `null` when no toast is showing.
+ */
+export interface ToastState {
+  message: string;
+  tone: 'info' | 'error';
+}
 
 /**
  * The result of `verifyPassword` (Story 3.2). On success only `ok` is set;
@@ -196,6 +221,66 @@ export interface DomainState {
     selected: Set<string>;
   }) => Promise<WriteResult>;
   /**
+   * Auto-unblock on expiry (Story 4.5) — the MIRROR of `stageStartTimer`'s
+   * body (the `stageStartTimer: ({ durationMs, selected })` action below) with
+   * `activeTimer: null`. Runs through the SAME
+   * shared `enqueue` chain as every other privileged write (the spec's Always
+   * clause: no parallel hosts-write path, no `runApply` reuse — `runApply`
+   * never writes `activeTimer`).
+   *
+   * Queue-time guard (the spec's Always clause — the effective blocklist is
+   * computed AT QUEUE TIME, never from a tick-time snapshot): the job re-reads
+   * `committed` when it acquires the queue and only proceeds when
+   * `committed.activeTimer != null && Number.isFinite(endEpochMs) &&
+   * Date.now() >= endEpochMs`. Out-of-guard it returns
+   * `{ok:false, error:'not-expired'}` WITHOUT touching any port (no config
+   * write, no admin prompt, no `applyStatus` flip, no toast) — this is what
+   * absorbs a superseding session (a NEW session queued ahead of the expiry
+   * job presents a future `endEpochMs` at run time) and the double-fire of
+   * the module-level trigger.
+   *
+   * Body order mirrors `stageStartTimer` exactly:
+   *   1. `writeConfig({...committed, activeTimer: null})` FIRST. On failure ->
+   *      `{ok:false, error:'config-write:<detail>'}` and return BEFORE any
+   *      hosts write, BEFORE flipping `applyStatus`, BEFORE advancing
+   *      `committed` (strict order — no admin prompt, no state change, no
+   *      toast).
+   *   2. Flip `applyStatus: 'running'`.
+   *   3. `writeHosts(effectiveHostsLines(nextConfig))` in try/catch. Because
+   *      `activeTimer` is null in `nextConfig`, `effectiveBlocklist`
+   *      contributes the ALWAYS-ON loop alone — so an also-always-on domain
+   *      REMAINS blocked purely by union precedence (no removal code path).
+   *      On deny -> `committed.activeTimer` INTACT (memory keeps the expired
+   *      session so 4.7's relaunch re-arm can converge; config.json on disk
+   *      already says "no session" — the accepted-drift mirror of Start,
+   *      over-blocking never a leak) + `applyStatus: 'idle'` + the error
+   *      toast. On throw -> same + `hosts-throw:<detail>` envelope.
+   *   4. On hosts ok -> advance `committed` to `nextConfig`, reset
+   *      `applyStatus: 'idle'`, set `lastResult`, and raise the success toast
+   *      "Session ended. Domains unblocked.".
+   *
+   * On success (and only then) the Shell-level toast is set:
+   * `{ message: 'Session ended. Domains unblocked.', tone: 'info' }` on
+   * success, `{ message: "Couldn't update /etc/hosts. No changes made.",
+   * tone: 'error' }` on a hosts deny or throw. The toast is RUNTIME state
+   * (never persisted); the Shell renders it and auto-dismisses it via
+   * `clearToast()`.
+   *
+   * Fire-and-forget-safe: never rejects (the enqueue body is fully guarded +
+   * caught), so the module-level trigger below can call it without a
+   * `.catch`.
+   *
+   * JSDoc contract for later stories: Story 4.6 (end-early) and Story 4.7
+   * (launch re-arm when `now >= end-time`) call THIS action directly — they
+   * must not fork a parallel hosts-write path.
+   */
+  expireTimer: () => Promise<WriteResult>;
+  /**
+   * Clear the Shell-level toast (Story 4.5). Called by the Shell's 8 s
+   * auto-dismiss timer. Runtime-only: no config write, no hosts write.
+   */
+  clearToast: () => void;
+  /**
    * Sync: read the managed section (`readHostsSection`) + compare to committed
    * (`computeDrift`) + set `drift`. Returns the result. No admin prompt.
    */
@@ -250,6 +335,14 @@ export interface DomainState {
   /** Epoch ms when the throttle elapses, or `null` when not throttled. */
   gateThrottleUntil: number | null;
   /**
+   * The Shell-level toast (Story 4.5): the current message + tone, or `null`
+   * when nothing is showing. RUNTIME-ONLY — set by `expireTimer` (and later
+   * stories' gated actions), cleared by the Shell's 8 s auto-dismiss via
+   * `clearToast()`. NOT persisted to `config.json`, NOT in `Config`/`types.ts`
+   * (same precedent as the gate state above); resets on relaunch.
+   */
+  toast: ToastState | null;
+  /**
    * Open the gate for `action` when a password is set, or run `action()`
    * immediately when no password is set (the no-op short-circuit — the gate is
    * never an empty sheet). The single reusable entry point every gated caller
@@ -296,6 +389,10 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
   gateAction: null,
   gateAttempts: 0,
   gateThrottleUntil: null,
+  // Story 4.5 — runtime-only Shell-level toast. `null` when nothing is
+  // showing; set by `expireTimer`, cleared by the Shell's auto-dismiss via
+  // `clearToast`. Not persisted (same precedent as the gate state above).
+  toast: null,
 
   stageDomainAdd: (raw) => {
     const apex = normaliseDomain(raw);
@@ -650,6 +747,124 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     });
   },
 
+  // ----- Story 4.5 — `expireTimer` (the auto-unblock on expiry) -----
+
+  expireTimer: () => {
+    // The MIRROR of `stageStartTimer`'s body (the `stageStartTimer:
+    // ({ durationMs, selected })` action in this file — referenced by NAME,
+    // not line range, so this comment does not rot as the file grows) with
+    // `activeTimer: null`. Parallel queue body — NOT a reuse of `runApply`
+    // (which never writes `activeTimer`) — keeping the strict
+    // config-then-hosts order auditable in one place. Through the shared
+    // `enqueue` chain only: no parallel hosts-write path, never concurrent
+    // with an Apply (one osascript prompt at a time).
+    return enqueue(async () => {
+      // Queue-time guard + re-read (the spec's Always clause): `committed` is
+      // read INSIDE the enqueue — at the moment this job ACQUIRES the queue,
+      // never from a tick-time snapshot. Three conditions, all required:
+      //   - `activeTimer != null` — no session, nothing to expire (absorbs
+      //     the trigger's double-fire after a successful expiry).
+      //   - `Number.isFinite(endEpochMs)` — a malformed (NaN/Infinity)
+      //     end time can never count as expired.
+      //   - `Date.now() >= endEpochMs` — the session has actually reached
+      //     its end AT RUN TIME. A superseding session (a NEW Start queued
+      //     ahead of this job) rewrites `activeTimer` with a FUTURE end; this
+      //     re-read sees it and no-ops — the fresh session survives.
+      // Out-of-guard: return WITHOUT touching any port (no config write, no
+      // admin prompt, no `applyStatus` flip, no `committed` change, no toast).
+      const committed = get().committed;
+      const active = committed.activeTimer;
+      if (
+        active == null ||
+        !Number.isFinite(active.endEpochMs) ||
+        Date.now() < active.endEpochMs
+      ) {
+        return { ok: false, error: 'not-expired' } as WriteResult;
+      }
+      const nextConfig: Config = {
+        ...committed,
+        activeTimer: null,
+      };
+      // 1. Write config.json FIRST (strict order, mirrors `stageStartTimer`'s
+      // accepted-drift order). On failure -> short-circuit BEFORE any
+      // elevation: no admin prompt, NO `applyStatus` flip, NO `committed`
+      // advance, NO toast. Over-blocking direction: a config-write failure
+      // leaves everything exactly as it was — hosts still blocks the session
+      // domains, memory still says the session runs.
+      const cfg = writeConfig(nextConfig);
+      if (!cfg.ok) {
+        return {
+          ok: false,
+          error: `config-write:${cfg.error ?? 'unknown'}`,
+        } as WriteResult;
+      }
+      // 2. Flip `applyStatus: 'running'` (the same UI gate the Start/Apply
+      // paths use) and compute the effective hosts lines from the JUST-BUILT
+      // `nextConfig` — always-on only, because the active-timer set lifts
+      // (`effectiveBlocklist`'s Epic 4 loop contributes nothing when
+      // `activeTimer == null`). The always-on loop alone keeps an
+      // also-always-on domain blocked — union precedence by construction,
+      // no removal code path.
+      set({ applyStatus: 'running' });
+      // 3. Write the managed hosts section — ONE admin prompt. The native
+      // promise resolves (never rejects) per shellRunner's contract; the
+      // try/catch is the same defensive guard `stageStartTimer` carries
+      // (Story 4.2 review — PATCH 2): an unexpected throw must never leave
+      // `applyStatus === 'running'` forever.
+      try {
+        const lines = effectiveHostsLines(nextConfig);
+        const result = await writeHosts(lines);
+        if (result.ok) {
+          // Hosts ok -> advance `committed` to `nextConfig` (`activeTimer`
+          // cleared) + reset `applyStatus` + set `lastResult` + raise the
+          // success toast. The badge/countdown consumers derive everything
+          // from `committed.activeTimer`, so they revert with zero changes
+          // to the surfaces.
+          set({
+            committed: nextConfig,
+            applyStatus: 'idle',
+            lastResult: result,
+            toast: { message: 'Session ended. Domains unblocked.', tone: 'info' },
+          });
+        } else {
+          // Hosts denied (or hard OS error) -> `committed.activeTimer` INTACT
+          // in memory (config.json on disk already says "no session" — the
+          // accepted-drift mirror of Start; over-blocking, never a leak).
+          // `applyStatus` resets to `idle`; `lastResult` carries the envelope;
+          // the failure toast shows. Retry = relaunch (4.7 re-arm) or a new
+          // session.
+          set({
+            applyStatus: 'idle',
+            lastResult: result,
+            toast: {
+              message: HOSTS_FAILURE_TOAST,
+              tone: 'error',
+            },
+          });
+        }
+        return result;
+      } catch (err) {
+        // Defensive — shellRunner's contract says the promise never rejects,
+        // but JS Promises can still throw; reset `applyStatus`, keep
+        // `committed.activeTimer` intact, raise the failure toast.
+        set({
+          applyStatus: 'idle',
+          toast: {
+            message: HOSTS_FAILURE_TOAST,
+            tone: 'error',
+          },
+        });
+        return { ok: false, error: `hosts-throw:${String(err)}` } as WriteResult;
+      }
+    });
+  },
+
+  clearToast: () => {
+    // Runtime-only: clear the Shell-level toast. Called by the Shell's 8 s
+    // auto-dismiss timer. No config write, no hosts write.
+    set({ toast: null });
+  },
+
   // ----- Story 3.2 — the reusable password gate actions -----
 
   requirePassword: (action) => {
@@ -742,6 +957,54 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     set({ gateAttempts: 0, gateThrottleUntil: null });
   },
 }));
+
+// ---------------------------------------------------------------------------
+// Story 4.5 — the expiry trigger (module-level slice subscription).
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the scoped timer slice is parked ON an expired session: a session is
+ * mirrored (`endEpochMs != null`, finite) AND the wall-clock mirror has caught
+ * up to or passed it. This is exactly the state the slice's driver SELF-PARKS
+ * into (`timerStore.ts:175-188` — the tick that observes `now >= end` clears
+ * the driver and parks `nowMs` AT `endEpochMs`), and also the state
+ * `start()` parks an already-expired `endEpochMs` into at mount (`timerStore.ts:151-161`)
+ * — which is why an expired-at-launch session re-arms through this same
+ * trigger (Story 4.7 layers the launch UX on this path).
+ *
+ * Derived here (NOT added to the slice) deliberately: the spec's Ask-First
+ * forbids changing the timer slice's state shape, and the trigger only needs
+ * this one boolean.
+ */
+function sliceExpiredParked(s: { endEpochMs: number | null; nowMs: number }): boolean {
+  return (
+    s.endEpochMs != null && Number.isFinite(s.endEpochMs) && s.nowMs >= s.endEpochMs
+  );
+}
+
+// The expiry trigger. A module-level subscription on the scoped slice that
+// fires `expireTimer()` ONCE on the expired-parked false->true transition —
+// not on every tick (the driver self-park is a one-time state change; the
+// transition detector is what keeps this from re-firing per second).
+//
+// Why here and not in a component: expiry is a privileged write — it belongs
+// in the domain layer. The Timer surface unmounts and the driver parks
+// regardless of surfaces; the SLICE, not the view tree, knows the moment. The
+// import is ONE-WAY (store -> timerStore; timerStore imports nothing from
+// store), so there is no cycle.
+//
+// Fire-and-forget: `expireTimer` never rejects (the enqueue body is guarded +
+// caught), and the toast carries the outcome. Duplicate fires are absorbed by
+// the queue-time guard (after a successful expiry `activeTimer` is null; a
+// superseding session presents a future `endEpochMs`).
+useTimerStore.subscribe((state, prev) => {
+  if (sliceExpiredParked(state) && !sliceExpiredParked(prev)) {
+    void useDomainStore.getState().expireTimer().catch(() => {
+      // Defensive — the enqueue body never rejects, but a fire-and-forget
+      // trigger must never surface an unhandled rejection.
+    });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Serialized Apply queue (module-private).

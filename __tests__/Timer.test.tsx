@@ -929,6 +929,15 @@ test('Blocked path at an already-expired endEpochMs: numeral reads 00:00, ring e
   // The slice parked immediately at mount: remaining clamps to 0 and no
   // per-second driver runs (the expired park is pinned in timerStore tests).
   expect(selectRemainingMs(useTimerStore.getState())).toBe(0);
+
+  // Story 4.5 note: that same park fires the domain store's module-level
+  // expiry trigger ASYNCHRONOUSLY after this mount. Its expireTimer run
+  // no-ops here — this file's `writeConfig` native mock returns `undefined`
+  // (a config-write failure envelope), so no state change and no hosts write
+  // follow. The "no config/host write ever runs" invariant below still holds
+  // for the SURFACE (4.3 cannot unblock); the trigger's own writeConfig call
+  // is its separate, spec-owned privileged path (pinned end-to-end in
+  // store.test.ts and StatusHeader.test.tsx's expired-at-mount test).
 });
 
 test('End early with no password set short-circuits to the announce (gate never opens)', () => {

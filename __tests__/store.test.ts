@@ -35,6 +35,8 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 }));
 
 import { useDomainStore } from '../src/domain/store';
+import { useTimerStore } from '../src/domain/timerStore';
+import * as shellRunner from '../src/hosts/shellRunner';
 import { stagedChangeCount } from '../src/domain/stagedChangeCount';
 import { DEFAULT_CONFIG } from '../src/config/types';
 import {
@@ -90,6 +92,9 @@ beforeEach(() => {
     gateAction: null,
     gateAttempts: 0,
     gateThrottleUntil: null,
+    // Story 4.5 — the Shell-level toast is runtime-only; reset it so a prior
+    // test's toast can't leak into the next.
+    toast: null,
   });
 });
 
@@ -2115,4 +2120,564 @@ test('gate actions never call writeConfig (gate state is runtime-only, NOT persi
   expect(fn).not.toHaveBeenCalled();
   // No gate action persisted anything to config.json.
   expect(configNative.writeConfig).not.toHaveBeenCalled();
+});
+
+// ===========================================================================
+// Story 4.5 — `expireTimer` (the auto-unblock on expiry) + the Shell-level
+// runtime-only toast + the module-level expiry trigger.
+//
+// Mirrors the 4.2 `stageStartTimer` matrix with the inverse write
+// (`activeTimer: null`). Covers: success (strict config-then-hosts order,
+// hosts payload = always-on lines only, `committed.activeTimer` cleared,
+// info toast), also-always-on stays blocked, hosts-deny, hosts-throw,
+// config-write fail, the queue-time not-expired guard, the superseding-
+// session no-op, double-fire idempotency, queue-behind-Apply (fresh re-read
+// of `committed`), `clearToast`, and the fire-and-forget trigger on the
+// timer slice's expired false->true transition (including expired-at-mount).
+// ===========================================================================
+
+/** Seed a committed config carrying an EXPIRED focus session. */
+function seedExpiredSession(opts?: {
+  alwaysOn?: Array<string>;
+  selected?: Array<string>;
+  endEpochMs?: number;
+}): number {
+  const end = opts?.endEpochMs ?? Date.now() - 1_000;
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [
+        { hostname: 'a.com', alwaysOn: true },
+        { hostname: 'b.com', alwaysOn: false },
+        ...(opts?.alwaysOn ?? []).map((hostname) => ({ hostname, alwaysOn: true })),
+      ],
+      activeTimer: {
+        endEpochMs: end,
+        selectedDomains: opts?.selected ?? ['a.com', 'b.com'],
+      },
+    },
+    applyStatus: 'idle',
+  });
+  return end;
+}
+
+test('expireTimer success: writeConfig (activeTimer:null) BEFORE writeHosts, hosts payload = always-on lines only, committed.activeTimer cleared, info toast', async () => {
+  const end = seedExpiredSession();
+
+  const result = await useDomainStore.getState().expireTimer();
+
+  expect(result).toEqual({ ok: true });
+  // Strict order: writeConfig fires once BEFORE writeHosts.
+  const writeConfigOrder = configNative.writeConfig.mock.invocationCallOrder[0];
+  const writeHostsOrder = shellNative.writeHosts.mock.invocationCallOrder[0];
+  expect(writeConfigOrder).toBeLessThan(writeHostsOrder);
+  // writeConfig called exactly once with the full config carrying
+  // `activeTimer: null` on top of the committed domains.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.domains).toStrictEqual([
+    { hostname: 'a.com', alwaysOn: true },
+    { hostname: 'b.com', alwaysOn: false },
+  ]);
+  expect(written.activeTimer).toBeNull();
+  // writeHosts called exactly once with the ALWAYS-ON lines only — with
+  // `activeTimer: null` the Epic 4 timer loop contributes nothing, so the
+  // timer-selected `b.com` (alwaysOn:false) is GONE from the hosts payload.
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
+  // `committed.activeTimer` is cleared in memory (badge/countdown revert).
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  // applyStatus resets to idle; lastResult carries the envelope.
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().lastResult).toEqual({ ok: true });
+  // The success toast (info tone) is raised.
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. Domains unblocked.',
+    tone: 'info',
+  });
+});
+
+test('expireTimer success keeps an also-always-on domain blocked (hosts payload retains it; no removal path)', async () => {
+  // `b.com` is in the session selection AND alwaysOn. On expiry the session
+  // set lifts, but the always-on loop keeps it in the effective blocklist —
+  // union precedence by construction. A regression that REMOVED domains from
+  // `alwaysOn` (or recomputed the payload from the wrong source) would drop
+  // it from the hosts lines and fail here.
+  seedExpiredSession({ selected: ['b.com'], alwaysOn: ['b.com'] });
+
+  const result = await useDomainStore.getState().expireTimer();
+
+  expect(result).toEqual({ ok: true });
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.activeTimer).toBeNull();
+  // `alwaysOn` is NOT touched — the domain entry survives untouched.
+  expect(written.domains).toContainEqual({ hostname: 'b.com', alwaysOn: true });
+  const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  // Both always-on domains stay blocked after the session lifts.
+  expect(distinctApexes).toStrictEqual(
+    new Set(['a.com', 'www.a.com', 'b.com', 'www.b.com']),
+  );
+});
+
+test('expireTimer hosts-deny: committed.activeTimer stays INTACT, applyStatus resets to idle, error toast', async () => {
+  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  const end = seedExpiredSession();
+
+  const result = await useDomainStore.getState().expireTimer();
+
+  expect(result).toStrictEqual({ ok: false, error: 'admin-denied' });
+  // writeConfig ran (carrying the activeTimer:null write — accepted drift).
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  // `committed.activeTimer` INTACT in memory (the over-blocking mirror of
+  // Start's accepted-drift order; retry-safe).
+  expect(useDomainStore.getState().committed.activeTimer).toStrictEqual({
+    endEpochMs: end,
+    selectedDomains: ['a.com', 'b.com'],
+  });
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().lastResult).toStrictEqual({
+    ok: false,
+    error: 'admin-denied',
+  });
+  // The failure toast (error tone).
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: "Couldn't update /etc/hosts. No changes made.",
+    tone: 'error',
+  });
+});
+
+test('expireTimer hosts-throw: returns a hosts-throw envelope, keeps activeTimer intact, resets applyStatus, error toast', async () => {
+  // shellRunner's writeHosts promise RESOLVES (never rejects) per its port
+  // contract — a native-mock rejection is converted to an envelope by the
+  // port before the store ever sees it. To exercise the store's DEFENSIVE
+  // try/catch (the mirror of Start's Story 4.2 PATCH 2), spy on the
+  // shellRunner module namespace: Babel compiles store.ts's named import to
+  // a call-time property access, so the spy intercepts the store's call
+  // before the port can convert anything. Restored by hand — this file has
+  // no afterEach(restoreAllMocks).
+  const spy = jest
+    .spyOn(shellRunner, 'writeHosts')
+    .mockRejectedValue(new Error('osascript exploded'));
+  try {
+    seedExpiredSession();
+
+    const result = await useDomainStore.getState().expireTimer();
+
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toContain('hosts-throw:');
+    // applyStatus NOT left running; committed.activeTimer INTACT; toast error.
+    expect(useDomainStore.getState().applyStatus).toBe('idle');
+    expect(useDomainStore.getState().committed.activeTimer).not.toBeNull();
+    expect(useDomainStore.getState().toast).toStrictEqual({
+      message: "Couldn't update /etc/hosts. No changes made.",
+      tone: 'error',
+    });
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test('expireTimer config-write failure: short-circuits BEFORE elevation — no writeHosts, applyStatus untouched, committed unchanged, NO toast', async () => {
+  configNative.writeConfig.mockReturnValue({ ok: false, error: 'disk-full' });
+  const end = seedExpiredSession();
+
+  const result = await useDomainStore.getState().expireTimer();
+
+  expect(result).toStrictEqual({ ok: false, error: 'config-write:disk-full' });
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  // Strict order: a config-write fail short-circuits before the elevation.
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().committed.activeTimer).toStrictEqual({
+    endEpochMs: end,
+    selectedDomains: ['a.com', 'b.com'],
+  });
+  // NO toast on a config-write failure.
+  expect(useDomainStore.getState().toast).toBeNull();
+});
+
+test('expireTimer not-expired guard: null activeTimer OR a future end -> no ports, no applyStatus flip, no toast', async () => {
+  // Case 1: no session at all.
+  useDomainStore.setState({ committed: DEFAULT_CONFIG, applyStatus: 'idle' });
+  const r1 = await useDomainStore.getState().expireTimer();
+  expect(r1).toStrictEqual({ ok: false, error: 'not-expired' });
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+
+  // Case 2: a live (future-ended) session — Date.now() < endEpochMs.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      activeTimer: { endEpochMs: Date.now() + 60_000, selectedDomains: ['a.com'] },
+    },
+    applyStatus: 'idle',
+  });
+  const r2 = await useDomainStore.getState().expireTimer();
+  expect(r2).toStrictEqual({ ok: false, error: 'not-expired' });
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().toast).toBeNull();
+});
+
+test('expireTimer malformed guard: a NaN endEpochMs can never count as expired -> not-expired, zero ports, no toast', async () => {
+  // A malformed (NaN) end time — reachable only through a hand-edited or
+  // corrupt config.json that readConfig does not shape-check element values
+  // on. `Date.now() < NaN` is false, so the guard's non-finite check is what
+  // absorbs this: a corrupt session must NEVER auto-unblock. Mirrors the
+  // guard test's structure above (case 3 of the same Always clause).
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      domains: [{ hostname: 'a.com', alwaysOn: true }],
+      activeTimer: { endEpochMs: NaN, selectedDomains: ['a.com'] },
+    },
+    applyStatus: 'idle',
+  });
+
+  const result = await useDomainStore.getState().expireTimer();
+
+  expect(result).toStrictEqual({ ok: false, error: 'not-expired' });
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().committed.activeTimer).toStrictEqual({
+    endEpochMs: NaN,
+    selectedDomains: ['a.com'],
+  });
+  expect(useDomainStore.getState().toast).toBeNull();
+});
+
+test('expireTimer with an EMPTY always-on set writes a markers-only (empty) hosts payload — unblock-all, no domain removal from config', async () => {
+  // The session's selected domains are ALL non-always-on and no domain is
+  // alwaysOn: when the session set lifts, the effective blocklist is EMPTY,
+  // so the hosts payload is the markers-only empty array (unblock all) —
+  // and `committed.domains` still carries the non-always-on entry untouched
+  // (a regression that removed domains from the config on expiry fails here).
+  seedExpiredSession({ selected: ['b.com'], alwaysOn: [] });
+  // Narrow the seed's committed to ONLY the non-always-on domain (drop the
+  // always-on `a.com` the helper adds).
+  useDomainStore.setState({
+    committed: {
+      ...useDomainStore.getState().committed,
+      domains: [{ hostname: 'b.com', alwaysOn: false }],
+    },
+  });
+
+  const result = await useDomainStore.getState().expireTimer();
+
+  expect(result).toEqual({ ok: true });
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  // The hosts payload is an EMPTY array — the markers-only rewrite that
+  // unblocks everything (the 1.5 contract for `lines === []`).
+  expect(shellNative.writeHosts.mock.calls[0][0]).toStrictEqual([]);
+  // `committed.domains` is NOT mutated by expiry — the session domain stays
+  // listed (alwaysOn:false), just no longer in the effective blocklist.
+  expect(useDomainStore.getState().committed.domains).toStrictEqual([
+    { hostname: 'b.com', alwaysOn: false },
+  ]);
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+});
+
+test('expireTimer behind a HUNG queue run: no toast, no committed change, zero port calls from the expiry job while it waits', async () => {
+  // The matrix's "Queue busy / hung — no toast while waiting" row: expireTimer
+  // only ever runs through the shared `enqueue` chain. With a queued Start's
+  // writeHosts promise held pending forever, the expiry job never acquires
+  // the queue — so nothing happens AT ALL until the head run settles (no
+  // premature toast, no state churn, no out-of-band port calls).
+  seedExpiredSession();
+  const pendingResolvers: Array<(v: WriteResult) => void> = [];
+  shellNative.writeHosts.mockImplementation(
+    () =>
+      new Promise<WriteResult>((res) => {
+        pendingResolvers.push(res);
+      }),
+  );
+
+  // Start a session (future end) whose writeHosts NEVER resolves — the
+  // queue is now hung on the Start's run.
+  const startP = useDomainStore.getState().stageStartTimer({
+    durationMs: TWENTY_FIVE_MIN_MS,
+    selected: new Set(['a.com']),
+  });
+  await flushMicrotasks();
+  expect(pendingResolvers).toHaveLength(1); // the Start's pending writeHosts
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1); // the Start's
+
+  // Queue the expiry behind the hung run and drain — nothing may happen.
+  const committedBefore = useDomainStore.getState().committed;
+  const expireP = useDomainStore.getState().expireTimer();
+  await flushMicrotasks();
+
+  // The expiry job has NOT run: no second writeConfig, no toast, no committed
+  // change, no lastResult from the expiry. (`applyStatus` reads 'running' —
+  // that is the IN-FLIGHT Start's legitimate flip, not the expiry's.)
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1); // the Start's only
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1); // pending
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(useDomainStore.getState().committed).toBe(committedBefore);
+  expect(useDomainStore.getState().applyStatus).toBe('running');
+  expect(useDomainStore.getState().lastResult).toBeNull();
+
+  // Un-block the fixture: release the Start's writeHosts so the queue (and
+  // the test) settle — the expiry run then acquires the queue and no-ops on
+  // the fresh FUTURE session (the superseding-session no-op already pins
+  // that; here we only release the hang so nothing leaks into later tests).
+  pendingResolvers.shift()!({ ok: true });
+  await Promise.allSettled([startP, expireP]);
+  await flushMicrotasks();
+  // Still no failure toast after everything settles: the expiry no-oped on
+  // the superseded (future) session.
+  expect(useDomainStore.getState().toast).toBeNull();
+});
+
+test('expireTimer superseding session no-op: a Start queued ahead rewrites activeTimer with a FUTURE end and the expiry run re-reads it and no-ops', async () => {
+  // Seed an EXPIRED session, then start a NEW session (future end) whose
+  // writeHosts is held in flight. Queue expireTimer while Start runs: when
+  // it acquires the queue, `committed.activeTimer` carries the FUTURE end of
+  // the fresh session — the queue-time re-read must no-op and NOT clobber it.
+  seedExpiredSession();
+  const pendingResolvers: Array<(v: WriteResult) => void> = [];
+  shellNative.writeHosts.mockImplementation(
+    () =>
+      new Promise<WriteResult>((res) => {
+        pendingResolvers.push(res);
+      }),
+  );
+
+  const startP = useDomainStore.getState().stageStartTimer({
+    durationMs: TWENTY_FIVE_MIN_MS,
+    selected: new Set(['a.com']),
+  });
+  await flushMicrotasks();
+  expect(pendingResolvers).toHaveLength(1); // the Start's writeHosts
+
+  // Queue the expiry behind the in-flight Start.
+  const expireP = useDomainStore.getState().expireTimer();
+  await flushMicrotasks();
+  // The Start has not settled -> the expiry job has NOT run yet.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1); // Start's only
+  expect(pendingResolvers).toHaveLength(1);
+
+  // Release the Start's writeHosts: it commits the fresh session (FUTURE
+  // end); then the expiry job runs, re-reads `committed`, sees the future
+  // end, and no-ops WITHOUT touching any port.
+  pendingResolvers.shift()!({ ok: true });
+  const [startRes, expireRes] = await Promise.all([startP, expireP]);
+
+  expect(startRes).toEqual({ ok: true });
+  expect(expireRes).toStrictEqual({ ok: false, error: 'not-expired' });
+  // Only the Start's writeConfig + writeHosts ever ran.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  // The fresh session SURVIVES.
+  expect(useDomainStore.getState().committed.activeTimer).not.toBeNull();
+  expect(
+    useDomainStore.getState().committed.activeTimer!.endEpochMs,
+  ).toBeGreaterThanOrEqual(Date.now());
+  expect(useDomainStore.getState().toast).toBeNull();
+});
+
+test('expireTimer double-fire idempotency: the 2nd call after a successful expiry no-ops with not-expired', async () => {
+  seedExpiredSession();
+
+  const r1 = await useDomainStore.getState().expireTimer();
+  expect(r1).toEqual({ ok: true });
+  const r2 = await useDomainStore.getState().expireTimer();
+
+  expect(r2).toStrictEqual({ ok: false, error: 'not-expired' });
+  // Exactly ONE writeConfig + ONE writeHosts across both calls.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  // The success toast is still the ONE toast (not replaced by a failure).
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. Domains unblocked.',
+    tone: 'info',
+  });
+});
+
+test('expireTimer queued behind an in-flight Apply: re-reads committed at queue time (hosts payload includes the Apply\'s just-committed domain)', async () => {
+  useDomainStore.setState({
+    committed: DEFAULT_CONFIG,
+    staged: null,
+    applyStatus: 'idle',
+  });
+  const pendingResolvers: Array<(v: WriteResult) => void> = [];
+  shellNative.writeHosts.mockImplementation(
+    () =>
+      new Promise<WriteResult>((res) => {
+        pendingResolvers.push(res);
+      }),
+  );
+
+  // Start an Apply committing `example.com` as alwaysOn.
+  useDomainStore.getState().stageDomainAdd('example.com');
+  const applyP = useDomainStore.getState().apply();
+  await flushMicrotasks();
+  expect(pendingResolvers).toHaveLength(1); // the Apply's writeHosts
+
+  // While the Apply is in flight, the session expires and expireTimer queues.
+  const end = seedExpiredSession();
+  const expireP = useDomainStore.getState().expireTimer();
+  await flushMicrotasks();
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1); // Apply's only
+  expect(pendingResolvers).toHaveLength(1);
+
+  // Release the Apply: it commits `example.com` to `committed` FIRST; the
+  // expiry job then acquires the queue, reads the run-time `committed` (now
+  // carrying `example.com` + the expired activeTimer) and builds its payload
+  // from THAT — not from the pre-Apply snapshot.
+  pendingResolvers.shift()!({ ok: true });
+  await flushMicrotasks();
+  // The expiry job's own writeHosts is the new pending entry — release it.
+  expect(pendingResolvers).toHaveLength(1);
+  pendingResolvers.shift()!({ ok: true });
+  const [applyRes, expireRes] = await Promise.all([applyP, expireP]);
+
+  expect(applyRes).toStrictEqual({ ok: true });
+  expect(expireRes).toEqual({ ok: true });
+  // Two writeConfig calls (the Apply's, then the expiry's). The expiry's
+  // preserves the Apply's just-committed domain and carries activeTimer:null.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(2);
+  const expiryWritten = JSON.parse(configNative.writeConfig.mock.calls[1][0]);
+  expect(expiryWritten.domains).toContainEqual({
+    hostname: 'example.com',
+    alwaysOn: true,
+  });
+  expect(expiryWritten.activeTimer).toBeNull();
+  // The expiry's hosts payload = the ALWAYS-ON lines of the post-Apply
+  // committed: `example.com` (the Apply's just-committed alwaysOn domain).
+  // A stale pre-Apply snapshot would have produced the seed's `a.com`
+  // payload instead — the re-read is the whole point of this test. (The
+  // Apply's staged slice REPLACES the domains list, so the seed's `a.com`
+  // entry is legitimately gone.)
+  const hostsLines = shellNative.writeHosts.mock.calls[1][0] as string[];
+  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  expect(distinctApexes).toStrictEqual(
+    new Set(['example.com', 'www.example.com']),
+  );
+  // The expired session is cleared.
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  expect(end).toBeLessThan(Date.now()); // sanity: the seed was genuinely past
+});
+
+test('expireTimer toast lifecycle: set on the outcome, cleared by clearToast (no config/host writes)', async () => {
+  seedExpiredSession();
+  await useDomainStore.getState().expireTimer();
+  expect(useDomainStore.getState().toast).not.toBeNull();
+
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+
+  useDomainStore.getState().clearToast();
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+});
+
+// ---------------------------------------------------------------------------
+// Story 4.5 — the module-level expiry trigger (store.ts): a useTimerStore
+// subscription that fires `expireTimer()` fire-and-forget on the slice's
+// expired-parked false->true transition (the self-park driver signal).
+// ---------------------------------------------------------------------------
+
+/** Reset the timer slice to a clean non-expired baseline (no driver started). */
+function resetTimerSlice(): void {
+  useTimerStore.setState({ nowMs: 0, endEpochMs: null, totalMs: null });
+}
+
+test('the 4.5 trigger fires expireTimer on the slice expired false->true transition (seeded expired session)', async () => {
+  seedExpiredSession();
+  resetTimerSlice();
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+
+  const end = useDomainStore.getState().committed.activeTimer!.endEpochMs;
+  // Simulate the driver's self-park: the slice lands in the expired-parked
+  // state (nowMs AT the end). The subscriber sees false -> true and fires
+  // expireTimer.
+  useTimerStore.setState({ nowMs: end, endEpochMs: end, totalMs: 60_000 });
+  await flushMicrotasks();
+
+  // The trigger ran the whole expiry path: config + hosts + toast.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.activeTimer).toBeNull();
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. Domains unblocked.',
+    tone: 'info',
+  });
+
+  resetTimerSlice();
+});
+
+test('the 4.5 trigger is steady-state safe: a true->true update does NOT re-fire', async () => {
+  seedExpiredSession();
+  resetTimerSlice();
+
+  const end = useDomainStore.getState().committed.activeTimer!.endEpochMs;
+  useTimerStore.setState({ nowMs: end, endEpochMs: end, totalMs: 60_000 });
+  await flushMicrotasks();
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+
+  // A second setState still describing the expired-parked state (true->true)
+  // must NOT fire a second expiry.
+  useTimerStore.setState({ nowMs: end, endEpochMs: end });
+  await flushMicrotasks();
+
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+
+  resetTimerSlice();
+});
+
+test('the 4.5 trigger fires on expired-at-mount: start(expiredEnd) parks immediately and expireTimer runs', async () => {
+  seedExpiredSession();
+  resetTimerSlice();
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+
+  const end = useDomainStore.getState().committed.activeTimer!.endEpochMs;
+  // The Timer/StatusHeader mount path: `start()` with an already-expired end
+  // parks the slice IMMEDIATELY (timerStore's park branch) — the same
+  // false->true transition the driver's self-park produces.
+  useTimerStore.getState().start(end);
+  await flushMicrotasks();
+
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Session ended. Domains unblocked.',
+    tone: 'info',
+  });
+
+  // The slice's park left no live driver; release the refcount start held.
+  useTimerStore.getState().stop();
+  resetTimerSlice();
+});
+
+test('the 4.5 trigger stays silent while a LIVE session ticks (false->false updates never fire)', async () => {
+  seedExpiredSession();
+  resetTimerSlice();
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+
+  // A live (future-ended) mirror: the expired flag stays false across ticks.
+  const futureEnd = Date.now() + 60_000;
+  useTimerStore.setState({ nowMs: Date.now(), endEpochMs: futureEnd, totalMs: 60_000 });
+  useTimerStore.setState({ nowMs: Date.now() + 1_000 }); // a tick
+  await flushMicrotasks();
+
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().toast).toBeNull();
+
+  resetTimerSlice();
 });

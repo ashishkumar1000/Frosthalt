@@ -141,6 +141,9 @@ afterEach(() => {
       gateAction: null,
       gateAttempts: 0,
       gateThrottleUntil: null,
+      // Story 4.5 — the Shell-level toast is runtime-only; reset it so a
+      // prior test's toast can't leak into the next.
+      toast: null,
     });
   });
   // Story 4.4 — the status header now subscribes to the scoped timer slice,
@@ -1628,6 +1631,8 @@ afterAll(() => {
       gateAction: null,
       gateAttempts: 0,
       gateThrottleUntil: null,
+      // Story 4.5 — clear any leaked toast at module teardown too.
+      toast: null,
     });
   });
 });
@@ -1845,4 +1850,195 @@ test('the status header shows the Blocked badge and a live mm:ss countdown while
     jest.advanceTimersByTime(1000);
   });
   expect(extractText(testRenderer.toJSON())).toContain('04:59');
+});
+
+// ===========================================================================
+// Story 4.5 — Shell-level expiry end-to-end: the driver's self-park fires
+// the store's module-level expiry trigger -> expireTimer clears
+// `committed.activeTimer` (config-then-hosts) -> the header reverts to the
+// Epic-2 Free form (badge + count + "no active timer") and the Shell-level
+// toast renders, is announced to VoiceOver, and auto-dismisses after 8 s.
+// The native mocks here default to `undefined` (a failure envelope), so both
+// ports are explicitly seeded to succeed before the expiry runs.
+// ===========================================================================
+
+/** Drain the enqueue/microtask chain so an enqueued expireTimer run settles. */
+async function drainAsync(): Promise<void> {
+  for (let i = 0; i < 8; i++) {
+    await Promise.resolve();
+  }
+}
+
+const T = 1_756_000_000_000;
+
+test('Shell-level expiry e2e: the countdown parks -> domains unblock -> "Session ended." toast renders, is announced, and auto-dismisses after 8 s', async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  const configNative = require('../src/native/specs/NativeConfigStoreSpec')
+    .default as { writeConfig: jest.Mock };
+  const shellNative = require('../src/native/specs/NativeShellRunnerSpec')
+    .default as { writeHosts: jest.Mock };
+  configNative.writeConfig.mockReturnValue({ ok: true });
+  shellNative.writeHosts.mockResolvedValue({ ok: true });
+
+  // Seed a live 5-minute session: `a.com` is always-on, `b.com` rides the
+  // session only. Live effective count = 2; after expiry the session set
+  // lifts and only the always-on domain remains -> count drops to 1.
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [
+          { hostname: 'a.com', alwaysOn: true },
+          { hostname: 'b.com', alwaysOn: false },
+        ],
+        activeTimer: {
+          endEpochMs: T + 5 * 60_000,
+          selectedDomains: ['a.com', 'b.com'],
+        },
+      },
+    });
+  });
+
+  const testRenderer = renderShell();
+  // Live session: Blocked badge, 05:00, 2 domains, no placeholder.
+  expect(extractText(testRenderer.toJSON())).toContain('05:00');
+  expect(extractText(testRenderer.toJSON())).toContain('2 domains');
+
+  // This suite shares one module-level store + native mocks across tests and
+  // does NOT reset mock history per test (only the 3-4 e2e seeds these), so
+  // clear the call history here — the call-count assertions below are about
+  // THIS test's expiry run only.
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+
+  // The spec AC says the unblock fires "on ANY surface": navigate OFF the
+  // launch surface (Blocklist) to Settings before driving the clock, so the
+  // expiry provably fires while a different surface is active.
+  await ReactTestRenderer.act(async () => {
+    findKeyDownContainer(testRenderer.root).props.onKeyDown({
+      nativeEvent: { metaKey: true, key: '4' },
+    });
+  });
+
+  // Drive the wall clock past the session end: the slice's driver tick
+  // observes `now >= end`, self-parks at `endEpochMs`, and the store's
+  // module-level trigger fires expireTimer. Drain the microtasks so the
+  // enqueued run (config write -> hosts write -> state + toast) settles.
+  announceForAccessibility.mockClear();
+  await ReactTestRenderer.act(async () => {
+    jest.advanceTimersByTime(5 * 60_000);
+    await drainAsync();
+  });
+
+  // The store ran the expiry path end-to-end.
+  expect(useDomainStore.getState().committed.activeTimer).toBeNull();
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.activeTimer).toBeNull();
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+
+  // The header reverted with zero surface changes: Free badge, the
+  // placeholder back, and the count dropped to the always-on domain only.
+  const text = extractText(testRenderer.toJSON());
+  const badgeByLabel = (label: string) =>
+    testRenderer.root.findAll(
+      (node) => node.props && node.props.accessibilityLabel === label,
+    );
+  expect(badgeByLabel('Status: Free').length).toBeGreaterThanOrEqual(1);
+  expect(badgeByLabel('Status: Blocked')).toHaveLength(0);
+  expect(text).toContain('no active timer');
+  expect(text).toContain('1 domain');
+  // The countdown numeral is gone with the session — not parked at 00:00.
+  expect(text).not.toContain('00:00');
+
+  // The Shell-level success toast rendered + was announced to VoiceOver.
+  expect(text).toContain('Session ended. Domains unblocked.');
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    'Session ended. Domains unblocked.',
+  );
+
+  // 8 s later the toast auto-dismisses (Shell's clearToast timer).
+  await ReactTestRenderer.act(async () => {
+    jest.advanceTimersByTime(8_000);
+  });
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(extractText(testRenderer.toJSON())).not.toContain(
+    'Session ended. Domains unblocked.',
+  );
+});
+
+test('Shell-level expiry with a denied hosts write keeps the session and shows the error toast, then dismisses it', async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  const configNative = require('../src/native/specs/NativeConfigStoreSpec')
+    .default as { writeConfig: jest.Mock };
+  const shellNative = require('../src/native/specs/NativeShellRunnerSpec')
+    .default as { writeHosts: jest.Mock };
+  configNative.writeConfig.mockReturnValue({ ok: true });
+  // The admin prompt is denied: the hosts write resolves not-ok.
+  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [{ hostname: 'a.com', alwaysOn: true }],
+        activeTimer: {
+          endEpochMs: T + 5 * 60_000,
+          selectedDomains: ['a.com'],
+        },
+      },
+    });
+  });
+
+  const testRenderer = renderShell();
+  // Clear the shared mocks' history (see the e2e above) so the deny-path
+  // assertions count only this test's calls.
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+  announceForAccessibility.mockClear();
+  // Drive the wall clock past the session end: the driver self-parks and the
+  // store's trigger fires expireTimer, whose hosts write is denied.
+  await ReactTestRenderer.act(async () => {
+    jest.advanceTimersByTime(5 * 60_000);
+    await drainAsync();
+  });
+
+  // Deny path: `committed.activeTimer` stays INTACT (accepted drift — config
+  // on disk says "no session", memory still says the session runs), so the
+  // header keeps the Blocked badge + the 00:00 parked countdown.
+  expect(useDomainStore.getState().committed.activeTimer).not.toBeNull();
+  // Port assertions, same shape as the success e2e: writeConfig ran ONCE with
+  // the accepted-drift `activeTimer: null` payload; writeHosts ran once and
+  // was denied.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.activeTimer).toBeNull();
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const text = extractText(testRenderer.toJSON());
+  const badgeByLabel = (label: string) =>
+    testRenderer.root.findAll(
+      (node) => node.props && node.props.accessibilityLabel === label,
+    );
+  expect(badgeByLabel('Status: Blocked').length).toBeGreaterThanOrEqual(1);
+  expect(badgeByLabel('Status: Free')).toHaveLength(0);
+  expect(text).not.toContain('no active timer');
+  // The parked countdown numeral still renders (the session is "live" in
+  // memory until 4.6's End-early or 4.7's re-arm clears it).
+  expect(text).toContain('00:00');
+
+  // The failure toast (error tone) rendered + was announced.
+  expect(text).toContain("Couldn't update /etc/hosts. No changes made.");
+  expect(announceForAccessibility).toHaveBeenCalledWith(
+    "Couldn't update /etc/hosts. No changes made.",
+  );
+
+  // It still auto-dismisses after 8 s.
+  await ReactTestRenderer.act(async () => {
+    jest.advanceTimersByTime(8_000);
+  });
+  expect(extractText(testRenderer.toJSON())).not.toContain(
+    "Couldn't update /etc/hosts. No changes made.",
+  );
 });

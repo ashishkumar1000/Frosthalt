@@ -16,6 +16,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   AccessibilityInfo,
   StyleSheet,
+  Text,
   View,
 } from 'react-native';
 import type {
@@ -35,6 +36,11 @@ import { HostsViewer } from './HostsViewer';
 import { PasswordGate } from './PasswordGate';
 import { useDomainStore } from '../domain/store';
 import { effectiveBlocklist } from '../domain/effectiveBlocklist';
+import { tokens } from '../theme/tokens';
+
+/** Auto-dismiss timeout for the Shell-level toast (Story 4.5 — 8 s, the same
+ * Ask-First choice Panic's component-local toast uses). */
+const TOAST_AUTO_DISMISS_MS = 8000;
 
 /**
  * ⌘1-⌘4 select the four surfaces; ⌘N focuses the add-domain field (Story 2.2);
@@ -98,6 +104,34 @@ export function Shell(): React.ReactElement {
   // from the store at call time, runs it, then closes the gate.
   const gateOpen = useDomainStore((s) => s.gateOpen);
   const closeGate = useDomainStore((s) => s.closeGate);
+
+  // Story 4.5 — the Shell-level toast. The store sets it (expiry, and later
+  // 4.6/4.7); the Shell is the one component mounted on every surface, so it
+  // renders the single toast element. Runtime-only state in the store (never
+  // persisted) — the same precedent as 3.2's gate state. Epic 5 owns a real
+  // toast primitive; this stays minimal (no queue, no stack, one message).
+  const toast = useDomainStore((s) => s.toast);
+  const clearToast = useDomainStore((s) => s.clearToast);
+
+  // Toast lifecycle: announce the message to VoiceOver when it appears (the
+  // `accessibilityLiveRegion="polite"` below is Android-only / a no-op on
+  // macOS — the explicit announce is what VoiceOver hears, mirroring how the
+  // Shell announces nav changes) and auto-dismiss after 8 s. Keyed on the
+  // toast OBJECT so a new message (or tone) re-announces and re-arms the
+  // timer; the cleanup clears the pending timer on change/unmount so a
+  // quickly-replaced toast never dismisses its successor early.
+  useEffect(() => {
+    if (toast == null) {
+      return;
+    }
+    AccessibilityInfo.announceForAccessibility(toast.message);
+    const timer = setTimeout(() => {
+      clearToast();
+    }, TOAST_AUTO_DISMISS_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [toast, clearToast]);
 
   const selectRow = (i: number) => {
     setSurface(i as SurfaceIndex);
@@ -291,6 +325,31 @@ export function Shell(): React.ReactElement {
       {gateOpen ? (
         <PasswordGate onVerified={runGateAction} onClose={closeGate} />
       ) : null}
+      {toast ? (
+        // Story 4.5 — the Shell-level toast, rendered AFTER the overlays
+        // (hosts viewer, password gate) so it paints on top. `tone: 'error'`
+        // renders in the destructive token; `'info'` stays neutral with the
+        // primary border (Panic's success-toast pattern, Panic.tsx:335-365 —
+        // not migrated; that component-local toast stays as-is).
+        // `pointerEvents="none"`: the absolute overlay must never intercept
+        // touches in its area for the full 8 s it is showing — the surface
+        // underneath (e.g. Blocklist rows) stays interactive.
+        <View
+          style={styles.toast}
+          pointerEvents="none"
+          accessibilityLiveRegion="polite"
+          accessibilityLabel={toast.message}
+        >
+          <Text
+            style={[
+              styles.toastText,
+              toast.tone === 'error' && styles.toastTextError,
+            ]}
+          >
+            {toast.message}
+          </Text>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -302,5 +361,38 @@ const styles = StyleSheet.create({
   body: {
     flex: 1,
     flexDirection: 'row',
+  },
+  // Story 4.5 — the Shell-level toast. A compact grouped View pinned at the
+  // bottom of the window (absolute so it overlays whichever surface is
+  // active — expiry can fire on ANY surface), reusing the Panic success-toast
+  // token pattern (border + body typography, Panic.tsx styles.toast). Two
+  // legibility/behaviour guards: `backgroundColor` uses the HostsViewer
+  // panel token (`monoBg`) so the text is never floating directly over
+  // whatever the active surface painted (e.g. domain rows), and the JSX
+  // carries `pointerEvents="none"` so the overlay never intercepts touches
+  // in its area while showing.
+  toast: {
+    position: 'absolute',
+    left: tokens.spacing.md,
+    right: tokens.spacing.md,
+    bottom: tokens.spacing.md,
+    backgroundColor: tokens.monoBg,
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: tokens.spacing.sm,
+    paddingHorizontal: tokens.spacing.md,
+    paddingVertical: tokens.spacing.sm,
+    borderRadius: tokens.rounded.md,
+    borderWidth: 1,
+    borderColor: tokens.primary,
+  },
+  toastText: {
+    ...tokens.typography.body,
+  },
+  // The error tone renders in the destructive token (the "Couldn't update
+  // /etc/hosts" copy reads as a failure, not a success).
+  toastTextError: {
+    color: tokens.destructive,
   },
 });
