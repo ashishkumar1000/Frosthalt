@@ -35,6 +35,7 @@ import { Settings } from './Settings';
 import { Timer } from './Timer';
 import { HostsViewer } from './HostsViewer';
 import { PasswordGate } from './PasswordGate';
+import { ScheduleEditor } from './ScheduleEditor';
 import { useDomainStore } from '../domain/store';
 import { effectiveBlocklist } from '../domain/effectiveBlocklist';
 import { tokens } from '../theme/tokens';
@@ -44,12 +45,15 @@ import { tokens } from '../theme/tokens';
 const TOAST_AUTO_DISMISS_MS = 8000;
 
 /**
- * ⌘1-⌘4 select the four surfaces; ⌘N focuses the add-domain field (Story 2.2);
- * bare Return / Enter fire Apply on a surface with a staged draft — Blocklist
- * (surface 0, Story 2.3, when the add field is blurred) or Schedule (surface
- * 2, Story 5.1, when the schedule buffer is dirty); bare Escape closes the
- * read-only hosts viewer overlay when it is open (Story 2.6). Keys outside
- * this set are ignored (the native default applies).
+ * ⌘1-⌘4 select the four surfaces; ⌘N focuses the add-domain field (Story 2.2)
+ * except on surface 2, where it opens the add schedule editor sheet (Story
+ * 5.2, no-op while already open); bare Return / Enter fire Apply on a surface
+ * with a staged draft — Blocklist (surface 0, Story 2.3, when the add field is
+ * blurred) or Schedule (surface 2, Story 5.1, when the schedule buffer is
+ * dirty) — but never while an overlay is open (hosts viewer 2.6, password gate
+ * 3.2, schedule editor 5.2); bare Escape closes the topmost open overlay
+ * (password gate 3.2, hosts viewer 2.6, schedule editor 5.2, in that branch
+ * order). Keys outside this set are ignored (the native default applies).
  */
 const KEY_DOWN_EVENTS: HandledKeyEvent[] = [
   { key: '1', metaKey: true },
@@ -89,6 +93,17 @@ export function Shell(): React.ReactElement {
   // viewer is a window-level inert surface, mirroring how the native alert
   // inert-ifies the Shell's Return gate).
   const [viewerOpen, setViewerOpen] = useState(false);
+  // Story 5.2 — the schedule editor sheet's open state. `'new'` opens the ADD
+  // editor (empty draft); a schedule `id` opens the EDIT editor pre-filled
+  // from the rendered (staged ?? committed) schedule; `null` (the initial)
+  // means closed. Shell-owned for the same reason as `viewerOpen`: ⌘N, bare
+  // Escape, and the bare-Return gate all live in this component's key handler,
+  // and component-local state inside `<Schedule>` would need a reverse
+  // channel. The sheet itself is the scratchpad — nothing stages until its
+  // Save (which calls `onClose` after `stageScheduleUpsert` succeeds).
+  const [scheduleEditorTarget, setScheduleEditorTarget] = useState<
+    'new' | string | null
+  >(null);
   // The staged draft + apply action, read here so the Return -> Apply branch
   // can fire `apply()` iff `staged != null`. Blocklist also reads these; both
   // may read the same store.
@@ -192,11 +207,38 @@ export function Shell(): React.ReactElement {
       setViewerOpen(false);
       return;
     }
-    // ⌘N focuses the add-domain field (context-aware — only the Blocklist
-    // surface renders the field, but the ref is always attached and a no-op
-    // focus when the surface is absent is harmless). No announce + no
-    // surface change: ⌘N is a focus shortcut, not navigation.
+    // Story 5.2 — bare Escape closes the schedule editor sheet (the third
+    // overlay, after the gate and the hosts viewer). Placed BEFORE the ⌘N and
+    // Return branches so that while the sheet is open bare Escape never
+    // reaches them — the sheet is a window-level inert surface that owns
+    // Escape, and closing it must discard the scratchpad draft WITHOUT
+    // touching `stagedSchedules` (the editor's Cancel semantics; the store is
+    // untouched because nothing stages until Save). No ⌘Esc (bare Escape
+    // only), matching the macOS overlay dismiss contract. The gate and viewer
+    // branches above stay first: with overlays stacked, Escape peels the
+    // topmost-armed one (gate, then viewer, then the sheet).
+    if (!metaKey && key === 'Escape' && scheduleEditorTarget != null) {
+      setScheduleEditorTarget(null);
+      return;
+    }
+    // ⌘N is context-aware (Story 5.2): on surface 2 (Schedule) it opens the
+    // ADD schedule editor sheet — a NO-OP while the sheet is already open
+    // (re-opening must not wipe a half-typed draft). The open is also gated
+    // with `!gateOpen && !viewerOpen` (5-2 review patch): the gate and the
+    // hosts viewer are window-level inert surfaces, and mounting the editor
+    // sheet ABOVE either would break the modal layering — the same
+    // `!gateOpen`/`!viewerOpen` parity bare Return already carries. On every
+    // other surface ⌘N keeps the Story 2.2 focus behaviour unchanged (⌘N
+    // focuses the add-domain field; the ref is always attached and a no-op
+    // focus when the surface is absent is harmless). No announce + no surface
+    // change in either case.
     if (metaKey && key === 'n') {
+      if (surface === 2 && !gateOpen && !viewerOpen) {
+        if (scheduleEditorTarget == null) {
+          setScheduleEditorTarget('new');
+        }
+        return;
+      }
       addFieldRef.current?.focus();
       return;
     }
@@ -221,11 +263,17 @@ export function Shell(): React.ReactElement {
     // Story 3.2: also gated with `!gateOpen` so bare Return does NOT fire
     // Apply while the password gate sheet is open (the gate is a window-level
     // inert surface; the gate's own field owns Return when focused).
+    // Story 5.2: also gated with `scheduleEditorTarget == null` so bare
+    // Return does NOT fire Apply while the schedule editor sheet is open —
+    // the sheet is a window-level inert surface, and an Apply firing under a
+    // half-typed draft would be wrong (the editor's Save is the ONLY path
+    // that stages from the sheet).
     if (
       !metaKey &&
       (key === 'Return' || key === 'Enter') &&
       !viewerOpen &&
       !gateOpen &&
+      scheduleEditorTarget == null &&
       ((surface === 0 && !addFieldFocused && staged != null) ||
         (surface === 2 && stagedSchedules != null))
     ) {
@@ -307,10 +355,14 @@ export function Shell(): React.ReactElement {
           <Timer onOpenBlocklist={() => selectRow(BLOCKLIST_SURFACE_INDEX)} />
         ) : surface === 2 ? (
           // Story 5.1: the Schedule surface — rows + enable toggles riding
-          // the staged-then-Apply pipeline. The Shell stays surface-routing-
-          // only; the component owns its rows, Apply/Cancel controls, and
-          // empty state.
-          <Schedule />
+          // the staged-then-Apply pipeline. Story 5.2 threads the editor-sheet
+          // openers (the Shell owns the sheet's open state, since ⌘N/Esc live
+          // in this component's key handler): the empty-state Add… and each
+          // row's Edit control land here.
+          <Schedule
+            onAddSchedule={() => setScheduleEditorTarget('new')}
+            onEditSchedule={(id) => setScheduleEditorTarget(id)}
+          />
         ) : surface === 3 ? (
           // Story 3-4: <Panic>'s success-toast "Re-enable your blocklist"
           // link navigates the user to Blocklist (row 0). Threading the
@@ -345,6 +397,21 @@ export function Shell(): React.ReactElement {
       ) : null}
       {gateOpen ? (
         <PasswordGate onVerified={runGateAction} onClose={closeGate} />
+      ) : null}
+      {scheduleEditorTarget != null ? (
+        // Story 5.2 — the schedule editor sheet, mounted after the overlays
+        // (hosts viewer, password gate) and BEFORE the toast, so the toast
+        // still paints on top of it (the HostsViewer/PasswordGate mount-order
+        // precedent). `target` is `'new'` (add draft) or the schedule `id`
+        // (edit, pre-filled from the rendered staged ?? committed schedule).
+        // The editor's own Save + Cancel call `onClose`; bare Escape closes it
+        // via the key branch above. Closing NEVER touches `stagedSchedules` —
+        // the sheet is a scratchpad and only its Save stages.
+        <ScheduleEditor
+          key={scheduleEditorTarget}
+          target={scheduleEditorTarget}
+          onClose={() => setScheduleEditorTarget(null)}
+        />
       ) : null}
       {toast ? (
         // Story 4.5 — the Shell-level toast, rendered AFTER the overlays

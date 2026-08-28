@@ -21,6 +21,7 @@ function makeSchedule(overrides?: Partial<Schedule>): Schedule {
     startTime: '09:00',
     endTime: '17:00',
     enabled: true,
+    domains: ['example.com'],
     ...overrides,
   };
 }

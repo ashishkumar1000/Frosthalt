@@ -8,7 +8,11 @@
  * order the 1.5 hosts-file contract requires.
  */
 
-import { normaliseDomain, toHostsLines } from '../src/domain/normalise';
+import {
+  normaliseDomain,
+  normaliseTime,
+  toHostsLines,
+} from '../src/domain/normalise';
 
 // ---------------------------------------------------------------------------
 // normaliseDomain — golden cases (valid input -> lowercase apex)
@@ -134,6 +138,44 @@ test('every line matches the strict hosts-line regex from the 1.5 contract', () 
   }
 });
 
+// ---------------------------------------------------------------------------
+// normaliseTime (Story 5.2) — golden cases + the total contract
+// ---------------------------------------------------------------------------
+
+describe('normaliseTime', () => {
+  // The spec's golden examples: H:mm zero-pads to HH:mm.
+  test.each([
+    ['9:5', '09:05'],
+    ['9:30', '09:30'],
+    ['09:05', '09:05'],
+    ['23:59', '23:59'],
+    ['0:00', '00:00'],
+    ['  07:15  ', '07:15'],
+  ])('%p -> %p (trimmed + zero-padded)', (raw, expected) => {
+    expect(normaliseTime(raw)).toBe(expected);
+  });
+
+  test.each([
+    '', // empty
+    '   ', // whitespace only
+    '9', // no colon
+    '9:5:3', // too many parts
+    '0930', // no separator
+    '24:00', // hour out of range
+    '12:60', // minute out of range
+    '-1:30', // negative hour
+    '09:', // missing minute
+    ':30', // missing hour
+    'nine:thirty', // non-numeric
+    '9.30', // wrong separator
+    930 as unknown, // non-string input
+    null as unknown, // non-string input
+    undefined as unknown, // non-string input
+  ])('%p -> null (invalid or non-string)', (raw) => {
+    expect(normaliseTime(raw)).toBeNull();
+  });
+});
+
 // Compile-time pin: the module exports the two functions with their contracts.
 // If the signatures changed, these lines would be a compile error.
 const _normaliseDomainAcceptsStringReturnsStringOrNull: (
@@ -141,5 +183,9 @@ const _normaliseDomainAcceptsStringReturnsStringOrNull: (
 ) => string | null = normaliseDomain;
 const _toHostsLinesAcceptsStringReturnsStringArray: (apex: string) => string[] =
   toHostsLines;
+const _normaliseTimeAcceptsUnknownReturnsStringOrNull: (
+  raw: unknown,
+) => string | null = normaliseTime;
 void _normaliseDomainAcceptsStringReturnsStringOrNull;
 void _toHostsLinesAcceptsStringReturnsStringArray;
+void _normaliseTimeAcceptsUnknownReturnsStringOrNull;

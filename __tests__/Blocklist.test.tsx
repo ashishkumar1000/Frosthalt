@@ -700,6 +700,7 @@ test('a staged SCHEDULE draft alone does not enable Blocklist Apply or show its 
           startTime: '09:00',
           endTime: '17:00',
           enabled: false,
+          domains: ['example.com'],
         },
       ],
     });

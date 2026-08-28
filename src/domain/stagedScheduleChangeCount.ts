@@ -6,10 +6,10 @@
  * `stagedChangeCount.ts` (domains, Story 2.3). It counts schedules whose `id`
  * exists in one list but not the other (added / removed) plus schedules that
  * exist in both but differ in ANY field (`name`, `weekdays`, `startTime`,
- * `endTime`, `enabled`). Identity is `id` (the Schedule PK, Story 1-4's
- * schema); a field-level diff is required because the Schedule surface's
- * staged edits are toggles and later editor saves (5.2), which change fields
- * without changing the id.
+ * `endTime`, `enabled`, `domains`). Identity is `id` (the Schedule PK, Story
+ * 1-4's schema); a field-level diff is required because the Schedule
+ * surface's staged edits are toggles and later editor saves (5.2), which
+ * change fields without changing the id.
  *
  * Order-agnostic (a `Map` is used), mirroring the domain helper's discipline
  * and `draftEqualsCommitted` (`store.ts`): a reordered-but-value-equal pair
@@ -29,8 +29,20 @@ import type { Schedule } from '../config/types';
 /**
  * A canonical per-schedule value key: every field EXCEPT `id` (identity),
  * with `weekdays` canonicalised to a sorted, de-duplicated list so a
- * reordered-but-equal weekday set compares equal. Used for the O(1) field
+ * reordered-but-equal weekday set compares equal, and `domains` canonicalised
+ * the same way (Story 5.2 added the field). Used for the O(1) field
  * comparison across the two lists.
+ *
+ * Domains MUST be part of the key: the editor can change ONLY a schedule's
+ * domain set, and without it such an edit would compare equal and never
+ * clean-revert (`stagedSchedules` would stay non-null with a 0-change hint).
+ * Every read defends with `Array.isArray` — configStore validates the
+ * schedules ARRAY only, not its elements, so hand-edited configs and pre-5.2
+ * schedules may lack the field. A MISSING array canonicalises to `[]` (5-2
+ * review patch), the same key as an explicitly empty one: without this, a
+ * hand-edited `domains: []` schedule vs a toggle-copy of it with the field
+ * dropped would produce DIFFERENT keys and the enable-toggle clean-revert
+ * would fail (phantom "1 change staged" + a redundant admin prompt).
  *
  * The key is `JSON.stringify`d (not a `|`/`,` join) so a schedule whose
  * `name` itself contains a separator ("a|b" vs "a" + "b") can never produce
@@ -41,13 +53,17 @@ import type { Schedule } from '../config/types';
 export function scheduleValueKey(schedule: Schedule): string {
   const weekdays = Array.isArray(schedule.weekdays)
     ? [...new Set(schedule.weekdays)].sort((a, b) => a - b)
-    : null;
+    : [];
+  const domains = Array.isArray(schedule.domains)
+    ? [...new Set(schedule.domains)].sort()
+    : [];
   return JSON.stringify([
     String(schedule.name ?? ''),
     weekdays,
     String(schedule.startTime ?? ''),
     String(schedule.endTime ?? ''),
     String(schedule.enabled ?? ''),
+    domains,
   ]);
 }
 

@@ -23,12 +23,16 @@
  * gates on the DOMAIN buffer only — while the shared `apply()` commits both
  * fields in one write.
  *
- * Edit/Delete/Add are ANNOUNCE-ONLY placeholders: Story 5.2 owns the editor
- * sheet, Story 5.5 owns the removal confirm alert (which is a confirm alert,
- * NOT password-gated — escapes only, per the epic's gate scope). Each press
- * announces the placeholder to VoiceOver and raises a small component-local
- * toast (the 4.3 placeholder-toast precedent — no store toast, no gate, no
- * staging, no port call).
+ * Add and Edit are REAL in Story 5.2: the surface takes `onAddSchedule` /
+ * `onEditSchedule` props (the Shell owns the schedule-editor sheet's open
+ * state — component-local state would need a reverse channel to ⌘N/Esc, which
+ * live in the Shell's key handler) and wires the empty-state "Add…" button and
+ * each row's Edit control to them. Delete REMAINS an announce-only
+ * placeholder: Story 5.5 owns the removal confirm alert (which is a confirm
+ * alert, NOT password-gated — escapes only, per the epic's gate scope). Its
+ * press announces the placeholder to VoiceOver and raises a small
+ * component-local toast (the 4.3 placeholder-toast precedent — no store toast,
+ * no gate, no staging, no port call).
  *
  * On mount, VoiceOver announces "Schedule, N schedules" so the surface's
  * state is spoken on entry (the Shell's own nav announce stays as-is).
@@ -48,26 +52,38 @@ import { tokens } from '../theme/tokens';
 import { ApplyButton } from './ApplyButton';
 import { ScheduleRow } from './ScheduleRow';
 
+export interface ScheduleProps {
+  /**
+   * Opens the Shell-hosted add schedule editor sheet (empty-state "Add…" and
+   * the ⌘N shortcut both land here — the Shell owns the sheet).
+   */
+  onAddSchedule: () => void;
+  /**
+   * Opens the Shell-hosted edit schedule editor sheet pre-filled with the
+   * given schedule `id` (row Edit controls).
+   */
+  onEditSchedule: (id: string) => void;
+}
+
 /**
- * Empty-state copy (the spec's exact AC string). The primary "Add…"
- * placeholder button renders alongside it.
+ * Empty-state copy (the spec's exact AC string). The primary "Add…" button
+ * renders alongside it.
  */
 const EMPTY_STATE_TEXT =
   'No schedules yet. Add one to block on a recurring weekly window.';
 
-// ----- Story 5.2 / 5.5 placeholder copy ------------------------------------
-// Each placeholder is labelled for its future owner. The EDIT copy is the
-// Story 5.2 editor-sheet placeholder; the DELETE copy is the Story 5.5
-// removal-confirm placeholder; the ADD copy covers both the empty-state
-// "Add…" button and (later) the ⌘N add-editor entry point.
-const ADD_PLACEHOLDER_TEXT = 'Adding a schedule is coming soon.';
-const EDIT_PLACEHOLDER_TEXT = 'Editing schedules is coming soon.';
+// ----- Story 5.5 placeholder copy ------------------------------------------
+// The DELETE placeholder is labelled for its future owner. (Add/Edit
+// placeholders retired in 5.2 — those are real editor-sheet entry points now.)
 const DELETE_PLACEHOLDER_TEXT = 'Removing schedules is coming soon.';
 // Auto-dismiss timeout for the component-local placeholder toast (8 s, the
 // same auto-dismiss the Shell-level store toast uses).
 const PLACEHOLDER_TOAST_DISMISS_MS = 8000;
 
-export function Schedule(): React.ReactElement {
+export function Schedule({
+  onAddSchedule,
+  onEditSchedule,
+}: ScheduleProps): React.ReactElement {
   const committed = useDomainStore((s) => s.committed);
   const stagedSchedules = useDomainStore((s) => s.stagedSchedules);
   const applyStatus = useDomainStore((s) => s.applyStatus);
@@ -94,13 +110,14 @@ export function Schedule(): React.ReactElement {
   const changesHint =
     changeCount === 1 ? '1 change staged' : `${changeCount} changes staged`;
 
-  // ----- Story 5.2 / 5.5 placeholders (announce-only) -----------------------
+  // ----- Story 5.5 delete placeholder (announce-only) ------------------------
   // A small component-local toast (the 4.3 placeholder-toast precedent):
   // the message is announced to VoiceOver AND rendered as a subdued inline
   // toast for 8 s. No store toast (the Shell-level toast is for write
   // outcomes), no gate, no staging, no port call. Auto-dismisses via a
   // module-level timeout captured in a ref, cleared on unmount + on every
-  // re-show (the Panic.tsx local-toast timer discipline).
+  // re-show (the Panic.tsx local-toast timer discipline). Add/Edit no longer
+  // route through here — they call the Shell-owned editor-sheet props.
   const [placeholderToast, setPlaceholderToast] = useState<string | null>(null);
   const placeholderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -122,10 +139,6 @@ export function Schedule(): React.ReactElement {
       setPlaceholderToast(null);
     }, PLACEHOLDER_TOAST_DISMISS_MS);
   };
-  // Story 5.2 owns the real add-editor sheet (⌘N while on this surface).
-  const handleAdd = () => showPlaceholder(ADD_PLACEHOLDER_TEXT);
-  // Story 5.2 owns the real editor sheet.
-  const handleEdit = () => showPlaceholder(EDIT_PLACEHOLDER_TEXT);
   // Story 5.5 owns the removal confirm alert (NOT password-gated — escapes
   // only, per the epic's gate scope).
   const handleDelete = () => showPlaceholder(DELETE_PLACEHOLDER_TEXT);
@@ -149,21 +162,30 @@ export function Schedule(): React.ReactElement {
     <View style={styles.container}>
       <Text style={styles.title}>Schedule</Text>
       {isEmpty ? (
-        // Empty state: the spec's exact AC copy + a primary "Add…"
-        // placeholder button (Story 5.2 owns the real add editor).
+        // Empty state: the spec's exact AC copy + a primary "Add…" button
+        // that opens the Shell-hosted editor sheet (Story 5.2).
         <React.Fragment>
           <Text style={styles.body}>{EMPTY_STATE_TEXT}</Text>
           <Pressable
-            onPress={handleAdd}
+            onPress={onAddSchedule}
+            disabled={running}
             focusable
             enableFocusRing
             accessibilityRole="button"
             accessibilityLabel="Add…"
-            // No `accessibilityState` here (review BH-19): a hard-coded
-            // `disabled: false` is redundant noise — the enabled state is the
-            // default VoiceOver reading, and a hard-coded value would go
-            // stale the moment this placeholder gains real gating (5.2).
-            style={({ pressed }) => [styles.addButton, pressed && styles.addButtonPressed]}
+            accessibilityState={{ disabled: running }}
+            // Gated with `disabled={running}` (5-2 review patch): every row
+            // control is disabled while an Apply is in flight, and this
+            // primary button must not open the editor sheet mid-write either
+            // (a draft started against a config that is about to change).
+            // The conditional `accessibilityState` replaces review BH-19's
+            // "no hard-coded state" rule — the value is now real, not stale
+            // noise.
+            style={({ pressed }) => [
+              styles.addButton,
+              pressed && styles.addButtonPressed,
+              running && styles.addButtonDisabled,
+            ]}
           >
             <Text style={styles.addButtonLabel}>Add…</Text>
           </Pressable>
@@ -176,7 +198,7 @@ export function Schedule(): React.ReactElement {
                 key={s.id}
                 schedule={s}
                 onToggleEnabled={stageScheduleEnabledToggle}
-                onEdit={handleEdit}
+                onEdit={onEditSchedule}
                 onDelete={handleDelete}
                 disabled={running}
               />
@@ -277,6 +299,9 @@ const styles = StyleSheet.create({
   },
   addButtonPressed: {
     opacity: 0.85,
+  },
+  addButtonDisabled: {
+    opacity: 0.4,
   },
   addButtonLabel: {
     ...tokens.typography.body,

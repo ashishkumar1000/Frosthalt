@@ -17,10 +17,11 @@
  *     `onPress`) driving `onHoverIn`/`onHoverOut`.
  *
  * The summary is derived LIVE from the rendered schedule via the pure
- * `formatScheduleSummary` — never from a stale copy. The Edit and Delete
- * controls are ANNOUNCE-ONLY placeholders (Story 5.2 owns the editor sheet,
- * 5.5 owns the removal confirm alert): the surface wires them to a handler
- * that announces + toasts, and this row just forwards the schedule's `id`.
+ * `formatScheduleSummary` — never from a stale copy. Edit is REAL as of
+ * Story 5.2 (it opens the Shell-hosted editor sheet — the surface forwards the
+ * `onEditSchedule` prop); Delete REMAINS an announce-only placeholder (Story
+ * 5.5 owns the removal confirm alert): the surface wires it to a handler that
+ * announces + toasts, and this row just forwards the schedule's `id` to both.
  */
 
 import React, { useState } from 'react';
@@ -38,7 +39,7 @@ export interface ScheduleRowProps {
    */
   onToggleEnabled: (id: string) => void;
   /**
-   * Edit handler — a PLACEHOLDER for Story 5.2 (the editor sheet). Receives
+   * Edit handler — opens the Shell-hosted editor sheet (Story 5.2). Receives
    * the schedule's `id`.
    */
   onEdit: (id: string) => void;
@@ -118,10 +119,10 @@ export function ScheduleRow({
           {summary}
         </Text>
       </View>
-      {/* The Edit control (Story 5.2 placeholder — announce-only; the surface
-          owns the placeholder announce). Always MOUNTED (Tab/VoiceOver-
-          reachable) and visually revealed on row-hover OR focus, so the
-          pointer-only hover path and the keyboard Tab path both surface it. */}
+      {/* The Edit control (Story 5.2 — opens the Shell-hosted editor sheet).
+          Always MOUNTED (Tab/VoiceOver-reachable) and visually revealed on
+          row-hover OR focus, so the pointer-only hover path and the keyboard
+          Tab path both surface it. */}
       <Pressable
         onPress={() => onEdit(schedule.id)}
         disabled={disabled}

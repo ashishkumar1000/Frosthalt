@@ -304,6 +304,7 @@ test('one writeConfig carries BOTH fields: staged domains AND staged schedules r
       startTime: '09:00',
       endTime: '17:00',
       enabled: false,
+      domains: ['example.com'],
     },
   ];
 
@@ -338,6 +339,7 @@ test('a schedules-only Apply (staged: null) keeps committed.domains in the writt
       startTime: '20:00',
       endTime: '22:00',
       enabled: true,
+      domains: ['example.com'],
     },
   ];
 
@@ -365,6 +367,7 @@ test('a domains-only Apply (stagedSchedules: null) preserves NON-EMPTY committed
       startTime: '09:00',
       endTime: '17:00',
       enabled: true,
+      domains: ['example.com'],
     },
     {
       id: 'evenings',
@@ -373,6 +376,7 @@ test('a domains-only Apply (stagedSchedules: null) preserves NON-EMPTY committed
       startTime: '20:00',
       endTime: '22:00',
       enabled: false,
+      domains: ['example.com'],
     },
   ];
   const committed: Config = {

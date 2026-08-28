@@ -36,6 +36,17 @@ export interface Schedule {
   endTime: string;
   /** Enable toggle (block-affecting per AD-6 — staged-then-Apply). */
   enabled: boolean;
+  /**
+   * The hostnames this schedule blocks during its window (Story 5.2).
+   * Normalised, lowercase apex hostnames — the same shape `Domain.hostname`
+   * holds — but INDEPENDENT of the blocklist once scheduled (the timer
+   * precedent: removing a domain from the blocklist does not remove it from
+   * a schedule; an orphaned domain keeps its membership). `configStore`
+   * validates the `schedules` ARRAY only, not its elements, so EVERY read of
+   * this field defends with `Array.isArray` and treats a missing value as
+   * `[]` (hand-edited configs and pre-5.2 schedules may lack it).
+   */
+  domains: string[];
 }
 
 /** App-level settings (non-block-affecting; commits directly per AD-6). */

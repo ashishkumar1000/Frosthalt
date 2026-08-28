@@ -435,6 +435,7 @@ test('⌘3 with populated committed.schedules renders the schedule rows', async 
           startTime: '09:00',
           endTime: '17:00',
           enabled: true,
+          domains: ['example.com'],
         },
       ],
     },
@@ -1131,6 +1132,7 @@ test('bare Return on surface 2 with stagedSchedules != null fires apply()', asyn
           startTime: '09:00',
           endTime: '17:00',
           enabled: false,
+          domains: ['example.com'],
         },
       ],
     });
@@ -2254,4 +2256,259 @@ test('Shell-level end-early e2e: press -> config write (activeTimer:null) -> hos
   expect(extractText(testRenderer.toJSON())).not.toContain(
     'Session ended. 1 domain unblocked.',
   );
+});
+// ===========================================================================
+// Story 5.2 — the schedule editor sheet wiring: ⌘N on the Schedule surface
+// (surface 2, reached via ⌘3) opens the ADD editor; ⌘N while it is open is a
+// no-op (the draft must not be wiped by a remount); bare Escape closes it;
+// bare Return does NOT fire Apply while it is open (the editor is a
+// window-level inert surface, mirroring the viewer/gate Return gates).
+// ===========================================================================
+
+/** Navigate to the Schedule surface (surface 2) and open the ADD editor. */
+async function openScheduleEditor(
+  container: ReactTestRenderer.ReactTestInstance,
+): Promise<void> {
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '3' } });
+  });
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: 'n' } });
+  });
+}
+
+/** Find the editor's name field by its accessibilityLabel. */
+function findEditorNameField(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance | undefined {
+  return root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onChangeText === 'function' &&
+      node.props.accessibilityLabel === 'Schedule name',
+  )[0];
+}
+
+test('⌘N on the Schedule surface opens the ADD schedule editor', async () => {
+  seedForReturn({ staged: null });
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  // Before: no editor on the Schedule surface.
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '3' } });
+  });
+  expect(extractText(testRenderer.toJSON())).not.toContain('Add schedule');
+
+  await openScheduleEditor(container);
+
+  // The ADD editor sheet renders (its title is present; the EDIT title is not).
+  const text = extractText(testRenderer.toJSON());
+  expect(text).toContain('Add schedule');
+  expect(text).not.toContain('Edit schedule');
+  // Merely OPENING the sheet stages nothing (the scratchpad invariant).
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('⌘N while the editor is open is a no-op (the draft is not wiped by a remount)', async () => {
+  seedForReturn({ staged: null });
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await openScheduleEditor(container);
+
+  // Type a partial draft, then press ⌘N again.
+  const field = findEditorNameField(testRenderer.root);
+  expect(field).toBeDefined();
+  ReactTestRenderer.act(() => {
+    field!.props.onChangeText('Focus mornings');
+  });
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: 'n' } });
+  });
+
+  // The typed draft survived (a remount from a second setScheduleEditorTarget
+  // would have wiped it back to ''). The finder can match more than one node
+  // for the same TextInput under the RN preset (the host component spreads
+  // the props onto its inner node — why the AddDomain assertions use >= 1),
+  // so assert EVERY match carries the typed value.
+  const fields = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onChangeText === 'function' &&
+      node.props.accessibilityLabel === 'Schedule name',
+  );
+  expect(fields.length).toBeGreaterThanOrEqual(1);
+  for (const field of fields) {
+    expect(field.props.value).toBe('Focus mornings');
+  }
+  // Still the ADD editor (⌘N did not toggle the target to anything else).
+  expect(extractText(testRenderer.toJSON())).toContain('Add schedule');
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('bare Escape closes the schedule editor without staging anything', async () => {
+  seedForReturn({ staged: null });
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await openScheduleEditor(container);
+  expect(extractText(testRenderer.toJSON())).toContain('Add schedule');
+
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Escape' } });
+  });
+
+  expect(extractText(testRenderer.toJSON())).not.toContain('Add schedule');
+  expect(extractText(testRenderer.toJSON())).not.toContain('Edit schedule');
+  // Closed WITHOUT staging — Esc discards the draft (the scratchpad invariant).
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('bare Return does NOT fire apply() while the schedule editor is open (even with both buffers dirty)', async () => {
+  seedForReturn({
+    staged: [{ hostname: 'example.com', alwaysOn: false }],
+  });
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      stagedSchedules: [
+        {
+          id: 'focus',
+          name: 'Focus',
+          weekdays: [0, 1, 2, 3, 4],
+          startTime: '09:00',
+          endTime: '17:00',
+          enabled: false,
+          domains: ['example.com'],
+        },
+      ],
+    });
+  });
+  const applyMock = mockApply();
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  await openScheduleEditor(container);
+  // Sanity: the editor is open (its sheet title is present).
+  expect(extractText(testRenderer.toJSON())).toContain('Add schedule');
+
+  // Bare Return on surface 2 with BOTH buffers dirty would fire apply() if
+  // the editor-open gate were absent (see the 5.1 surface-2 Return test).
+  await ReactTestRenderer.act(async () => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: false, key: 'Return' } });
+    await Promise.resolve();
+  });
+
+  expect(applyMock).not.toHaveBeenCalled();
+  // The editor is still open — Return did not close or commit it either.
+  expect(extractText(testRenderer.toJSON())).toContain('Add schedule');
+  expect(useDomainStore.getState().stagedSchedules).not.toBeNull();
+});
+
+// 5-2 review patch: the row-Edit and Add… entry points are exercised THROUGH
+// the Shell — a regression turning the row Edit into the ADD sheet (which
+// would stage a duplicate `-2` schedule on Save) must fail here, not just in
+// the component tests.
+
+/** Find a button-role node by its exact accessibilityLabel. */
+function findButtonIn(
+  root: ReactTestRenderer.ReactTestInstance,
+  label: string,
+): ReactTestRenderer.ReactTestInstance | undefined {
+  return root.findAll(
+    (node) =>
+      node.props &&
+      node.props.accessibilityRole === 'button' &&
+      node.props.accessibilityLabel === label,
+  )[0];
+}
+
+test('the row Edit control opens the EDIT sheet pre-filled with that schedule', async () => {
+  seedForReturn({ staged: null });
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        schedules: [
+          {
+            id: 'focus-mornings',
+            name: 'Focus mornings',
+            weekdays: [0, 1, 2, 3, 4],
+            startTime: '09:00',
+            endTime: '17:00',
+            enabled: true,
+            domains: ['example.com'],
+          },
+        ],
+      },
+    });
+  });
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  // Navigate to the Schedule surface (surface 2).
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '3' } });
+  });
+
+  // Press the row's Edit control.
+  const edit = findButtonIn(testRenderer.root, 'Edit Focus mornings');
+  expect(edit).toBeDefined();
+  await ReactTestRenderer.act(() => {
+    edit!.props.onPress();
+  });
+
+  // The EDIT sheet is open and pre-filled from that row — NOT the ADD sheet
+  // (an ADD sheet here would stage a duplicate `-2` schedule on Save).
+  const text = extractText(testRenderer.toJSON());
+  expect(text).toContain('Edit schedule');
+  expect(text).not.toContain('Add schedule');
+  const nameField = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onChangeText === 'function' &&
+      node.props.accessibilityLabel === 'Schedule name',
+  );
+  expect(nameField.length).toBeGreaterThanOrEqual(1);
+  expect(nameField[0].props.value).toBe('Focus mornings');
+  // Merely opening the sheet stages nothing.
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('the empty-state Add… button opens the ADD sheet with an empty name field', async () => {
+  seedForReturn({ staged: null });
+
+  const testRenderer = renderShell();
+  const container = findKeyDownContainer(testRenderer.root);
+
+  // Navigate to the Schedule surface (surface 2) — the committed list is
+  // empty, so the empty state with its Add… button renders.
+  await ReactTestRenderer.act(() => {
+    container.props.onKeyDown({ nativeEvent: { metaKey: true, key: '3' } });
+  });
+  expect(extractText(testRenderer.toJSON())).toContain(
+    'No schedules yet. Add one to block on a recurring weekly window.',
+  );
+
+  const add = findButtonIn(testRenderer.root, 'Add…');
+  expect(add).toBeDefined();
+  await ReactTestRenderer.act(() => {
+    add!.props.onPress();
+  });
+
+  // The ADD sheet is open with an EMPTY draft — not a pre-filled edit.
+  const text = extractText(testRenderer.toJSON());
+  expect(text).toContain('Add schedule');
+  expect(text).not.toContain('Edit schedule');
+  const nameField = testRenderer.root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.onChangeText === 'function' &&
+      node.props.accessibilityLabel === 'Schedule name',
+  );
+  expect(nameField.length).toBeGreaterThanOrEqual(1);
+  expect(nameField[0].props.value).toBe('');
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
 });

@@ -44,6 +44,13 @@
  *     `{ ok: false, error: "not-found" }` without staging when `hostname` is not
  *     in the draft (defensive — the UI only triggers remove from a rendered
  *     row). Removal is STAGED (Apply commits, not password-gated).
+ *   - `stageScheduleUpsert(schedule)` (Story 5.2) — stage ONE full schedule
+ *     add/edit from the editor sheet: validate + normalise (invalid ->
+ *     `{ok:false, error:'invalid-schedule'}`, nothing staged), upsert onto
+ *     `stagedSchedules ?? committed.schedules` (replace by `id`, else
+ *     append), new array reference on mutation, clean-revert to `null` when
+ *     the result equals `committed.schedules`. No gate (FR-15 exempts
+ *     add/edit), no ports, no toast.
  *   - `cancelStaged()` — discard staged back to last-committed.
  *   - `apply()` — enqueue a serialized Apply run; returns its envelope.
  *   - `stageStartTimer({durationMs, selected})` (Story 4.2) — start a focus
@@ -74,7 +81,7 @@ import { create } from 'zustand';
 import type { Config, Domain, Schedule } from '../config/types';
 import { readConfig, writeConfig } from '../config/configStore';
 import { hashPassword, GATE_MAX_ATTEMPTS, GATE_THROTTLE_MS } from '../config/password';
-import { normaliseDomain } from './normalise';
+import { normaliseDomain, normaliseTime } from './normalise';
 import { runApply } from './apply';
 import { effectiveHostsLines } from './effectiveBlocklist';
 import { computeDrift } from './drift';
@@ -196,6 +203,22 @@ export interface DomainState {
    * rides the staged-then-Apply pipeline rather than committing directly.
    */
   stageScheduleEnabledToggle: (id: string) => WriteResult;
+  /**
+   * Stage one full schedule upsert (Story 5.2) — the editor sheet's Save.
+   * Validates + normalises the incoming draft (name non-empty, >=1 weekday,
+   * >=1 domain, both times parse via `normaliseTime`, end strictly after
+   * start); invalid input returns `{ok:false, error:'invalid-schedule'}`
+   * WITHOUT staging anything. Builds on `stagedSchedules ??
+   * committed.schedules`, REPLACES the schedule with the same `id` in place
+   * (else appends), and produces a NEW array reference when it mutates so the
+   * apply-queue's mid-run-edit detection still works. Clean-revert: if the
+   * resulting draft equals `committed.schedules` (order-agnostic, via
+   * `scheduleValueKey`) `stagedSchedules` is cleared to `null` — a
+   * net-identical edit Save fires no redundant admin prompt on the next
+   * Apply. No ports, no gate, no toast — FR-15 exempts add/edit from the
+   * password gate, and the Apply button already owns the prompt.
+   */
+  stageScheduleUpsert: (schedule: Schedule) => WriteResult;
   cancelStaged: () => void;
   /**
    * Discard the staged SCHEDULE draft only (Story 5.1) — sets
@@ -623,6 +646,105 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     // `stageAlwaysOnToggle`'s no-redundant-Apply principle — a net-no-op
     // toggle (enable then disable) must NOT leave a dirty draft that would
     // force an admin prompt to write an identical config.
+    if (scheduleDraftEqualsCommitted(next, get().committed.schedules)) {
+      set({ stagedSchedules: null });
+      return { ok: true };
+    }
+    set({ stagedSchedules: next });
+    return { ok: true };
+  },
+
+  stageScheduleUpsert: (raw) => {
+    // ---- Validate + normalise FIRST (fail-safe: nothing stages on a bad
+    // draft). The editor already gates its Save button on the same checks, so
+    // reaching here with an invalid draft means a non-UI caller — still
+    // rejected, never staged. This is the store-side re-run of the exact
+    // helpers the editor uses live (`normaliseTime` / `normaliseDomain`), the
+    // single-source-of-truth pattern from `stageDomainAdd`.
+    const name = typeof raw?.name === 'string' ? raw.name.trim() : '';
+    if (name === '') {
+      return { ok: false, error: 'invalid-schedule' };
+    }
+    // Weekdays: keep only valid 0-6 integer codes, de-duplicated, ascending —
+    // a hand-built draft with duplicates or out-of-range codes is coerced
+    // rather than trusted.
+    const weekdays = (
+      Array.isArray(raw.weekdays) ? raw.weekdays : []
+    ).filter((d): d is Schedule['weekdays'][number] =>
+      Number.isInteger(d) && d >= 0 && d <= 6,
+    );
+    const dedupedWeekdays = [...new Set(weekdays)].sort((a, b) => a - b);
+    if (dedupedWeekdays.length === 0) {
+      return { ok: false, error: 'invalid-schedule' };
+    }
+    const startTime = normaliseTime(raw?.startTime);
+    const endTime = normaliseTime(raw?.endTime);
+    if (startTime == null || endTime == null) {
+      return { ok: false, error: 'invalid-schedule' };
+    }
+    // Same-day windows only: zero-padded `HH:mm` compares lexically exactly
+    // as it compares chronologically, so this plain string compare is the
+    // whole window rule (end must be strictly AFTER start — equal is invalid).
+    if (endTime <= startTime) {
+      return { ok: false, error: 'invalid-schedule' };
+    }
+    // Domains: re-normalise each entry (committed hostnames are idempotent
+    // under `normaliseDomain`), drop anything unparseable, de-duplicate.
+    // Order preserved (the editor's committed-order-first union) — the value
+    // key canonicalises for comparison.
+    const rawDomains = Array.isArray(raw?.domains) ? raw.domains : [];
+    const domains = [
+      ...new Set(
+        rawDomains
+          .map((d) => (typeof d === 'string' ? normaliseDomain(d) : null))
+          .filter((d): d is string => d != null),
+      ),
+    ];
+    if (domains.length === 0) {
+      return { ok: false, error: 'invalid-schedule' };
+    }
+    const id = typeof raw?.id === 'string' ? raw.id.trim() : '';
+    if (id === '') {
+      // Defensive beyond the spec's enumerated list: the editor always builds
+      // an id (existing on edit, `nextScheduleId` on add), but an id-less
+      // draft would corrupt the PK.
+      return { ok: false, error: 'invalid-schedule' };
+    }
+    // `enabled` is a boolean from the editor (default true for a new
+    // schedule); coerce rather than trust.
+    const enabled = typeof raw?.enabled === 'boolean' ? raw.enabled : true;
+    const staged: Schedule = {
+      id,
+      name,
+      weekdays: dedupedWeekdays,
+      startTime,
+      endTime,
+      enabled,
+      domains,
+    };
+
+    // ---- Upsert on top of the current schedule draft (or committed, if
+    // clean). Replace the same-`id` schedule in place, else append — the
+    // exact build-on-draft + new-reference discipline of
+    // `stageScheduleEnabledToggle` above.
+    const base = get().stagedSchedules ?? get().committed.schedules;
+    const exists = base.some((s) => s.id === id);
+    // Map/filter/spread produce a NEW array reference either way, so the
+    // apply-queue's mid-run-edit detection
+    // (`s.stagedSchedules === schedulesSnapshot`) still works: an upsert that
+    // lands while an Apply is in flight is always a different reference from
+    // the snapshot the running Apply captured.
+    const next = exists
+      ? base.map((s) => (s.id === id ? staged : s))
+      : [...base, staged];
+    // Clean-revert: if the resulting draft equals committed.schedules (same
+    // ids + ALL fields INCLUDING domains, order-agnostic —
+    // `scheduleDraftEqualsCommitted` -> `scheduleValueKey`), clear
+    // `stagedSchedules` to `null`. This is the net-identical-edit path from
+    // the spec's I/O matrix: open a schedule, change nothing (or revert every
+    // field), Save -> the draft equals committed, so no dirty buffer and no
+    // redundant admin prompt on the next Apply. Domains MUST be inside
+    // `scheduleValueKey` for a domain-only edit to clean-revert too.
     if (scheduleDraftEqualsCommitted(next, get().committed.schedules)) {
       set({ stagedSchedules: null });
       return { ok: true };

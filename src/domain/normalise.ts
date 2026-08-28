@@ -96,6 +96,41 @@ export function normaliseDomain(raw: unknown): string | null {
 }
 
 /**
+ * Normalise a raw time entry into a zero-padded `HH:mm` string, or `null`
+ * when the input is not a usable 24-hour clock time (Story 5.2).
+ *
+ * PURE and TOTAL (mirrors `normaliseDomain`'s contract): no throws, no state.
+ * Accepts `H:mm` / `HH:mm` — trim, exactly one colon, 1-2 digit hour and
+ * minute, hour <= 23, minute <= 59 — and zero-pads both parts
+ * (`'9:5'` -> `'09:05'`, `'9:30'` -> `'09:30'`). Everything else (empty,
+ * whitespace, `9`, `9:5:3`, `24:00`, `12:60`, `-1:30`, non-string) is `null`.
+ *
+ * The zero-padded result is what makes the schedule's start/end comparison
+ * safe: zero-padded `HH:mm` strings compare LEXICALLY exactly as they compare
+ * CHRONOLOGICALLY, so the editor and `stageScheduleUpsert` gate same-day
+ * windows with a plain `end > start` string compare. The editor calls this
+ * LIVE in render (the `AddDomain.tsx` precedent) and the store re-runs it on
+ * Save — one source of truth, no UI/store drift.
+ */
+const TIME_RE = /^(\d{1,2}):(\d{1,2})$/;
+
+export function normaliseTime(raw: unknown): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const match = TIME_RE.exec(raw.trim());
+  if (match == null) {
+    return null;
+  }
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) {
+    return null;
+  }
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+}
+
+/**
  * Produce the 4 managed hosts lines for a normalised apex hostname: apex and
  * `www.`<apex> on `0.0.0.0` (IPv4) and `::` (IPv6), lowercase. The order is
  * fixed and matches the 1.5 hosts-file contract golden section:

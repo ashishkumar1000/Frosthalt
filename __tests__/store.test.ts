@@ -3209,6 +3209,7 @@ const FOCUS_SCHEDULE: Schedule = {
   startTime: '09:00',
   endTime: '17:00',
   enabled: true,
+  domains: ['example.com'],
 };
 
 const EVENINGS_SCHEDULE: Schedule = {
@@ -3218,6 +3219,7 @@ const EVENINGS_SCHEDULE: Schedule = {
   startTime: '20:00',
   endTime: '22:00',
   enabled: false,
+  domains: ['example.com'],
 };
 
 // ---------------------------------------------------------------------------
@@ -3312,6 +3314,41 @@ test('stageScheduleEnabledToggle clean-revert: toggling off then on reverts stag
   expect(r2).toStrictEqual({ ok: true });
   // Net = committed -> the schedule buffer reverts to null. No redundant
   // admin prompt on the next Apply (mirrors stageAlwaysOnToggle's clean-revert).
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+// 5-2 review patch: the value key canonicalises a MISSING weekdays/domains
+// array to [] (the same as an explicit empty one), so an enable-toggle
+// clean-revert works even on a hand-edited or pre-5.2 schedule whose domains
+// are empty or absent.
+test('stageScheduleEnabledToggle clean-revert on a schedule with committed domains: [] (empty array)', () => {
+  const emptyDomainsSchedule: Schedule = { ...FOCUS_SCHEDULE, domains: [] };
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [emptyDomainsSchedule] },
+    stagedSchedules: null,
+  });
+
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  expect(useDomainStore.getState().stagedSchedules).not.toBeNull();
+
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleEnabledToggle clean-revert on a schedule whose domains field is MISSING entirely', () => {
+  const missingDomainsSchedule = {
+    ...FOCUS_SCHEDULE,
+    domains: undefined,
+  } as unknown as Schedule;
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [missingDomainsSchedule] },
+    stagedSchedules: null,
+  });
+
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
+  expect(useDomainStore.getState().stagedSchedules).not.toBeNull();
+
+  useDomainStore.getState().stageScheduleEnabledToggle('focus');
   expect(useDomainStore.getState().stagedSchedules).toBeNull();
 });
 
@@ -3680,4 +3717,307 @@ test('a newer DOMAIN draft staged during an in-flight Apply is retained while th
     { hostname: 'social.com', alwaysOn: true },
   ]);
   expect(state.committed.domains).toStrictEqual([]);
+});
+
+// ===========================================================================
+// Story 5.2 — stageScheduleUpsert (the editor sheet's Save)
+//
+// Validation + normalisation re-run (the store-side mirror of the editor's
+// live gate), upsert semantics (replace same-id in place, else append) on
+// `stagedSchedules ?? committed.schedules`, NEW array reference on mutation,
+// and the clean-revert (including the DOMAIN-ONLY edit round-trip, which is
+// why `scheduleValueKey` must include domains).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Validation envelopes
+// ---------------------------------------------------------------------------
+
+test('stageScheduleUpsert rejects an empty name without staging', () => {
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    name: '   ',
+  });
+  expect(result).toStrictEqual({ ok: false, error: 'invalid-schedule' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleUpsert rejects 0 weekdays without staging', () => {
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    weekdays: [],
+  });
+  expect(result).toStrictEqual({ ok: false, error: 'invalid-schedule' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleUpsert rejects out-of-range weekdays that leave 0 valid days', () => {
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    // A hand-built draft with junk weekday codes: 7 and -1 are dropped, and
+    // with nothing valid left the draft is invalid.
+    weekdays: [7, -1] as unknown as Schedule['weekdays'],
+  });
+  expect(result).toStrictEqual({ ok: false, error: 'invalid-schedule' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test.each([
+  '9', // no colon
+  '24:00', // hour out of range
+  '09:60', // minute out of range
+  '', // empty
+])('stageScheduleUpsert rejects an unparseable start time %p', (start) => {
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    startTime: start,
+  });
+  expect(result).toStrictEqual({ ok: false, error: 'invalid-schedule' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleUpsert rejects an unparseable end time without staging', () => {
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    endTime: '9:5:3',
+  });
+  expect(result).toStrictEqual({ ok: false, error: 'invalid-schedule' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test.each([
+  ['09:00', '09:00'], // equal is invalid (end strictly after start)
+  ['17:00', '09:00'], // end before start
+])('stageScheduleUpsert rejects end <= start (%p -> %p)', (start, end) => {
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    startTime: start,
+    endTime: end,
+  });
+  expect(result).toStrictEqual({ ok: false, error: 'invalid-schedule' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleUpsert rejects 0 domains without staging', () => {
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    domains: [],
+  });
+  expect(result).toStrictEqual({ ok: false, error: 'invalid-schedule' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleUpsert rejects domains that all fail normalisation', () => {
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    domains: ['not a domain', '0.0.0.0; rm -rf /'],
+  });
+  expect(result).toStrictEqual({ ok: false, error: 'invalid-schedule' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleUpsert rejects a draft with no usable id without staging', () => {
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    id: '   ',
+  });
+  expect(result).toStrictEqual({ ok: false, error: 'invalid-schedule' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Normalisation re-run + upsert behaviour
+// ---------------------------------------------------------------------------
+
+test('stageScheduleUpsert APPENDS a new schedule onto the clean committed list (new array reference)', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+  });
+
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    id: 'evenings',
+    name: '  Evenings  ',
+    weekdays: [6, 5], // unsorted; the store sorts + dedupes
+    startTime: '9:5', // zero-padded on stage
+    endTime: '22:00',
+    enabled: false,
+    domains: ['NEWS.site', 'news.site', 'https://video.com/watch'], // dupes + scheme
+  });
+
+  expect(result).toStrictEqual({ ok: true });
+  const state = useDomainStore.getState();
+  expect(state.stagedSchedules).toStrictEqual([
+    FOCUS_SCHEDULE,
+    {
+      id: 'evenings',
+      name: 'Evenings', // trimmed
+      weekdays: [5, 6], // sorted + deduped
+      startTime: '09:05', // zero-padded by normaliseTime
+      endTime: '22:00',
+      enabled: false,
+      domains: ['news.site', 'video.com'], // normalised + deduped
+    },
+  ]);
+  // NEW array reference, even though the base was the committed array.
+  expect(state.stagedSchedules).not.toBe(state.committed.schedules);
+  expect(state.applyStatus).toBe('idle');
+});
+
+test('stageScheduleUpsert REPLACES the same-id schedule in place when editing', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE] },
+  });
+
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    name: 'Deep focus',
+    startTime: '08:00',
+    endTime: '12:00',
+    domains: ['news.site'],
+  });
+
+  expect(result).toStrictEqual({ ok: true });
+  const state = useDomainStore.getState();
+  expect(state.stagedSchedules).toStrictEqual([
+    {
+      ...FOCUS_SCHEDULE,
+      name: 'Deep focus',
+      startTime: '08:00',
+      endTime: '12:00',
+      domains: ['news.site'],
+    },
+    EVENINGS_SCHEDULE, // untouched, same position
+  ]);
+});
+
+test('stageScheduleUpsert builds on the staged draft, not committed, when a draft exists', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: [{ ...FOCUS_SCHEDULE, enabled: false }],
+  });
+
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    id: 'evenings',
+    name: 'Evenings',
+    weekdays: [5, 6],
+    startTime: '20:00',
+    endTime: '22:00',
+    enabled: true,
+    domains: ['example.com'],
+  });
+
+  expect(result).toStrictEqual({ ok: true });
+  // The staged toggle is PRESERVED (built on the draft) and the upsert
+  // appended after it.
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+    {
+      id: 'evenings',
+      name: 'Evenings',
+      weekdays: [5, 6],
+      startTime: '20:00',
+      endTime: '22:00',
+      enabled: true,
+      domains: ['example.com'],
+    },
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// Clean-revert
+// ---------------------------------------------------------------------------
+
+test('stageScheduleUpsert clean-reverts to null on a NET-IDENTICAL edit', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+  });
+
+  // Re-stage a toggle first so the buffer is dirty, then Save an upsert that
+  // restores the exact committed value (reverting the toggle field).
+  useDomainStore.getState().stageScheduleEnabledToggle('focus'); // off
+  expect(useDomainStore.getState().stagedSchedules).not.toBeNull();
+
+  const result = useDomainStore.getState().stageScheduleUpsert(FOCUS_SCHEDULE);
+  expect(result).toStrictEqual({ ok: true });
+  // Clean-revert: the draft equals committed (order-agnostic value compare),
+  // so the buffer clears — no redundant admin prompt on the next Apply.
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleUpsert clean-reverts on a DOMAIN-ONLY edit round-trip (scheduleValueKey includes domains)', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+  });
+
+  // Domain-only change -> the buffer holds it (and the value key sees it).
+  useDomainStore.getState().stageScheduleUpsert({
+    ...FOCUS_SCHEDULE,
+    domains: ['news.site'],
+  });
+  expect(useDomainStore.getState().stagedSchedules).not.toBeNull();
+
+  // Reverting JUST the domains (every other field unchanged) must also
+  // clean-revert — this is the regression the spec's "scheduleValueKey MUST
+  // include domains" clause pins: without domains in the key, the second
+  // upsert would compare equal and keep a 0-change dirty buffer.
+  const result = useDomainStore.getState().stageScheduleUpsert(FOCUS_SCHEDULE);
+  expect(result).toStrictEqual({ ok: true });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Mid-run-edit reference discipline
+// ---------------------------------------------------------------------------
+
+test('stageScheduleUpsert produces a NEW array reference mid-Apply so the running run retains it', async () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+  });
+
+  // A domain edit gives the Apply something real to run (a clean-everything
+  // Apply short-circuits at call time without touching the ports), and its
+  // snapshot is what the run carries.
+  useDomainStore.getState().stageDomainAdd('social.com');
+
+  let resolveFirst: ((v: WriteResult) => void) | null = null;
+  shellNative.writeHosts.mockImplementation(
+    () => new Promise<WriteResult>((res) => {
+      resolveFirst = res;
+    }),
+  );
+
+  // The in-flight Apply captures `stagedSchedules: null` (clean schedule
+  // buffer at call time).
+  const p = useDomainStore.getState().apply();
+  await flushMicrotasks();
+
+  // The upsert lands mid-run: a NEW array reference, distinct from the null
+  // snapshot, so the success handler retains it rather than clobbering it.
+  const result = useDomainStore.getState().stageScheduleUpsert({
+    id: 'evenings',
+    name: 'Evenings',
+    weekdays: [5, 6],
+    startTime: '20:00',
+    endTime: '22:00',
+    enabled: true,
+    domains: ['example.com'],
+  });
+  expect(result).toStrictEqual({ ok: true });
+
+  resolveFirst!({ ok: true });
+  await p;
+
+  const state = useDomainStore.getState();
+  // The upsert staged BEFORE the run committed, so the run (snapshot null)
+  // did not carry it — the buffer is RETAINED for the next Apply. It was
+  // appended onto the clean committed list (focus + the new evenings).
+  expect(state.stagedSchedules).not.toBeNull();
+  expect(state.stagedSchedules).toHaveLength(2);
+  expect(state.stagedSchedules![0]).toStrictEqual(FOCUS_SCHEDULE);
+  expect(state.stagedSchedules![1].id).toBe('evenings');
+  // The DOMAIN slice (the run's own snapshot) committed + cleared normally.
+  expect(state.committed.domains).toStrictEqual([
+    { hostname: 'social.com', alwaysOn: true },
+  ]);
+  expect(state.staged).toBeNull();
 });

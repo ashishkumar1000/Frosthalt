@@ -18,7 +18,9 @@
  *     rows, no Apply, no Cancel.
  *   - Mount announce: "Schedule, N schedule(s)".
  *   - Tab order: enable -> name -> edit -> delete (document order).
- *   - Add/Edit/Delete placeholders announce + toast (5.2/5.5 owners).
+ *   - Add/Edit open the Shell-owned editor sheet via the `onAddSchedule` /
+ *     `onEditSchedule` props (Story 5.2); Delete remains the 5.5 placeholder
+ *     (announce + toast).
  *   - The "N changes staged" hint (singular / plural / absent).
  *
  * The store actions themselves are unit-tested in `store.test.ts`; here we
@@ -127,6 +129,7 @@ const FOCUS_MORNINGS: ScheduleType = {
   startTime: '09:00',
   endTime: '17:00',
   enabled: true,
+  domains: ['example.com'],
 };
 
 const EVENINGS: ScheduleType = {
@@ -136,6 +139,7 @@ const EVENINGS: ScheduleType = {
   startTime: '20:00',
   endTime: '22:00',
   enabled: false,
+  domains: ['example.com'],
 };
 
 /** Seeds the store state for a test and clears the announce mock. */
@@ -146,6 +150,8 @@ function seedState(overrides: {
   applyStatus?: 'idle' | 'running';
 }): void {
   announceForAccessibility.mockClear();
+  onAddSchedule.mockClear();
+  onEditSchedule.mockClear();
   // Wrap in act(): a previous test's renderer may still be subscribed to the
   // store (react-test-renderer does not auto-unmount), so a bare setState
   // would re-render it outside act and warn. act batches the update.
@@ -178,10 +184,22 @@ afterEach(() => {
   }
 });
 
+// Story 5.2 — the Shell-owned editor-sheet openers, wired as props. The
+// surface must call these (NOT stage anything) when Add…/Edit are pressed;
+// the sheet itself is tested in `ScheduleEditor.test.tsx` and the Shell
+// wiring in `Shell.test.tsx`.
+const onAddSchedule = jest.fn();
+const onEditSchedule = jest.fn();
+
 function renderSchedule() {
   let testRenderer!: ReturnType<typeof ReactTestRenderer.create>;
   ReactTestRenderer.act(() => {
-    testRenderer = ReactTestRenderer.create(<Schedule />);
+    testRenderer = ReactTestRenderer.create(
+      <Schedule
+        onAddSchedule={onAddSchedule}
+        onEditSchedule={onEditSchedule}
+      />,
+    );
   });
   currentRenderer = testRenderer;
   return testRenderer;
@@ -543,10 +561,11 @@ test('each row mounts enable -> name -> edit -> delete in document order', () =>
 });
 
 // ---------------------------------------------------------------------------
-// Story 5.2 / 5.5 placeholders: Add/Edit/Delete announce + toast
+// Story 5.2: Add…/Edit open the Shell-owned editor sheet via props;
+// Story 5.5: Delete remains the announce + toast placeholder
 // ---------------------------------------------------------------------------
 
-test('the empty-state Add… button announces the add placeholder and toasts it', () => {
+test('the empty-state Add… button calls the onAddSchedule prop (the Shell opens the editor sheet)', () => {
   seedState({ schedules: [], stagedSchedules: null });
 
   const testRenderer = renderSchedule();
@@ -556,19 +575,20 @@ test('the empty-state Add… button announces the add placeholder and toasts it'
     add!.props.onPress();
   });
 
-  // Announced to VoiceOver...
-  expect(announceForAccessibility).toHaveBeenCalledWith(
-    'Adding a schedule is coming soon.',
-  );
-  // ...and rendered as the component-local placeholder toast.
-  expect(extractText(testRenderer.toJSON())).toContain(
-    'Adding a schedule is coming soon.',
-  );
-  // Placeholder only — nothing staged, Apply still gated off.
+  expect(onAddSchedule).toHaveBeenCalledTimes(1);
+  // The surface does NOT stage or announce on its own — the sheet owns the
+  // draft, and only its Save stages.
   expect(useDomainStore.getState().stagedSchedules).toBeNull();
+  expect(announceForAccessibility).not.toHaveBeenCalledWith(
+    'Adding a schedule is coming soon.',
+  );
+  // No placeholder toast renders for Add anymore.
+  expect(extractText(testRenderer.toJSON())).not.toContain(
+    'Adding a schedule is coming soon.',
+  );
 });
 
-test('the row Edit control announces the edit placeholder and toasts it', () => {
+test('the row Edit control calls the onEditSchedule prop with the schedule id', () => {
   seedState({ schedules: [FOCUS_MORNINGS] });
 
   const testRenderer = renderSchedule();
@@ -578,13 +598,14 @@ test('the row Edit control announces the edit placeholder and toasts it', () => 
     edit!.props.onPress();
   });
 
-  expect(announceForAccessibility).toHaveBeenCalledWith(
-    'Editing schedules is coming soon.',
-  );
-  expect(extractText(testRenderer.toJSON())).toContain(
-    'Editing schedules is coming soon.',
-  );
+  expect(onEditSchedule).toHaveBeenCalledTimes(1);
+  expect(onEditSchedule).toHaveBeenCalledWith('focus-mornings');
+  // Nothing staged, no placeholder announce — Edit is a real editor entry
+  // point now.
   expect(useDomainStore.getState().stagedSchedules).toBeNull();
+  expect(extractText(testRenderer.toJSON())).not.toContain(
+    'Editing schedules is coming soon.',
+  );
 });
 
 test('the row Delete control announces the delete placeholder and toasts it', () => {

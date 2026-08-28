@@ -20,6 +20,7 @@ function makeSchedule(overrides?: Partial<Schedule>): Schedule {
     startTime: '09:00',
     endTime: '17:00',
     enabled: true,
+    domains: ['example.com'],
     ...overrides,
   };
 }
@@ -129,5 +130,51 @@ test('names containing the old separator characters are never conflated (EC-4/BH
 test('a weekday set and its reordered twin compare equal inside the JSON key', () => {
   const committed = [makeSchedule({ id: 'a', weekdays: [4, 0, 2] })];
   const staged = [makeSchedule({ id: 'a', weekdays: [0, 2, 4] })];
+  expect(stagedScheduleChangeCount(staged, committed)).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// Story 5.2 — domains are part of the value key
+// ---------------------------------------------------------------------------
+
+test('a domains-only change counts as 1 (scheduleValueKey includes domains)', () => {
+  const committed = [makeSchedule()];
+  const staged = [makeSchedule({ domains: ['news.site'] })];
+  expect(stagedScheduleChangeCount(staged, committed)).toBe(1);
+});
+
+test('a reordered-but-equal domain set is NOT a change (order-agnostic)', () => {
+  const committed = [makeSchedule({ domains: ['a.com', 'b.com'] })];
+  const staged = [makeSchedule({ domains: ['b.com', 'a.com'] })];
+  expect(stagedScheduleChangeCount(staged, committed)).toBe(0);
+});
+
+test('a duplicated-but-equal domain set is NOT a change', () => {
+  const committed = [makeSchedule({ domains: ['a.com'] })];
+  const staged = [makeSchedule({ domains: ['a.com', 'a.com'] })];
+  expect(stagedScheduleChangeCount(staged, committed)).toBe(0);
+});
+
+// 5-2 review patch: a MISSING array canonicalises to [] — the same key as an
+// explicit empty one — so an enable-toggle copy of a schedule with no domains
+// (empty or absent field) is NOT a change and the clean-revert holds.
+test('a toggle-copy with the domains field MISSING vs committed domains: [] is NOT a change', () => {
+  const committed = [
+    makeSchedule({ domains: [] }),
+  ];
+  // Same enabled value — ONLY the array's presence differs (the enabled
+  // delta is covered by its own test above).
+  const staged = [
+    { ...makeSchedule(), domains: undefined } as unknown as Schedule,
+  ];
+  expect(stagedScheduleChangeCount(staged, committed)).toBe(0);
+});
+
+test('a toggle-copy with domains: [] vs committed domains MISSING entirely is NOT a change', () => {
+  const committed = [
+    { ...makeSchedule(), domains: undefined } as unknown as Schedule,
+  ];
+  // Same enabled value — ONLY the array's presence differs.
+  const staged = [makeSchedule({ domains: [] })];
   expect(stagedScheduleChangeCount(staged, committed)).toBe(0);
 });
