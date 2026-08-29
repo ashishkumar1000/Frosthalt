@@ -9,6 +9,14 @@ Built with React Native for macOS because the target machine (a work
 MacBook) doesn't allow installing third-party apps, but does allow running
 your own code with `sudo` access.
 
+**Status: v1 complete.** All six planned epics are built and shipped,
+covering the blocklist, password gate, focus timer, schedules, and the menu
+bar app. See
+[`_bmad-output/planning-artifacts/epics.md`](./_bmad-output/planning-artifacts/epics.md)
+for the epic breakdown, and
+[`_bmad-output/implementation-artifacts/deferred-work.md`](./_bmad-output/implementation-artifacts/deferred-work.md)
+for the known deferred items.
+
 ## Why
 
 - Cannot install third-party apps on the office laptop, so Cold Turkey and
@@ -20,23 +28,32 @@ your own code with `sudo` access.
 See [`Frosthalt-PRD.md`](./Frosthalt-PRD.md) for the full product
 requirements, feature roadmap, and design decisions.
 
-## Core features (v1)
+## Features (all shipped)
 
 - **Blocklist** — add/remove domains, mark them always-on, apply to
   `/etc/hosts` in one batched admin-password prompt.
-- **Focus timer** — block a set of domains for a chosen duration; auto-unblock
-  on expiry.
+- **Focus timer** — block a set of domains for a chosen duration; live
+  countdown ring, auto-unblock on expiry, end-early behind the password,
+  and mid-session persistence (closing the app keeps the block running and
+  re-arms it on launch).
 - **Schedule** — block domains automatically during a recurring day/time
-  window (e.g. weekdays 9–5).
-- **Password gate** — a password protects against impulsively disabling
-  blocks or removing them mid-session.
+  window (e.g. weekdays 9–5), with live transitions while the app runs.
+- **Password gate** — a salt-free SHA-256 password hash protects against
+  impulsively disabling blocks, removing domains mid-session, or panic
+  unblocking; includes a change-password flow in the danger zone.
 - **Status header** — always-visible view of what's blocked and any active
   timer countdown.
+- **Menu bar app** — the block state mirrors to the macOS menu bar with a
+  live badge and countdown; quick-start focus sessions, show/hide the
+  window, and quit from the menu. Closing the window keeps Frosthalt
+  running in the menu bar; quitting asks for confirmation.
+- **Window restoration** — window size and position persist across
+  launches.
 
 ## How it works
 
 Frosthalt writes a marked `# BEGIN/END FROSTHALT` section into `/etc/hosts`,
-mapping blocked domains (apex + `www.`) to `127.0.0.1` / `::1` on both IPv4
+mapping blocked domains (apex + `www.`) to `0.0.0.0` / `::` on both IPv4
 and IPv6, then flushes the DNS cache. Because this happens at the hosts-file
 level, blocking applies system-wide with no per-browser setup. Edits run
 through macOS's native `osascript … with administrator privileges` prompt —
@@ -51,20 +68,22 @@ trade-offs.
 ## Tech stack
 
 - React Native for macOS (`react-native-macos`), Hermes JS engine
-- A small Swift native module (`ShellRunner`) for privileged shell access
+- Four Swift TurboModules: `ShellRunner` (privileged shell access for the
+  Apply pipeline), `ConfigStore` (config.json read/write), `MenuBar`
+  (status-bar item + menu), and `Window` (size/position persistence)
 - Local JSON config at `~/Library/Application Support/Frosthalt/config.json`
   — no network calls, fully offline
 
 ## Getting started
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding. This repo uses **pnpm** — install dependencies first with `pnpm install`.
 
 ### Step 1: Start Metro
 
 Run the Metro dev server from the root of the project:
 
 ```sh
-npm start
+pnpm start
 ```
 
 ### Step 2: Install CocoaPods dependencies
@@ -113,6 +132,13 @@ running app automatically.
 
 To forcefully reload and reset app state, select **"Reload"** from the Dev
 Menu, accessed via <kbd>Cmd ⌘</kbd> + <kbd>D</kbd> in the app window.
+
+## Verifying changes
+
+```sh
+pnpm typecheck   # TypeScript, no emit
+pnpm test        # Jest unit tests
+```
 
 ## Troubleshooting
 
