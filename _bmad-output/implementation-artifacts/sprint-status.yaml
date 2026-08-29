@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-14-2026 00:19
-last_updated: 08-29-2026  # 6-5 done (commit pending at flip time: build + manual matrix passed)
+last_updated: 08-30-2026  # epic-6 done (retrospective skipped by user decision)
 
 project: Frosthalt
 project_key: NOKEY
@@ -80,7 +80,7 @@ development_status:
   5-5-schedule-enable-disable-and-removal-confirm-alert-not-passwo: done
   epic-5-retrospective: optional
 
-  epic-6: in-progress
+  epic-6: done
   6-1-menubar-turbomodule-nsstatusitem-nsmenu: done
   6-2-menu-bar-badge-mirror-and-countdown: done
   6-3-menu-bar-quick-start-show-window-and-quit-actions: done
