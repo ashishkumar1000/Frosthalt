@@ -224,6 +224,27 @@ export interface DomainState {
    */
   stageScheduleEnabledToggle: (id: string) => WriteResult;
   /**
+   * Remove the schedule with the given id from the staged schedule draft
+   * (built on `stagedSchedules ?? committed.schedules`) — the schedule-shaped
+   * MIRROR of `stageDomainRemove` (Story 5.5). Always produces a NEW
+   * `stagedSchedules` array reference when it mutates (filter), so the
+   * apply-queue's mid-run-edit detection
+   * (`s.stagedSchedules === schedulesSnapshot`) still works. Clean-revert: if
+   * the resulting draft equals `committed.schedules` (compared by `id` + ALL
+   * fields, order-agnostic — `scheduleDraftEqualsCommitted`), `stagedSchedules`
+   * is cleared to `null` so deleting a schedule that exists ONLY in the staged
+   * buffer (added via the editor, not yet Applied) returns the surface to
+   * net-zero — no hint, no pulsing Apply, no redundant admin prompt. Returns
+   * `{ ok: false, error: "not-found" }` without staging when the id is not in
+   * the draft (defensive — the UI only triggers remove from a rendered row).
+   *
+   * Removal is STAGED (Apply commits) and gated by the SURFACE's confirm alert
+   * (a plain `Alert.alert`, NOT the password gate — Epic 3's scope is escapes
+   * only). No port calls, no gate, no toast — a pure staging action, exactly
+   * like `stageDomainRemove`.
+   */
+  stageScheduleRemove: (id: string) => WriteResult;
+  /**
    * Stage one full schedule upsert (Story 5.2) — the editor sheet's Save.
    * Validates + normalises the incoming draft (name non-empty, >=1 weekday,
    * >=1 domain, both times parse via `normaliseTime`, end strictly after
@@ -697,6 +718,31 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     // `stageAlwaysOnToggle`'s no-redundant-Apply principle — a net-no-op
     // toggle (enable then disable) must NOT leave a dirty draft that would
     // force an admin prompt to write an identical config.
+    if (scheduleDraftEqualsCommitted(next, get().committed.schedules)) {
+      set({ stagedSchedules: null });
+      return { ok: true };
+    }
+    set({ stagedSchedules: next });
+    return { ok: true };
+  },
+
+  stageScheduleRemove: (id) => {
+    // The schedule-shaped mirror of `stageDomainRemove`'s staging shape with
+    // `id` as the PK — the full contract (not-found guard, NEW array
+    // reference, clean-revert) lives in the interface JSDoc above. Removal is
+    // optimistic: the row vanishes immediately (the UI renders
+    // `stagedSchedules ?? committed.schedules`, which no longer holds the
+    // id); Apply commits; Cancel reverts. NOT password-gated — the SURFACE
+    // gates it behind a plain confirm alert (escapes only, per the epic's
+    // gate scope).
+    const base = get().stagedSchedules ?? get().committed.schedules;
+    if (!base.some((s) => s.id === id)) {
+      // Unknown id — unreachable from the UI (rows only render existing ids).
+      return { ok: false, error: 'not-found' };
+    }
+    // Filter, not in-place mutation (NEW array reference — see the interface
+    // doc), then the `scheduleDraftEqualsCommitted` clean-revert below.
+    const next = base.filter((s) => s.id !== id);
     if (scheduleDraftEqualsCommitted(next, get().committed.schedules)) {
       set({ stagedSchedules: null });
       return { ok: true };

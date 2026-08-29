@@ -40,6 +40,7 @@ import { useClockStore } from '../src/domain/clockStore';
 import * as shellRunner from '../src/hosts/shellRunner';
 import * as effectiveBlocklistModule from '../src/domain/effectiveBlocklist';
 import { stagedChangeCount } from '../src/domain/stagedChangeCount';
+import { stagedScheduleChangeCount } from '../src/domain/stagedScheduleChangeCount';
 import { DEFAULT_CONFIG } from '../src/config/types';
 import type { Config, Schedule, Weekday } from '../src/config/types';
 import {
@@ -4022,6 +4023,210 @@ test('stageScheduleUpsert produces a NEW array reference mid-Apply so the runnin
     { hostname: 'social.com', alwaysOn: true },
   ]);
   expect(state.staged).toBeNull();
+});
+
+// ===========================================================================
+// Story 5.5 — stageScheduleRemove (the stageDomainRemove mirror, schedule-
+// shaped). Staged removal + clean-revert + not-found, mirrored from the
+// stageDomainRemove family above; the Apply payload pin proves removing an
+// ACTIVE schedule shrinks the hosts payload at Apply time (5-3's schedule
+// contribution lifting unless covered by always-on).
+// ===========================================================================
+
+test('stageScheduleRemove removes a committed schedule and stages a new draft (count 1 via stagedScheduleChangeCount)', () => {
+  // committed has two schedules; removing one stages a draft missing it.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE],
+    },
+    stagedSchedules: null,
+  });
+
+  const result = useDomainStore.getState().stageScheduleRemove('focus');
+
+  expect(result).toStrictEqual({ ok: true });
+  // The staged draft no longer contains focus; committed is untouched.
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    EVENINGS_SCHEDULE,
+  ]);
+  expect(useDomainStore.getState().committed.schedules).toStrictEqual([
+    FOCUS_SCHEDULE,
+    EVENINGS_SCHEDULE,
+  ]);
+  // The story's central invariant — `stagedSchedules != null ⟹ count >= 1`
+  // — directly verified via the same pure helper the hint uses. One removed
+  // schedule -> 1 change (removal is counted by the ids-in-committed-not-in-
+  // staged branch of stagedScheduleChangeCount).
+  expect(
+    stagedScheduleChangeCount(
+      useDomainStore.getState().stagedSchedules!,
+      useDomainStore.getState().committed.schedules,
+    ),
+  ).toBe(1);
+});
+
+test('stageScheduleRemove removes from a multi-edit staged schedule draft', () => {
+  // committed has two schedules; a staged draft toggles the first and carries
+  // the second unchanged. Removing the UNTOUCHED second schedule must build on
+  // the DRAFT (dropping it), not committed — and the count reflects the
+  // remaining change (the toggle) only.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE],
+    },
+    stagedSchedules: [
+      { ...FOCUS_SCHEDULE, enabled: false }, // toggled
+      EVENINGS_SCHEDULE, // unchanged
+    ],
+  });
+
+  const result = useDomainStore.getState().stageScheduleRemove('evenings');
+
+  expect(result).toStrictEqual({ ok: true });
+  // The draft now reflects the toggle only; the removed row is gone.
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
+  // Pinned via stagedScheduleChangeCount (not just inferred from the draft):
+  // committed=[focus:true,evenings:false], staged=[focus:false] -> 1 toggled +
+  // 1 removed = 2 changes.
+  expect(
+    stagedScheduleChangeCount(
+      useDomainStore.getState().stagedSchedules!,
+      useDomainStore.getState().committed.schedules,
+    ),
+  ).toBe(2);
+});
+
+test('stageScheduleRemove clean-revert: deleting a schedule added via the editor reverts stagedSchedules to null', () => {
+  // committed has NO schedules; the editor's Save stages one addition
+  // (the real user path — stageScheduleUpsert, not a hand-seeded buffer).
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [] },
+    stagedSchedules: null,
+  });
+  const upsert = useDomainStore.getState().stageScheduleUpsert(FOCUS_SCHEDULE);
+  expect(upsert).toStrictEqual({ ok: true });
+  expect(useDomainStore.getState().stagedSchedules).toStrictEqual([
+    FOCUS_SCHEDULE,
+  ]);
+
+  // Deleting that staged-only addition nets back to committed ([]) -> the
+  // buffer clean-reverts to null: no hint, Apply disabled, no redundant admin
+  // prompt (the exact 2-4 remove-a-staged-addition case, schedule-shaped).
+  const result = useDomainStore.getState().stageScheduleRemove('focus');
+
+  expect(result).toStrictEqual({ ok: true });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleRemove produces a NEW stagedSchedules array reference on each remove', () => {
+  // The apply-queue's retain-newer-draft invariant relies on a newer draft
+  // being a DIFFERENT array reference from the snapshot a running Apply
+  // captured. Removing must filter (new ref), not mutate in place. committed
+  // has two schedules so successive removes keep the draft non-null (no
+  // clean-revert) and the two staged references stay comparable.
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE],
+    },
+    stagedSchedules: null,
+  });
+
+  useDomainStore.getState().stageScheduleRemove('focus');
+  const ref1 = useDomainStore.getState().stagedSchedules;
+  expect(ref1).not.toBeNull();
+
+  useDomainStore.getState().stageScheduleRemove('evenings');
+  const ref2 = useDomainStore.getState().stagedSchedules;
+  // NEW array reference, not in-place mutation.
+  expect(ref2).not.toBe(ref1);
+  expect(ref2).toStrictEqual([]);
+});
+
+test('stageScheduleRemove on an unknown id returns not-found and leaves the buffer unchanged', () => {
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: null,
+  });
+
+  const result = useDomainStore.getState().stageScheduleRemove('ghost');
+
+  expect(result).toStrictEqual({ ok: false, error: 'not-found' });
+  expect(useDomainStore.getState().stagedSchedules).toBeNull();
+});
+
+test('stageScheduleRemove on an unknown id with a staged draft leaves the draft unchanged', () => {
+  const draft = [{ ...FOCUS_SCHEDULE, enabled: false }];
+  useDomainStore.setState({
+    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
+    stagedSchedules: draft,
+  });
+
+  const result = useDomainStore.getState().stageScheduleRemove('ghost');
+
+  expect(result).toStrictEqual({ ok: false, error: 'not-found' });
+  // The staged draft reference is unchanged (no new array, no mutation).
+  expect(useDomainStore.getState().stagedSchedules).toBe(draft);
+});
+
+test('stageScheduleRemove + apply(): removing an ACTIVE schedule drops its domains from the hosts payload at Apply time', async () => {
+  // Fake timers pin the wall clock to a fixed local NOON so the schedule
+  // window below is guaranteed ACTIVE when Apply recomputes
+  // `effectiveHostsLines(nextConfig)` at run time (mirrors the 5.4 tests'
+  // fake-timers + setSystemTime discipline).
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 7, 12, 12, 0, 0, 0));
+  try {
+    // Whole-week 11:00–13:00 window: active at the pinned noon on ANY
+    // weekday. Its domain is NOT covered by anything else, so removing the
+    // schedule must shrink the payload.
+    const activeSchedule: Schedule = {
+      id: 'all-week',
+      name: 'All week',
+      weekdays: [0, 1, 2, 3, 4, 5, 6],
+      startTime: '11:00',
+      endTime: '13:00',
+      enabled: true,
+      domains: ['scheduled.com'],
+    };
+    useDomainStore.setState({
+      committed: {
+        ...DEFAULT_CONFIG,
+        domains: [{ hostname: 'always.com', alwaysOn: true }],
+        schedules: [activeSchedule],
+      },
+      stagedSchedules: null,
+    });
+
+    const result = useDomainStore.getState().stageScheduleRemove('all-week');
+    expect(result).toStrictEqual({ ok: true });
+
+    const applied = await useDomainStore.getState().apply();
+
+    expect(applied).toStrictEqual({ ok: true });
+    // The config write carries the empty schedules slice.
+    const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+    expect(written.schedules).toStrictEqual([]);
+    // The hosts payload recomputed AT APPLY TIME: ONLY the always-on
+    // domain's lines — the removed schedule's domain is gone from /etc/hosts.
+    expect(shellNative.writeHosts.mock.calls[0][0]).toStrictEqual([
+      '0.0.0.0 always.com',
+      ':: always.com',
+      '0.0.0.0 www.always.com',
+      ':: www.always.com',
+    ]);
+    // committed advanced to the removal; the buffer cleared.
+    const state = useDomainStore.getState();
+    expect(state.committed.schedules).toStrictEqual([]);
+    expect(state.stagedSchedules).toBeNull();
+    expect(state.applyStatus).toBe('idle');
+  } finally {
+    jest.useRealTimers();
+  }
 });
 
 // ---------------------------------------------------------------------------

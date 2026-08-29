@@ -19,9 +19,11 @@
  * The summary is derived LIVE from the rendered schedule via the pure
  * `formatScheduleSummary` — never from a stale copy. Edit is REAL as of
  * Story 5.2 (it opens the Shell-hosted editor sheet — the surface forwards the
- * `onEditSchedule` prop); Delete REMAINS an announce-only placeholder (Story
- * 5.5 owns the removal confirm alert): the surface wires it to a handler that
- * announces + toasts, and this row just forwards the schedule's `id` to both.
+ * `onEditSchedule` prop); Delete is REAL as of Story 5.5 (it opens the
+ * surface's confirm alert): this row forwards the schedule's `id` + `name` so
+ * the alert copy can name the schedule, and the whole RENDERED schedule to the
+ * enable-toggle so the surface can branch disable-confirm vs enable-direct
+ * on the rendered `enabled`.
  */
 
 import React, { useState } from 'react';
@@ -34,20 +36,22 @@ import { formatScheduleSummary } from '../domain/scheduleSummary';
 export interface ScheduleRowProps {
   schedule: Schedule;
   /**
-   * Enable-toggle handler (the optimistic staging toggle). Receives the
-   * schedule's `id` (the PK).
+   * Enable-toggle handler. Receives the WHOLE rendered schedule (not just the
+   * id) so the surface can branch on the rendered `enabled`: a disable press
+   * (rendered `enabled === true`) opens the confirm alert first, an enable
+   * press dispatches directly (Story 5.5).
    */
-  onToggleEnabled: (id: string) => void;
+  onToggleEnabled: (schedule: Schedule) => void;
   /**
    * Edit handler — opens the Shell-hosted editor sheet (Story 5.2). Receives
    * the schedule's `id`.
    */
   onEdit: (id: string) => void;
   /**
-   * Delete handler — a PLACEHOLDER for Story 5.5 (the removal confirm
-   * alert). Receives the schedule's `id`.
+   * Delete handler — opens the surface's confirm alert (Story 5.5). Receives
+   * the schedule's `id` and `name` (the alert copy names the schedule).
    */
-  onDelete: (id: string) => void;
+  onDelete: (id: string, name: string) => void;
   /**
    * Disables the checkbox AND the Edit/Delete controls (e.g. while an Apply
    * is in flight). The name/summary label stays readable — only the
@@ -92,7 +96,7 @@ export function ScheduleRow({
     >
       <Checkbox
         checked={schedule.enabled}
-        onPress={() => onToggleEnabled(schedule.id)}
+        onPress={() => onToggleEnabled(schedule)}
         // State-neutral imperative label (review BH-15): "Enable {name}" not
         // "Enabled for {name}" — VoiceOver already speaks the checked state
         // from `accessibilityState`, so a state-bearing label would read
@@ -137,12 +141,12 @@ export function ScheduleRow({
       >
         <Text style={styles.controlLabel}>Edit</Text>
       </Pressable>
-      {/* The Delete control (Story 5.5 placeholder — announce-only; the
-          surface owns the placeholder announce; 5.5 replaces this with the
-          confirm alert, which is NOT password-gated per the epic's gate
-          scope). Subdued destructive tint like DomainRow's Remove. */}
+      {/* The Delete control (Story 5.5 — the surface's confirm alert gates
+          the staging; NOT password-gated per the epic's gate scope, config
+          edits are not escapes). Subdued destructive tint like DomainRow's
+          Remove. */}
       <Pressable
-        onPress={() => onDelete(schedule.id)}
+        onPress={() => onDelete(schedule.id, schedule.name)}
         disabled={disabled}
         focusable
         enableFocusRing

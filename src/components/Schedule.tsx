@@ -5,12 +5,14 @@
  * `[enable-checkbox] name · summary · [Edit] [Delete]` — plus the staged-
  * then-Apply controls (Apply + Cancel-staged + the "N changes staged" hint)
  * and the empty state, mirroring `Blocklist.tsx`'s surface shape. Reads
- * `useDomainStore` and calls ONLY `stageScheduleEnabledToggle` / `apply` /
- * `cancelStagedSchedules` — no ports, no `child_process`/`fs`/`os` (ports &
- * adapters, one-way: `UI -> domain (Zustand) -> adapters -> ports`).
+ * `useDomainStore` and calls ONLY `stageScheduleEnabledToggle` /
+ * `stageScheduleRemove` / `apply` / `cancelStagedSchedules` — no ports, no
+ * `child_process`/`fs`/`os` (ports & adapters, one-way:
+ * `UI -> domain (Zustand) -> adapters -> ports`).
  *
- * Optimistic toggle: rows render `stagedSchedules ?? committed.schedules` so
- * a pending enable-toggle shows immediately; Apply commits config + hosts
+ * Rows render `stagedSchedules ?? committed.schedules` so a STAGED edit
+ * (toggle, add, remove) shows immediately once staged — a disable stages only
+ * after its confirm (Story 5.5 below); Apply commits config + hosts
  * (the existing 1.6 serialized pipeline — one config write carries BOTH the
  * domain and schedule buffers); Cancel discards only the schedule draft (the
  * Blocklist's staged edits are untouched). The enable control is a macOS
@@ -27,20 +29,30 @@
  * `onEditSchedule` props (the Shell owns the schedule-editor sheet's open
  * state — component-local state would need a reverse channel to ⌘N/Esc, which
  * live in the Shell's key handler) and wires the empty-state "Add…" button and
- * each row's Edit control to them. Delete REMAINS an announce-only
- * placeholder: Story 5.5 owns the removal confirm alert (which is a confirm
- * alert, NOT password-gated — escapes only, per the epic's gate scope). Its
- * press announces the placeholder to VoiceOver and raises a small
- * component-local toast (the 4.3 placeholder-toast precedent — no store toast,
- * no gate, no staging, no port call).
+ * each row's Edit control to them. Delete is REAL as of Story 5.5: the surface
+ * gates it behind a native confirm alert (`Alert.alert`, the 2-4 pattern) and
+ * only the confirm stages via `stageScheduleRemove` — a confirm alert, NOT the
+ * password gate (config edits, not escapes, per the epic's gate scope).
+ *
+ * Story 5.5 also routes the enable checkbox through the SAME confirm, but ONLY
+ * when the press would DISABLE the row AS RENDERED (the row's schedule comes
+ * from `stagedSchedules ?? committed.schedules`, so the branch uses the
+ * rendered `enabled` — a staged-disabled row that is re-checked is "enabling"
+ * and goes direct, while a staged-enabled newly-added row that is unchecked IS
+ * a disable and confirms). Enabling dispatches directly, no alert — adding and
+ * re-enabling are exempt from the gate. The confirm gates the STAGING, never
+ * the commit; Cancel/Esc stages nothing. The native alert captures keyboard
+ * focus, so the Shell's bare Return->Apply stays inert while it is open — no
+ * Shell change needed (the 2-4 precedent).
  *
  * On mount, VoiceOver announces "Schedule, N schedules" so the surface's
  * state is spoken on entry (the Shell's own nav announce stays as-is).
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect } from 'react';
 import {
   AccessibilityInfo,
+  Alert,
   Pressable,
   StyleSheet,
   Text,
@@ -49,6 +61,7 @@ import {
 import { useDomainStore } from '../domain/store';
 import { stagedScheduleChangeCount } from '../domain/stagedScheduleChangeCount';
 import { tokens } from '../theme/tokens';
+import type { Schedule as ScheduleType } from '../config/types';
 import { ApplyButton } from './ApplyButton';
 import { ScheduleRow } from './ScheduleRow';
 
@@ -72,14 +85,6 @@ export interface ScheduleProps {
 const EMPTY_STATE_TEXT =
   'No schedules yet. Add one to block on a recurring weekly window.';
 
-// ----- Story 5.5 placeholder copy ------------------------------------------
-// The DELETE placeholder is labelled for its future owner. (Add/Edit
-// placeholders retired in 5.2 — those are real editor-sheet entry points now.)
-const DELETE_PLACEHOLDER_TEXT = 'Removing schedules is coming soon.';
-// Auto-dismiss timeout for the component-local placeholder toast (8 s, the
-// same auto-dismiss the Shell-level store toast uses).
-const PLACEHOLDER_TOAST_DISMISS_MS = 8000;
-
 export function Schedule({
   onAddSchedule,
   onEditSchedule,
@@ -90,12 +95,13 @@ export function Schedule({
   const stageScheduleEnabledToggle = useDomainStore(
     (s) => s.stageScheduleEnabledToggle,
   );
+  const stageScheduleRemove = useDomainStore((s) => s.stageScheduleRemove);
   const apply = useDomainStore((s) => s.apply);
   const cancelStagedSchedules = useDomainStore((s) => s.cancelStagedSchedules);
 
-  // The rendered list is the optimistic draft when one exists, else the
-  // committed schedules. Toggle -> stageScheduleEnabledToggle -> re-render
-  // with the flipped value immediately; Apply commits; Cancel reverts.
+  // The rendered list is the staged draft when one exists, else the committed
+  // schedules. A STAGED edit re-renders immediately (a disable stages only
+  // after its confirm, Story 5.5); Apply commits; Cancel reverts.
   const schedules = stagedSchedules ?? committed.schedules;
   const running = applyStatus === 'running';
   const hasStaged = stagedSchedules != null;
@@ -110,38 +116,62 @@ export function Schedule({
   const changesHint =
     changeCount === 1 ? '1 change staged' : `${changeCount} changes staged`;
 
-  // ----- Story 5.5 delete placeholder (announce-only) ------------------------
-  // A small component-local toast (the 4.3 placeholder-toast precedent):
-  // the message is announced to VoiceOver AND rendered as a subdued inline
-  // toast for 8 s. No store toast (the Shell-level toast is for write
-  // outcomes), no gate, no staging, no port call. Auto-dismisses via a
-  // module-level timeout captured in a ref, cleared on unmount + on every
-  // re-show (the Panic.tsx local-toast timer discipline). Add/Edit no longer
-  // route through here — they call the Shell-owned editor-sheet props.
-  const [placeholderToast, setPlaceholderToast] = useState<string | null>(null);
-  const placeholderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null,
-  );
-  useEffect(() => {
-    return () => {
-      if (placeholderTimerRef.current != null) {
-        clearTimeout(placeholderTimerRef.current);
-      }
-    };
-  }, []);
-  const showPlaceholder = (message: string) => {
-    AccessibilityInfo.announceForAccessibility(message);
-    setPlaceholderToast(message);
-    if (placeholderTimerRef.current != null) {
-      clearTimeout(placeholderTimerRef.current);
-    }
-    placeholderTimerRef.current = setTimeout(() => {
-      setPlaceholderToast(null);
-    }, PLACEHOLDER_TOAST_DISMISS_MS);
+  // ----- Story 5.5 — the confirm alerts (delete + disable-on-uncheck) ---------
+  // Both confirm gates stage the edit, never the commit: the confirm's
+  // `onPress` is the ONLY path that stages (Cancel/Esc stages nothing —
+  // exactly the Blocklist.tsx remove-confirm shape, which these mirror
+  // verbatim). The native alert captures keyboard focus (so the Shell's
+  // Return->Apply gate is inert while it is open) and honours Esc via the
+  // cancel-style button — no Shell change. Delete/Disable are
+  // `style: 'destructive'` but NOT `isPreferred` — Cancel is the safe
+  // Esc/cancel target. No password gate: schedule disable/removal are config
+  // edits, not escapes (the epic's resolved gate scope).
+
+  // Delete: the confirm stages `stageScheduleRemove(id)`. The copy states the
+  // staged effect plainly and names the Apply step (mirroring 2-4's
+  // microcopy).
+  const handleDelete = (id: string, name: string) => {
+    Alert.alert(
+      `Delete ${name}?`,
+      'Removing it from your schedule list. This takes effect when you Apply.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => stageScheduleRemove(id),
+        },
+      ],
+    );
   };
-  // Story 5.5 owns the removal confirm alert (NOT password-gated — escapes
-  // only, per the epic's gate scope).
-  const handleDelete = () => showPlaceholder(DELETE_PLACEHOLDER_TEXT);
+
+  // Enable toggle: confirm ONLY when the press would DISABLE the row AS
+  // RENDERED. The row renders `stagedSchedules ?? committed.schedules`, so
+  // the branch uses the rendered schedule's `enabled` — a staged-disabled row
+  // that is re-checked is "enabling" (exempt, direct dispatch, and the store
+  // clean-reverts the buffer to null on net-zero), while a staged-enabled
+  // newly-added row that is unchecked IS a disable and confirms. The checkbox
+  // flips only on the confirm's `onPress` (the toggle is staged AFTER the
+  // confirm, never optimistically before it).
+  const handleToggleEnabled = (schedule: ScheduleType) => {
+    if (schedule.enabled) {
+      Alert.alert(
+        `Disable ${schedule.name}?`,
+        'Turning off this schedule. This takes effect when you Apply.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Disable',
+            style: 'destructive',
+            onPress: () => stageScheduleEnabledToggle(schedule.id),
+          },
+        ],
+      );
+      return;
+    }
+    // Enabling a disabled schedule is exempt from the gate — dispatch direct.
+    stageScheduleEnabledToggle(schedule.id);
+  };
 
   // Mount announce: "Schedule, N schedules". N is the rendered list length
   // (staged or committed) — what the user sees. Runs once on mount; later
@@ -197,7 +227,7 @@ export function Schedule({
               <ScheduleRow
                 key={s.id}
                 schedule={s}
-                onToggleEnabled={stageScheduleEnabledToggle}
+                onToggleEnabled={handleToggleEnabled}
                 onEdit={onEditSchedule}
                 onDelete={handleDelete}
                 disabled={running}
@@ -227,13 +257,6 @@ export function Schedule({
           </View>
         </>
       )}
-      {placeholderToast != null ? (
-        // The component-local placeholder toast (subdued inline strip — the
-        // 4.3 placeholder-toast precedent, Panic.tsx's local toast styling).
-        <View style={styles.placeholderToast}>
-          <Text style={styles.placeholderToastText}>{placeholderToast}</Text>
-        </View>
-      ) : null}
     </View>
   );
 }
@@ -322,21 +345,6 @@ const styles = StyleSheet.create({
     ...tokens.typography.body,
     // Subdued so the hint reads as a count, not a primary affordance.
     opacity: 0.7,
-  },
-  // The component-local placeholder toast: a compact subdued strip pinned
-  // under the controls (not an overlay — nothing else competes with it on
-  // this surface), reusing the mono panel pairing for legibility.
-  placeholderToast: {
-    marginTop: tokens.spacing.md,
-    alignSelf: 'flex-start',
-    borderRadius: tokens.rounded.md,
-    borderWidth: 1,
-    borderColor: tokens.primary,
-    paddingHorizontal: tokens.spacing.md,
-    paddingVertical: tokens.spacing.sm,
-  },
-  placeholderToastText: {
-    ...tokens.typography.label,
   },
   ghost: {
     paddingHorizontal: tokens.spacing.md,
