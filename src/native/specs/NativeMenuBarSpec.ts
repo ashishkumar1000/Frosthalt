@@ -90,21 +90,43 @@ export interface Spec extends TurboModule {
   setBadgeState(badge: MenuBarBadgeState): MenuBarResult;
 
   /**
-   * Fires with no payload when "Start 25-min focus" is clicked. Unlistened in
-   * this story — 6.3 adds the JS handler (reusing the Epic 4 focus-session
-   * start path).
+   * Quits the app: dispatches `NSApp.terminate(nil)` onto the main thread
+   * (Story 6.3). The JS "Quit" handler (`src/domain/menuBarActions.ts`) calls
+   * this — the decision to stay or go lives in JS so Story 6.5 can insert its
+   * confirm dialog before the call; by the time native sees `quit()` the
+   * decision is made. Fire-and-forget: the termination is dispatched (this
+   * method may be called from the JSI thread) and always returns
+   * `{ ok: true }` — no condition on this story's path makes it fail.
+   */
+  quit(): MenuBarResult;
+
+  /**
+   * Fires with no payload when "Start 25-min focus" is clicked. Since 6.3
+   * this IS listened: `startMenuBarActions()` (`src/domain/menuBarActions.ts`)
+   * reuses the EXISTING Epic 4 start path verbatim — one
+   * `stageStartTimer({durationMs, selected})` at store.ts (validation, the
+   * serialized apply queue and its one admin prompt all inherited), gated on
+   * no-live-session / idle-Apply / non-empty-domains, selected = all
+   * committed domains.
    */
   readonly onQuickStart: CodegenTypes.EventEmitter<void>;
 
   /**
-   * Fires with no payload when "Show window" is clicked. Unlistened in this
-   * story — 6.3 adds the JS handler.
+   * Fires with no payload when "Show window" is clicked. DELIBERATELY never
+   * listened — show-window is decided NATIVELY on the click (pure AppKit
+   * activation in `MenuBar.swift`'s `handleShowWindow`: activate + order the
+   * main window front/key, deminiaturized if Dock-minimized), with no state,
+   * no gating, nothing for JS to decide, so no JS round-trip exists. The
+   * event still fires; zero listeners is its happy state (the 6.1 contract).
    */
   readonly onShowWindow: CodegenTypes.EventEmitter<void>;
 
   /**
-   * Fires with no payload when "Quit" is clicked. Unlistened in this story —
-   * 6.3 adds the JS handler.
+   * Fires with no payload when "Quit" is clicked. Since 6.3 this is listened
+   * by `startMenuBarActions()` (`src/domain/menuBarActions.ts`), which routes
+   * to the native `quit()` above — the quit DECISION lives in JS so Story
+   * 6.5's quit-confirm dialog extends that same JS handler (today the quit is
+   * unconditional once it reaches this event).
    */
   readonly onQuit: CodegenTypes.EventEmitter<void>;
 }

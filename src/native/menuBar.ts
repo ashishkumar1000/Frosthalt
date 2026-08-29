@@ -32,3 +32,14 @@ export function initializeMenuBar(): MenuBarResult {
 export function setMenuBarBadge(badge: MenuBarBadgeState): MenuBarResult {
   return NativeMenuBar.setBadgeState(badge);
 }
+
+/**
+ * Story 6.3 — quits the app (main-thread-dispatched `NSApp.terminate(nil)` in
+ * the Swift impl). Forwards the payload-less call untouched and returns the
+ * `{ ok, error? }` envelope: the quit DECISION lives in the caller (the domain
+ * module's `onQuit` handler — Story 6.5 inserts its confirm dialog there), so
+ * this stays a dumb one-line forwarder like the two wrappers above.
+ */
+export function quitApp(): MenuBarResult {
+  return NativeMenuBar.quit();
+}

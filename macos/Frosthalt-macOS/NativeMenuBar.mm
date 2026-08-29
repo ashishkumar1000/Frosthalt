@@ -137,4 +137,15 @@ RCT_EXPORT_MODULE(NativeMenuBar)
   }];
 }
 
+// quit (Story 6.3) — the JS `onQuit` handler's termination call. Plain
+// dictionary return over a NO-ARG method: the 6.2 named-object-struct crash
+// lesson (`JS::NativeMenuBarSpec::<Type> &` params) cannot apply here — there
+// is no parameter to convert, so this is the same shape as `initialize`. The
+// termination itself is main-queue dispatched inside the Swift impl; this
+// method just forwards and returns { ok: true }.
+- (NSDictionary *)quit
+{
+  return [self.swiftImpl quit];
+}
+
 @end

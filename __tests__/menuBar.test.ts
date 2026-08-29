@@ -18,9 +18,14 @@ jest.mock('../src/native/specs/NativeMenuBarSpec', () => {
   const mock = {
     initialize: jest.fn(),
     setBadgeState: jest.fn(),
-    onQuickStart: jest.fn(),
-    onShowWindow: jest.fn(),
-    onQuit: jest.fn(),
+    quit: jest.fn(),
+    // Event emitters return a subscription whose `remove()` the runtime
+    // would call on teardown; Story 6.3's App mount now SUBSCRIBES (the
+    // `menuBarActions` handler), so these mocks return a usable
+    // subscription shape like the real codegen emitters do.
+    onQuickStart: jest.fn(() => ({ remove: jest.fn() })),
+    onShowWindow: jest.fn(() => ({ remove: jest.fn() })),
+    onQuit: jest.fn(() => ({ remove: jest.fn() })),
   };
   return {
     __esModule: true,
@@ -50,7 +55,7 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import App from '../App';
-import { initializeMenuBar, setMenuBarBadge } from '../src/native/menuBar';
+import { initializeMenuBar, setMenuBarBadge, quitApp } from '../src/native/menuBar';
 import type {
   MenuBarBadgeState,
   MenuBarResult,
@@ -59,6 +64,7 @@ import type {
 type NativeMenuBarMock = {
   initialize: jest.Mock;
   setBadgeState: jest.Mock;
+  quit: jest.Mock;
   onQuickStart: jest.Mock;
   onShowWindow: jest.Mock;
   onQuit: jest.Mock;
@@ -69,6 +75,7 @@ const native = require('../src/native/specs/NativeMenuBarSpec')
 beforeEach(() => {
   native.initialize.mockReset();
   native.setBadgeState.mockReset();
+  native.quit.mockReset();
 });
 
 // ---------------------------------------------------------------------------
@@ -121,10 +128,29 @@ test('setMenuBarBadge surfaces a native { ok: false, error } result untouched', 
 });
 
 // ---------------------------------------------------------------------------
-// App mount — initializeMenuBar() called exactly once, on mount
+// quitApp() — Story 6.3 quit forwarding
 // ---------------------------------------------------------------------------
 
-test('mounting App calls the native initialize() exactly once', async () => {
+test('quitApp forwards to the native quit() and returns its result', () => {
+  const result: MenuBarResult = { ok: true };
+  native.quit.mockReturnValue(result);
+
+  expect(quitApp()).toBe(result);
+  expect(native.quit).toHaveBeenCalledTimes(1);
+  expect(native.quit).toHaveBeenCalledWith();
+});
+
+test('quitApp surfaces a native { ok: false, error } result untouched', () => {
+  native.quit.mockReturnValue({ ok: false, error: 'boom' });
+
+  expect(quitApp()).toEqual({ ok: false, error: 'boom' });
+});
+
+// ---------------------------------------------------------------------------
+// App mount — initializeMenuBar() + mirror/actions wiring called on mount
+// ---------------------------------------------------------------------------
+
+test('mounting App calls the native initialize() exactly once and registers the 6.3 action handlers', async () => {
   native.initialize.mockReturnValue({ ok: true });
 
   let testRenderer!: ReactTestRenderer.ReactTestRenderer;
@@ -133,12 +159,25 @@ test('mounting App calls the native initialize() exactly once', async () => {
   });
 
   expect(native.initialize).toHaveBeenCalledTimes(1);
+  // Story 6.3 — the mount effect also starts `startMenuBarActions()`, which
+  // subscribes quick-start + quit to the emitters exactly once. (App's mount
+  // effect additionally runs `startMenuBarMirror()`; a single mount calls
+  // each emitter once for the actions registration — the mirror's push
+  // exercise is owned by `menuBarMirror.test.ts`.)
+  expect(native.onQuickStart).toHaveBeenCalledTimes(1);
+  expect(native.onQuit).toHaveBeenCalledTimes(1);
+  // "Show window" is native-only (activation in MenuBar.swift's click
+  // handler) — App never subscribes to it.
+  expect(native.onShowWindow).not.toHaveBeenCalled();
 
   await ReactTestRenderer.act(() => {
     testRenderer.unmount();
   });
 
-  // Unmounting does not re-trigger it, and there is no cleanup call either
-  // (the mount effect has no return) — still exactly one call total.
+  // Unmounting does not re-trigger either registration, and there is no
+  // cleanup call either (the mount effect has no return) — still one call
+  // of each total.
   expect(native.initialize).toHaveBeenCalledTimes(1);
+  expect(native.onQuickStart).toHaveBeenCalledTimes(1);
+  expect(native.onQuit).toHaveBeenCalledTimes(1);
 });

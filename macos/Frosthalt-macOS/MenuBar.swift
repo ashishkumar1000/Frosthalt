@@ -30,8 +30,11 @@
 //  Story 6.2 the class also renders the LIVE badge mirror
 //  (`setBadgeState(_:)`): the button's attributed title + the first menu
 //  row's text, painted from strings JS derived — this class does no
-//  derivation of its own. No click-handling logic beyond firing the closure
-//  (6.3) happens here — emitted events may stay unlistened.
+//  derivation of its own. Story 6.3: "Show window" is decided entirely
+//  natively (activation in the click handler — no JS round-trip) and `quit()`
+//  terminates on main; the quick-start/quit DECISIONS still live in JS
+//  (`src/domain/menuBarActions.ts`) via the emitted events — 6.5's
+//  quit-confirm extends them.
 //
 //  Glued into the Obj-C++ TurboModule (NativeMenuBar.mm) via the
 //  Xcode-generated "<product>-Swift.h" header, same as ConfigStore.swift /
@@ -124,6 +127,24 @@ final class MenuBar: NSObject {
     }
   }
 
+  // MARK: - quit() (Story 6.3)
+
+  /// Quits the app via `NSApp.terminate(nil)`, dispatched onto the main
+  /// thread (like every other mutation here). The QUIT DECISION was already
+  /// made in JS — the `onQuit` handler (`src/domain/menuBarActions.ts`)
+  /// called this deliberately, and Story 6.5's confirm dialog will live
+  /// there — so this method emits nothing and asks nothing: it terminates.
+  /// Fire-and-forget, same contract as `initialize()`: the dispatch may be
+  /// called from any thread, the return is always `{ ok: true }`.
+  @objc
+  func quit() -> [String: Any] {
+    // No `self` capture — `NSApp` is global, so the block retains nothing.
+    DispatchQueue.main.async {
+      NSApp.terminate(nil)
+    }
+    return ["ok": true]
+  }
+
   // MARK: - initialize()
 
   /// Idempotently builds the status item + menu skeleton. The actual
@@ -201,6 +222,22 @@ final class MenuBar: NSObject {
   }
 
   @objc private func handleShowWindow() {
+    // Story 6.3 — "Show window" is pure AppKit activation, decided entirely
+    // on this click and never routed through JS (the event still fires — it
+    // stays unlistened, which the TurboModule tolerates). Activation alone
+    // is NOT enough for a Dock-minimized window (the app would come forward
+    // with the window still miniaturized), so a miniaturized main window is
+    // deminiaturized first; otherwise it is ordered front + key. The
+    // nil-guard makes a no-main-window moment a harmless activation-only
+    // no-op, not a crash.
+    NSApp.activate(ignoringOtherApps: true)
+    if let window = NSApp.mainWindow {
+      if window.isMiniaturized {
+        window.deminiaturize(nil)
+      } else {
+        window.makeKeyAndOrderFront(nil)
+      }
+    }
     onShowWindow?()
   }
 

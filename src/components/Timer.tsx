@@ -81,9 +81,11 @@ import { ApplyButton } from './ApplyButton';
 import { CountdownRing } from './CountdownRing';
 import {
   TimerDurationPicker,
-  PRESET_MINUTES,
   type DurationPickerValue,
 } from './TimerDurationPicker';
+// Story 6.3 — the preset list moved to the domain layer (single-sourced with
+// the menu bar's quick-start duration); re-pointed from the picker component.
+import { PRESET_MINUTES } from '../domain/timerPresets';
 import { TimerDomainList } from './TimerDomainList';
 import {
   parseDurationMinutes,

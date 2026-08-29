@@ -11,9 +11,11 @@
  * once, standing up the native NSStatusItem + NSMenu skeleton at app startup.
  * Story 6.2 follows it with `startMenuBarMirror()` — the domain-layer third
  * subscriber that pushes the live badge/countdown mirror to native on every
- * real state change. Ordering matters: both native calls dispatch onto the
- * serial main queue in call order, so the menu is guaranteed to be built
- * before the first badge push renders into it.
+ * real state change. Story 6.3 adds `startMenuBarActions()` — the click-side
+ * wiring (quick-start / quit) into the same effect. Ordering matters: both
+ * native calls dispatch onto the serial main queue in call order, so the menu
+ * is guaranteed to be built before the first badge push renders into it (the
+ * effect's own FIFO order mirrors 6.2's).
  */
 
 import { useEffect } from 'react';
@@ -22,6 +24,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { Shell } from './src/components/Shell';
 import { initializeMenuBar } from './src/native/menuBar';
 import { startMenuBarMirror } from './src/domain/menuBarMirror';
+import { startMenuBarActions } from './src/domain/menuBarActions';
 
 function App() {
   const isDarkMode = useColorScheme() === 'dark';
@@ -29,6 +32,7 @@ function App() {
   useEffect(() => {
     initializeMenuBar();
     startMenuBarMirror();
+    startMenuBarActions();
   }, []);
 
   return (

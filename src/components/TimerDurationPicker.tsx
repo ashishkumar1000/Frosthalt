@@ -28,13 +28,14 @@ import React from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { tokens } from '../theme/tokens';
 import { formatDurationLabel } from '../config/duration';
+// Story 6.3 — the preset list is single-sourced in the domain layer (UI →
+// domain); the local 4.1 copy was hoisted to `src/domain/timerPresets.ts` so
+// the menu bar's quick-start and this chip row share ONE constant.
+import { PRESET_MINUTES } from '../domain/timerPresets';
 
 export type DurationPickerValue =
   | { kind: 'preset'; minutes: number }
   | { kind: 'custom'; minutes: number };
-
-/** The three preset minute values the chip row offers. */
-export const PRESET_MINUTES = [25, 45, 60] as const;
 
 export interface TimerDurationPickerProps {
   /**

@@ -36,9 +36,12 @@ jest.mock('../src/native/specs/NativeMenuBarSpec', () => ({
   default: {
     initialize: jest.fn(() => ({ ok: true })),
     setBadgeState: jest.fn(() => ({ ok: true })),
-    onQuickStart: jest.fn(),
-    onShowWindow: jest.fn(),
-    onQuit: jest.fn(),
+    quit: jest.fn(() => ({ ok: true })),
+    // Story 6.3 — App mount now also subscribes (startMenuBarActions), so
+    // the emitters return a usable subscription shape (see menuBar.test.ts).
+    onQuickStart: jest.fn(() => ({ remove: jest.fn() })),
+    onShowWindow: jest.fn(() => ({ remove: jest.fn() })),
+    onQuit: jest.fn(() => ({ remove: jest.fn() })),
   },
 }));
 
