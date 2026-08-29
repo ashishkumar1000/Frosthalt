@@ -29,16 +29,8 @@ jest.mock('../src/native/specs/NativeConfigStoreSpec', () => {
   };
 });
 
-import {
-  readConfig,
-  writeConfig,
-} from '../src/config/configStore';
-import {
-  Config,
-  DEFAULT_CONFIG,
-  Domain,
-  Schedule,
-} from '../src/config/types';
+import { readConfig, writeConfig } from '../src/config/configStore';
+import { Config, DEFAULT_CONFIG, Domain, Schedule } from '../src/config/types';
 
 // The mock's default export is the native module handle. Cast through
 // `unknown` because the real default is typed as the codegen `Spec` (which a
@@ -138,7 +130,7 @@ test.each([
   (_label, payload) => {
     native.readConfig.mockReturnValue({ ok: true, data: payload });
     expect(readConfig()).toEqual(DEFAULT_CONFIG);
-  },
+  }
 );
 
 // P1: a misbehaving native impl could return `null`/`undefined` (not throw).
@@ -324,7 +316,7 @@ test('round-trip with DEFAULT_CONFIG (empty config) deep-equal', () => {
     return { ok: true };
   });
   native.readConfig.mockImplementation(() =>
-    stored == null ? { ok: true, data: null } : { ok: true, data: stored },
+    stored == null ? { ok: true, data: null } : { ok: true, data: stored }
   );
 
   expect(writeConfig(DEFAULT_CONFIG)).toEqual({ ok: true });
@@ -339,13 +331,19 @@ test('round-trip with DEFAULT_CONFIG (empty config) deep-equal', () => {
 test('DEFAULT_CONFIG has the four required keys and omits passwordHash', () => {
   const keys = Object.keys(DEFAULT_CONFIG).sort();
   expect(keys).toEqual(
-    ['activeTimer', 'domains', 'schedules', 'settings'].sort(),
+    ['activeTimer', 'domains', 'schedules', 'settings'].sort()
   );
   // `passwordHash` is intentionally UNSET on the default — not an empty string.
   expect('passwordHash' in DEFAULT_CONFIG).toBe(false);
   expect(DEFAULT_CONFIG.domains).toEqual([]);
   expect(DEFAULT_CONFIG.schedules).toEqual([]);
-  expect(DEFAULT_CONFIG.settings).toEqual({ menuBarEnabled: false });
+  // Story 6.4 — the optional `windowFrame` field exists on the default as an
+  // explicit `null` ("no frame on record", same meaning as an absent field;
+  // frozen with the settings object).
+  expect(DEFAULT_CONFIG.settings).toEqual({
+    menuBarEnabled: false,
+    windowFrame: null,
+  });
   expect(DEFAULT_CONFIG.activeTimer).toBeNull();
 });
 
@@ -363,7 +361,7 @@ test('DEFAULT_CONFIG is deep-frozen so readConfig returns cannot be mutation-poi
   // a TypeError ("object is not extensible") — which is exactly the guard we
   // want. Either way (throw or silent no-op), the array must stay empty.
   expect(() =>
-    DEFAULT_CONFIG.domains.push({ hostname: 'poison.com', alwaysOn: true }),
+    DEFAULT_CONFIG.domains.push({ hostname: 'poison.com', alwaysOn: true })
   ).toThrow();
   expect(DEFAULT_CONFIG.domains).toEqual([]);
 });

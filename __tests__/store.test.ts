@@ -125,7 +125,9 @@ test('stageDomainAdd rejects the injection example without staging', () => {
 });
 
 test('stageDomainAdd normalises and stages a valid domain as alwaysOn:true', () => {
-  const result = useDomainStore.getState().stageDomainAdd('https://www.Example.COM/path');
+  const result = useDomainStore
+    .getState()
+    .stageDomainAdd('https://www.Example.COM/path');
 
   expect(result).toStrictEqual({ ok: true });
   expect(useDomainStore.getState().staged).toStrictEqual([
@@ -403,9 +405,7 @@ test('stageAlwaysOnToggle on an unknown hostname returns not-found and leaves st
 });
 
 test('stageAlwaysOnToggle on an unknown hostname with a staged draft leaves the draft unchanged', () => {
-  const draft = [
-    { hostname: 'example.com', alwaysOn: false },
-  ];
+  const draft = [{ hostname: 'example.com', alwaysOn: false }];
   useDomainStore.setState({
     committed: {
       ...DEFAULT_CONFIG,
@@ -476,8 +476,8 @@ test('stageDomainRemove removes a committed domain and stages a new draft (count
   expect(
     stagedChangeCount(
       useDomainStore.getState().staged!,
-      useDomainStore.getState().committed.domains,
-    ),
+      useDomainStore.getState().committed.domains
+    )
   ).toBe(1);
 });
 
@@ -508,8 +508,8 @@ test('stageDomainRemove removes from a multi-edit staged draft', () => {
   expect(
     stagedChangeCount(
       useDomainStore.getState().staged!,
-      useDomainStore.getState().committed.domains,
-    ),
+      useDomainStore.getState().committed.domains
+    )
   ).toBe(1);
 });
 
@@ -741,7 +741,10 @@ test('apply() success writes config then hosts in strict order with the golden p
 // ---------------------------------------------------------------------------
 
 test('apply() admin-denied retains staged, leaves committed unchanged, and forwards the envelope', async () => {
-  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  shellNative.writeHosts.mockResolvedValue({
+    ok: false,
+    error: 'admin-denied',
+  });
   useDomainStore.getState().stageDomainAdd('example.com');
   const committedBefore = useDomainStore.getState().committed;
 
@@ -883,9 +886,10 @@ test('a newer draft staged during an in-flight Apply is retained, not clobbered'
   useDomainStore.getState().stageDomainAdd('example.com');
   let resolveFirst: ((v: WriteResult) => void) | null = null;
   shellNative.writeHosts.mockImplementation(
-    () => new Promise<WriteResult>((res) => {
-      resolveFirst = res;
-    }),
+    () =>
+      new Promise<WriteResult>((res) => {
+        resolveFirst = res;
+      })
   );
 
   const p = useDomainStore.getState().apply();
@@ -947,7 +951,7 @@ test('a rejected writeHosts does not reject apply(), retains staged, and resets 
 
 // Compile-time pin: apply() returns Promise<WriteResult>.
 const _applyReturnsWriteResult = (
-  r: Promise<WriteResult>,
+  r: Promise<WriteResult>
 ): WriteResult | Promise<WriteResult> => r;
 void _applyReturnsWriteResult;
 
@@ -1132,7 +1136,10 @@ test('restoreSection admin-denied: { ok:false, error:"admin-denied" }, drift rem
     },
     drift: { drift: true, reason: 'missing' },
   });
-  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  shellNative.writeHosts.mockResolvedValue({
+    ok: false,
+    error: 'admin-denied',
+  });
 
   const result = await useDomainStore.getState().restoreSection();
 
@@ -1314,7 +1321,7 @@ test('setPassword writes the SHA-256 hash to config, advances committed, and ret
   expect(configNative.writeConfig.mock.calls[0][0]).not.toContain('secret123');
   // committed advanced to carry the hash.
   expect(useDomainStore.getState().committed.passwordHash).toBe(
-    hashPassword('secret123'),
+    hashPassword('secret123')
   );
 });
 
@@ -1345,7 +1352,7 @@ test('setPassword does NOT flip applyStatus (it is not an Apply run)', async () 
   expect(useDomainStore.getState().applyStatus).toBe('idle');
 });
 
-test('setPassword queued behind an in-flight Apply does NOT clobber the Apply\'s writeConfig — password write preserves the Apply\'s committed domains', async () => {
+test("setPassword queued behind an in-flight Apply does NOT clobber the Apply's writeConfig — password write preserves the Apply's committed domains", async () => {
   // Stage a domain and start an Apply whose writeHosts does not resolve until
   // we release it, so the Apply stays in flight while setPassword queues.
   useDomainStore.setState({ committed: DEFAULT_CONFIG });
@@ -1354,7 +1361,7 @@ test('setPassword queued behind an in-flight Apply does NOT clobber the Apply\'s
     () =>
       new Promise<WriteResult>((res) => {
         resolveApply = res;
-      }),
+      })
   );
 
   useDomainStore.getState().stageDomainAdd('example.com');
@@ -1423,7 +1430,7 @@ test('back-to-back setPassword calls serialize: the second write carries the lat
   expect(second.passwordHash).toBe(hashPassword('secondpw'));
   // Final committed reflects the LAST write (hashB), not hashA.
   expect(useDomainStore.getState().committed.passwordHash).toBe(
-    hashPassword('secondpw'),
+    hashPassword('secondpw')
   );
 });
 
@@ -1449,9 +1456,131 @@ test('setPassword persists committed only — staged (un-Applied) domain changes
   // committed gained the hash but no domain; staged is unchanged.
   expect(useDomainStore.getState().committed.domains).toStrictEqual([]);
   expect(useDomainStore.getState().committed.passwordHash).toBe(
-    hashPassword('secret123'),
+    hashPassword('secret123')
   );
   expect(useDomainStore.getState().staged).not.toBeNull();
+});
+
+// ===========================================================================
+// Story 6.4 — commitWindowFrame (the first `settings` writer).
+//
+// An exact `setPassword` discipline clone for `settings.windowFrame`: direct
+// config commit (AD-6) — writeConfig ONLY, never writeHosts, applyStatus
+// never flipped, no staged/hosts pipeline. `committed` is re-read INSIDE the
+// enqueue at run time. Validation lives in the domain layer
+// (`windowFrame.ts`) — the store trusts the passed `WindowFrame` (the
+// no-cycle rule: store.ts must not import windowFrame.ts), so these tests
+// hand in already-valid frames and pin the persistence mechanics only.
+// ===========================================================================
+
+const FRAME = { x: 12.5, y: -30, width: 1440, height: 900 };
+
+test('commitWindowFrame writes the frame into settings.windowFrame, advances committed, and returns { ok: true }', async () => {
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+
+  const result = await useDomainStore.getState().commitWindowFrame(FRAME);
+
+  expect(result).toEqual({ ok: true });
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  expect(written.settings.windowFrame).toEqual(FRAME);
+  // committed advanced to carry the frame.
+  expect(useDomainStore.getState().committed.settings.windowFrame).toEqual(
+    FRAME
+  );
+});
+
+test('commitWindowFrame preserves every other settings key and committed field', async () => {
+  useDomainStore.setState({
+    committed: {
+      ...DEFAULT_CONFIG,
+      passwordHash: 'abc',
+      domains: [{ hostname: 'a.com', alwaysOn: true }],
+      settings: { menuBarEnabled: true, windowFrame: null },
+    },
+  });
+
+  await useDomainStore.getState().commitWindowFrame(FRAME);
+
+  const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
+  // The settings object was SPREAD, never replaced wholesale.
+  expect(written.settings).toEqual({
+    menuBarEnabled: true,
+    windowFrame: FRAME,
+  });
+  // Everything else spread through from the run-time committed re-read.
+  expect(written.passwordHash).toBe('abc');
+  expect(written.domains).toStrictEqual([
+    { hostname: 'a.com', alwaysOn: true },
+  ]);
+  expect(useDomainStore.getState().committed.settings.menuBarEnabled).toBe(
+    true
+  );
+});
+
+test('commitWindowFrame does NOT call writeHosts and does NOT flip applyStatus', async () => {
+  useDomainStore.setState({ committed: DEFAULT_CONFIG, applyStatus: 'idle' });
+
+  await useDomainStore.getState().commitWindowFrame(FRAME);
+
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().lastResult).toBeNull();
+});
+
+test('commitWindowFrame on writeConfig failure returns the envelope and leaves committed unchanged', async () => {
+  configNative.writeConfig.mockReturnValue({ ok: false, error: 'disk-full' });
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+
+  const result = await useDomainStore.getState().commitWindowFrame(FRAME);
+
+  expect(result).toStrictEqual({ ok: false, error: 'disk-full' });
+  // No half-advance: the last persisted frame stays on record ("null").
+  expect(useDomainStore.getState().committed.settings.windowFrame).toBeNull();
+});
+
+test("commitWindowFrame queued behind an in-flight Apply does NOT clobber the Apply's writeConfig — the frame write preserves the Apply's committed domains", async () => {
+  useDomainStore.setState({ committed: DEFAULT_CONFIG });
+  let resolveApply: ((v: WriteResult) => void) | null = null;
+  shellNative.writeHosts.mockImplementation(
+    () =>
+      new Promise<WriteResult>((res) => {
+        resolveApply = res;
+      })
+  );
+
+  useDomainStore.getState().stageDomainAdd('example.com');
+  const applyP = useDomainStore.getState().apply();
+  await flushMicrotasks();
+  expect(useDomainStore.getState().applyStatus).toBe('running');
+
+  // A debounced frame event lands while the Apply is in flight — it queues.
+  const frameP = useDomainStore.getState().commitWindowFrame(FRAME);
+  await flushMicrotasks();
+  // Not yet run: only the Apply's config commit so far.
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
+
+  // Release the Apply: it commits staged domains FIRST, then the frame write
+  // runs on the run-time committed (domains included).
+  resolveApply!({ ok: true });
+  const [applyRes, frameRes] = await Promise.all([applyP, frameP]);
+
+  expect(applyRes).toStrictEqual({ ok: true });
+  expect(frameRes).toEqual({ ok: true });
+  expect(configNative.writeConfig).toHaveBeenCalledTimes(2);
+  const frameWritten = JSON.parse(configNative.writeConfig.mock.calls[1][0]);
+  expect(frameWritten.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  expect(frameWritten.settings.windowFrame).toEqual(FRAME);
+  const state = useDomainStore.getState();
+  expect(state.committed.domains).toStrictEqual([
+    { hostname: 'example.com', alwaysOn: true },
+  ]);
+  expect(state.committed.settings.windowFrame).toEqual(FRAME);
+  // writeHosts called exactly once (by the Apply) — the frame save never
+  // touches /etc/hosts.
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
 });
 
 // ===========================================================================
@@ -1478,9 +1607,10 @@ test('stageStartTimer success: writeConfig (activeTimer) BEFORE writeHosts (stri
   });
   const before = Date.now();
 
-  const result = await useDomainStore
-    .getState()
-    .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['a.com', 'b.com']) });
+  const result = await useDomainStore.getState().stageStartTimer({
+    durationMs: TWENTY_FIVE_MIN_MS,
+    selected: new Set(['a.com', 'b.com']),
+  });
 
   expect(result).toEqual({ ok: true });
   // Strict order: writeConfig fires once BEFORE writeHosts.
@@ -1495,9 +1625,11 @@ test('stageStartTimer success: writeConfig (activeTimer) BEFORE writeHosts (stri
   expect(written.domains).toStrictEqual([
     { hostname: 'a.com', alwaysOn: true },
   ]);
-  expect(written.activeTimer.endEpochMs).toBeGreaterThanOrEqual(before + TWENTY_FIVE_MIN_MS - 5);
+  expect(written.activeTimer.endEpochMs).toBeGreaterThanOrEqual(
+    before + TWENTY_FIVE_MIN_MS - 5
+  );
   expect(written.activeTimer.endEpochMs).toBeLessThanOrEqual(
-    Date.now() + TWENTY_FIVE_MIN_MS + 5,
+    Date.now() + TWENTY_FIVE_MIN_MS + 5
   );
   expect(written.activeTimer.selectedDomains).toStrictEqual(['a.com', 'b.com']);
   // writeHosts called exactly once with the union of always-on + timer-
@@ -1517,13 +1649,15 @@ test('stageStartTimer success: writeConfig (activeTimer) BEFORE writeHosts (stri
   expect(hostsLines.some((l: string) => l.includes('b.com'))).toBe(true);
   // Pull out the apex names (the second whitespace-delimited token).
   const distinctApexes = new Set(
-    hostsLines.map((l: string) => l.split(/\s+/)[1]),
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
   );
   // 2 apexes (a.com, b.com), each with `apex` and `www.<apex>` entries =
   // 4 distinct apex tokens. `a.com` appears twice (apex + www.) but the
   // dedupe collapses them — the assertion is on the SET of distinct
   // hostnames.
-  expect(distinctApexes).toStrictEqual(new Set(['a.com', 'b.com', 'www.a.com', 'www.b.com']));
+  expect(distinctApexes).toStrictEqual(
+    new Set(['a.com', 'b.com', 'www.a.com', 'www.b.com'])
+  );
   // committed.activeTimer advances to the new value.
   expect(useDomainStore.getState().committed.activeTimer).toStrictEqual({
     endEpochMs: written.activeTimer.endEpochMs,
@@ -1546,9 +1680,10 @@ test('stageStartTimer config-write failure: returns the envelope, does NOT call 
     applyStatus: 'idle',
   });
 
-  const result = await useDomainStore
-    .getState()
-    .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['a.com']) });
+  const result = await useDomainStore.getState().stageStartTimer({
+    durationMs: TWENTY_FIVE_MIN_MS,
+    selected: new Set(['a.com']),
+  });
 
   expect(result).toStrictEqual({ ok: false, error: 'config-write:disk-full' });
   // writeConfig was called (and failed) -> writeHosts is NEVER called.
@@ -1562,7 +1697,10 @@ test('stageStartTimer config-write failure: returns the envelope, does NOT call 
 });
 
 test('stageStartTimer hosts-deny: committed.activeTimer stays null (retry-safe); applyStatus resets to idle; lastResult carries the envelope', async () => {
-  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  shellNative.writeHosts.mockResolvedValue({
+    ok: false,
+    error: 'admin-denied',
+  });
   useDomainStore.setState({
     committed: {
       ...DEFAULT_CONFIG,
@@ -1572,9 +1710,10 @@ test('stageStartTimer hosts-deny: committed.activeTimer stays null (retry-safe);
     applyStatus: 'idle',
   });
 
-  const result = await useDomainStore
-    .getState()
-    .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['a.com']) });
+  const result = await useDomainStore.getState().stageStartTimer({
+    durationMs: TWENTY_FIVE_MIN_MS,
+    selected: new Set(['a.com']),
+  });
 
   expect(result).toStrictEqual({ ok: false, error: 'admin-denied' });
   // writeConfig ran (carrying the activeTimer write — accepted drift).
@@ -1592,7 +1731,7 @@ test('stageStartTimer hosts-deny: committed.activeTimer stays null (retry-safe);
   });
 });
 
-test('stageStartTimer queued behind an in-flight Apply: timer\'s writeConfig preserves the Apply\'s just-committed domains (no clobber)', async () => {
+test("stageStartTimer queued behind an in-flight Apply: timer's writeConfig preserves the Apply's just-committed domains (no clobber)", async () => {
   // Stage a domain and start an Apply whose writeHosts does not resolve
   // until we release it, so the Apply stays in flight while stageStartTimer
   // queues. After release, the Apply commits its staged domains first;
@@ -1611,7 +1750,7 @@ test('stageStartTimer queued behind an in-flight Apply: timer\'s writeConfig pre
     () =>
       new Promise<WriteResult>((res) => {
         pendingResolvers.push(res);
-      }),
+      })
   );
 
   // Stage and start the Apply.
@@ -1622,9 +1761,10 @@ test('stageStartTimer queued behind an in-flight Apply: timer\'s writeConfig pre
   expect(pendingResolvers).toHaveLength(1); // the Apply's writeHosts
 
   // While the Apply is in flight, call stageStartTimer — it queues behind.
-  const timerP = useDomainStore
-    .getState()
-    .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['b.com']) });
+  const timerP = useDomainStore.getState().stageStartTimer({
+    durationMs: TWENTY_FIVE_MIN_MS,
+    selected: new Set(['b.com']),
+  });
   await flushMicrotasks();
   // The Apply has not settled, so stageStartTimer must NOT have run yet.
   expect(configNative.writeConfig).toHaveBeenCalledTimes(1); // Apply's only
@@ -1662,7 +1802,7 @@ test('stageStartTimer queued behind an in-flight Apply: timer\'s writeConfig pre
   expect(state.committed.activeTimer?.selectedDomains).toStrictEqual(['b.com']);
 });
 
-test('stageStartTimer back-to-back: 2nd supersedes the 1st cleanly; 2nd\'s endEpochMs >= 1st\'s (computed at run time)', async () => {
+test("stageStartTimer back-to-back: 2nd supersedes the 1st cleanly; 2nd's endEpochMs >= 1st's (computed at run time)", async () => {
   useDomainStore.setState({
     committed: DEFAULT_CONFIG,
     staged: null,
@@ -1690,14 +1830,14 @@ test('stageStartTimer back-to-back: 2nd supersedes the 1st cleanly; 2nd\'s endEp
   // on the same millisecond when the queue drains without a wall-clock
   // tick, so we allow >= not >).
   expect(second.activeTimer.endEpochMs).toBeGreaterThanOrEqual(
-    first.activeTimer.endEpochMs,
+    first.activeTimer.endEpochMs
   );
   // The 2nd supersedes the 1st: only `b.com` survives in the final committed
   // state (stale `a.com` is trimmed by the second write carrying the new
   // selection).
-  expect(useDomainStore.getState().committed.activeTimer?.selectedDomains).toStrictEqual([
-    'b.com',
-  ]);
+  expect(
+    useDomainStore.getState().committed.activeTimer?.selectedDomains
+  ).toStrictEqual(['b.com']);
 });
 
 test('stageStartTimer does NOT clobber staged Blocklist edits (staged is intact after the hosts write)', async () => {
@@ -2156,7 +2296,10 @@ function seedExpiredSession(opts?: {
       domains: [
         { hostname: 'a.com', alwaysOn: true },
         { hostname: 'b.com', alwaysOn: false },
-        ...(opts?.alwaysOn ?? []).map((hostname) => ({ hostname, alwaysOn: true })),
+        ...(opts?.alwaysOn ?? []).map((hostname) => ({
+          hostname,
+          alwaysOn: true,
+        })),
       ],
       activeTimer: {
         endEpochMs: end,
@@ -2192,7 +2335,9 @@ test('expireTimer success: writeConfig (activeTimer:null) BEFORE writeHosts, hos
   // timer-selected `b.com` (alwaysOn:false) is GONE from the hosts payload.
   expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
   const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
   // `committed.activeTimer` is cleared in memory (badge/countdown revert).
   expect(useDomainStore.getState().committed.activeTimer).toBeNull();
@@ -2222,15 +2367,20 @@ test('expireTimer success keeps an also-always-on domain blocked (hosts payload 
   // `alwaysOn` is NOT touched — the domain entry survives untouched.
   expect(written.domains).toContainEqual({ hostname: 'b.com', alwaysOn: true });
   const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   // Both always-on domains stay blocked after the session lifts.
   expect(distinctApexes).toStrictEqual(
-    new Set(['a.com', 'www.a.com', 'b.com', 'www.b.com']),
+    new Set(['a.com', 'www.a.com', 'b.com', 'www.b.com'])
   );
 });
 
 test('expireTimer hosts-deny: committed.activeTimer stays INTACT, applyStatus resets to idle, error toast', async () => {
-  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  shellNative.writeHosts.mockResolvedValue({
+    ok: false,
+    error: 'admin-denied',
+  });
   const end = seedExpiredSession();
 
   const result = await useDomainStore.getState().expireTimer();
@@ -2319,7 +2469,10 @@ test('expireTimer not-expired guard: null activeTimer OR a future end -> no port
   useDomainStore.setState({
     committed: {
       ...DEFAULT_CONFIG,
-      activeTimer: { endEpochMs: Date.now() + 60_000, selectedDomains: ['a.com'] },
+      activeTimer: {
+        endEpochMs: Date.now() + 60_000,
+        selectedDomains: ['a.com'],
+      },
     },
     applyStatus: 'idle',
   });
@@ -2403,7 +2556,7 @@ test('expireTimer behind a HUNG queue run: no toast, no committed change, zero p
     () =>
       new Promise<WriteResult>((res) => {
         pendingResolvers.push(res);
-      }),
+      })
   );
 
   // Start a session (future end) whose writeHosts NEVER resolves — the
@@ -2454,7 +2607,7 @@ test('expireTimer superseding session no-op: a Start queued ahead rewrites activ
     () =>
       new Promise<WriteResult>((res) => {
         pendingResolvers.push(res);
-      }),
+      })
   );
 
   const startP = useDomainStore.getState().stageStartTimer({
@@ -2485,7 +2638,7 @@ test('expireTimer superseding session no-op: a Start queued ahead rewrites activ
   // The fresh session SURVIVES.
   expect(useDomainStore.getState().committed.activeTimer).not.toBeNull();
   expect(
-    useDomainStore.getState().committed.activeTimer!.endEpochMs,
+    useDomainStore.getState().committed.activeTimer!.endEpochMs
   ).toBeGreaterThanOrEqual(Date.now());
   expect(useDomainStore.getState().toast).toBeNull();
 });
@@ -2508,7 +2661,7 @@ test('expireTimer double-fire idempotency: the 2nd call after a successful expir
   });
 });
 
-test('expireTimer queued behind an in-flight Apply: re-reads committed at queue time (hosts payload includes the Apply\'s just-committed domain)', async () => {
+test("expireTimer queued behind an in-flight Apply: re-reads committed at queue time (hosts payload includes the Apply's just-committed domain)", async () => {
   useDomainStore.setState({
     committed: DEFAULT_CONFIG,
     staged: null,
@@ -2519,7 +2672,7 @@ test('expireTimer queued behind an in-flight Apply: re-reads committed at queue 
     () =>
       new Promise<WriteResult>((res) => {
         pendingResolvers.push(res);
-      }),
+      })
   );
 
   // Start an Apply committing `example.com` as alwaysOn.
@@ -2564,9 +2717,11 @@ test('expireTimer queued behind an in-flight Apply: re-reads committed at queue 
   // Apply's staged slice REPLACES the domains list, so the seed's `a.com`
   // entry is legitimately gone.)
   const hostsLines = shellNative.writeHosts.mock.calls[1][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   expect(distinctApexes).toStrictEqual(
-    new Set(['example.com', 'www.example.com']),
+    new Set(['example.com', 'www.example.com'])
   );
   // The expired session is cleared.
   expect(useDomainStore.getState().committed.activeTimer).toBeNull();
@@ -2678,7 +2833,11 @@ test('the 4.5 trigger stays silent while a LIVE session ticks (false->false upda
 
   // A live (future-ended) mirror: the expired flag stays false across ticks.
   const futureEnd = Date.now() + 60_000;
-  useTimerStore.setState({ nowMs: Date.now(), endEpochMs: futureEnd, totalMs: 60_000 });
+  useTimerStore.setState({
+    nowMs: Date.now(),
+    endEpochMs: futureEnd,
+    totalMs: 60_000,
+  });
   useTimerStore.setState({ nowMs: Date.now() + 1_000 }); // a tick
   await flushMicrotasks();
 
@@ -2719,7 +2878,10 @@ function seedLiveSession(opts?: {
       domains: [
         { hostname: 'a.com', alwaysOn: true },
         { hostname: 'b.com', alwaysOn: false },
-        ...(opts?.alwaysOn ?? []).map((hostname) => ({ hostname, alwaysOn: true })),
+        ...(opts?.alwaysOn ?? []).map((hostname) => ({
+          hostname,
+          alwaysOn: true,
+        })),
       ],
       activeTimer: {
         endEpochMs: end,
@@ -2754,7 +2916,9 @@ test('endEarly success on a LIVE session: writeConfig (activeTimer:null) BEFORE 
   // timer-selected `b.com` (alwaysOn:false) lifts, `a.com` stays (always-on).
   expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
   const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
   // `committed.activeTimer` is cleared in memory (badge/countdown revert).
   expect(useDomainStore.getState().committed.activeTimer).toBeNull();
@@ -2790,7 +2954,9 @@ test('endEarly N count excludes always-on domains (plural) and the toast uses th
   });
   // Both lifted domains are gone from the hosts payload; a.com stays.
   const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
 });
 
@@ -2807,10 +2973,12 @@ test('endEarly with every selected domain also always-on: payload still the alwa
   // `alwaysOn` is NOT touched — the domain entry survives untouched.
   expect(written.domains).toContainEqual({ hostname: 'b.com', alwaysOn: true });
   const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   // Both always-on domains stay blocked after the session lifts.
   expect(distinctApexes).toStrictEqual(
-    new Set(['a.com', 'www.a.com', 'b.com', 'www.b.com']),
+    new Set(['a.com', 'www.a.com', 'b.com', 'www.b.com'])
   );
   // N = 0 -> the bare copy (no "0 domains" grammar).
   expect(useDomainStore.getState().toast).toStrictEqual({
@@ -2840,9 +3008,11 @@ test('endEarly N count matches at normaliseDomain level: a selected www.-subdoma
 
   expect(result).toEqual({ ok: true });
   const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   expect(distinctApexes).toStrictEqual(
-    new Set(['twitter.com', 'www.twitter.com']),
+    new Set(['twitter.com', 'www.twitter.com'])
   );
   expect(useDomainStore.getState().toast).toStrictEqual({
     message: 'Session ended.',
@@ -2851,7 +3021,10 @@ test('endEarly N count matches at normaliseDomain level: a selected www.-subdoma
 });
 
 test('endEarly hosts-deny: committed.activeTimer stays INTACT, applyStatus resets to idle, error toast', async () => {
-  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  shellNative.writeHosts.mockResolvedValue({
+    ok: false,
+    error: 'admin-denied',
+  });
   const end = seedLiveSession();
 
   const result = await useDomainStore.getState().endEarly();
@@ -2903,7 +3076,7 @@ test('endEarly hosts-throw: returns a hosts-throw envelope, keeps activeTimer in
     // what the deny branch already sets.
     expect(useDomainStore.getState().lastResult!.ok).toBe(false);
     expect(String(useDomainStore.getState().lastResult!.error)).toContain(
-      'hosts-throw:',
+      'hosts-throw:'
     );
   } finally {
     spy.mockRestore();
@@ -2959,7 +3132,7 @@ test('endEarly double-fire idempotency: the 2nd call after a successful end no-o
   });
 });
 
-test('endEarly queued behind an in-flight Apply: re-reads committed at queue time (hosts payload includes the Apply\'s just-committed domain)', async () => {
+test("endEarly queued behind an in-flight Apply: re-reads committed at queue time (hosts payload includes the Apply's just-committed domain)", async () => {
   useDomainStore.setState({
     committed: DEFAULT_CONFIG,
     staged: null,
@@ -2970,7 +3143,7 @@ test('endEarly queued behind an in-flight Apply: re-reads committed at queue tim
     () =>
       new Promise<WriteResult>((res) => {
         pendingResolvers.push(res);
-      }),
+      })
   );
 
   // Start an Apply committing `example.com` as alwaysOn.
@@ -3013,9 +3186,11 @@ test('endEarly queued behind an in-flight Apply: re-reads committed at queue tim
   // A stale pre-Apply snapshot would have produced the seed's `a.com`
   // payload instead — the re-read is the whole point of this test.
   const hostsLines = shellNative.writeHosts.mock.calls[1][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   expect(distinctApexes).toStrictEqual(
-    new Set(['example.com', 'www.example.com']),
+    new Set(['example.com', 'www.example.com'])
   );
   // The live session is cleared.
   expect(useDomainStore.getState().committed.activeTimer).toBeNull();
@@ -3033,7 +3208,7 @@ test('endEarly queue-behind-Expiry re-read is authoritative: an expiry job queue
     () =>
       new Promise<WriteResult>((res) => {
         pendingResolvers.push(res);
-      }),
+      })
   );
 
   const expireP = useDomainStore.getState().expireTimer();
@@ -3080,7 +3255,9 @@ test('endEarly N count dedupes by apex: selected ["b.com", "www.b.com"] lifts ON
   // The hosts payload is still correct: the whole b.com apex lifted (both
   // entries map to the same apex), only the always-on a.com lines remain.
   const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
 });
 
@@ -3098,7 +3275,9 @@ test('endEarly with an EMPTY selectedDomains on a live session: zero branch -> b
   // the timer-selected block — of which there were none).
   expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
   const hostsLines = shellNative.writeHosts.mock.calls[0][0] as string[];
-  const distinctApexes = new Set(hostsLines.map((l: string) => l.split(/\s+/)[1]));
+  const distinctApexes = new Set(
+    hostsLines.map((l: string) => l.split(/\s+/)[1])
+  );
   expect(distinctApexes).toStrictEqual(new Set(['a.com', 'www.a.com']));
 });
 
@@ -3112,7 +3291,9 @@ test('endEarly fires on an EXPIRED-but-uncleared session: the guard checks PRESE
 
   expect(result).toEqual({ ok: true });
   expect(configNative.writeConfig).toHaveBeenCalledTimes(1);
-  expect(JSON.parse(configNative.writeConfig.mock.calls[0][0]).activeTimer).toBeNull();
+  expect(
+    JSON.parse(configNative.writeConfig.mock.calls[0][0]).activeTimer
+  ).toBeNull();
   expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
   expect(useDomainStore.getState().committed.activeTimer).toBeNull();
   expect(useDomainStore.getState().toast).toStrictEqual({
@@ -3158,9 +3339,10 @@ test('stageStartTimer hosts-throw: lastResult now carries the throw envelope (4-
       applyStatus: 'idle',
     });
 
-    const result = await useDomainStore
-      .getState()
-      .stageStartTimer({ durationMs: TWENTY_FIVE_MIN_MS, selected: new Set(['a.com']) });
+    const result = await useDomainStore.getState().stageStartTimer({
+      durationMs: TWENTY_FIVE_MIN_MS,
+      selected: new Set(['a.com']),
+    });
 
     expect(result.ok).toBe(false);
     expect(String(result.error)).toContain('hosts-throw:');
@@ -3171,7 +3353,7 @@ test('stageStartTimer hosts-throw: lastResult now carries the throw envelope (4-
     // deny branch.
     expect(useDomainStore.getState().lastResult!.ok).toBe(false);
     expect(String(useDomainStore.getState().lastResult!.error)).toContain(
-      'hosts-throw:',
+      'hosts-throw:'
     );
   } finally {
     spy.mockRestore();
@@ -3190,7 +3372,7 @@ test('expireTimer hosts-throw also sets lastResult (4-5 defer re-pinned)', async
     expect(useDomainStore.getState().applyStatus).toBe('idle');
     expect(useDomainStore.getState().lastResult!.ok).toBe(false);
     expect(String(useDomainStore.getState().lastResult!.error)).toContain(
-      'hosts-throw:',
+      'hosts-throw:'
     );
   } finally {
     spy.mockRestore();
@@ -3250,7 +3432,10 @@ test('stageScheduleEnabledToggle flips enabled on a committed schedule and stage
 
 test('stageScheduleEnabledToggle builds on the staged schedule draft when one exists', () => {
   useDomainStore.setState({
-    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE] },
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE],
+    },
     stagedSchedules: [
       { ...FOCUS_SCHEDULE, enabled: false }, // already toggled
       EVENINGS_SCHEDULE,
@@ -3358,7 +3543,10 @@ test('stageScheduleEnabledToggle clean-revert on a schedule whose domains field 
 test('stageScheduleEnabledToggle clean-revert compares weekday SETS (a reordered list is not a change)', () => {
   // Committed stores weekdays in a non-canonical order; toggling enabled off
   // and on must still clean-revert (weekday order is not part of identity).
-  const committedSchedule: Schedule = { ...FOCUS_SCHEDULE, weekdays: [4, 0, 2] };
+  const committedSchedule: Schedule = {
+    ...FOCUS_SCHEDULE,
+    weekdays: [4, 0, 2],
+  };
   useDomainStore.setState({
     committed: { ...DEFAULT_CONFIG, schedules: [committedSchedule] },
     stagedSchedules: null,
@@ -3376,7 +3564,10 @@ test('stageScheduleEnabledToggle clean-revert does NOT fire when other schedule 
   // back on — the draft still differs from committed (the second toggle) so
   // the buffer stays.
   useDomainStore.setState({
-    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE] },
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE],
+    },
     stagedSchedules: null,
   });
 
@@ -3481,7 +3672,9 @@ test('apply() commits BOTH fields in ONE writeConfig, advances both, and clears 
   expect(written.domains).toStrictEqual([
     { hostname: 'example.com', alwaysOn: true },
   ]);
-  expect(written.schedules).toStrictEqual([{ ...FOCUS_SCHEDULE, enabled: false }]);
+  expect(written.schedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
   // committed advanced per field; both buffers cleared.
   const state = useDomainStore.getState();
   expect(state.staged).toBeNull();
@@ -3513,8 +3706,12 @@ test('apply() with ONLY a schedule draft (staged: null) keeps committed.domains 
   expect(result).toStrictEqual({ ok: true });
   const written = JSON.parse(configNative.writeConfig.mock.calls[0][0]);
   // The clean domain slice leaves committed.domains untouched in the write.
-  expect(written.domains).toStrictEqual([{ hostname: 'kept.com', alwaysOn: true }]);
-  expect(written.schedules).toStrictEqual([{ ...FOCUS_SCHEDULE, enabled: false }]);
+  expect(written.domains).toStrictEqual([
+    { hostname: 'kept.com', alwaysOn: true },
+  ]);
+  expect(written.schedules).toStrictEqual([
+    { ...FOCUS_SCHEDULE, enabled: false },
+  ]);
   // In-memory committed advanced per field.
   const state = useDomainStore.getState();
   expect(state.committed.domains).toStrictEqual([
@@ -3577,7 +3774,10 @@ test('apply() with both buffers clean-reverted to null is a no-op: neither port 
 // ---------------------------------------------------------------------------
 
 test('apply() admin-denied retains BOTH drafts, leaves committed unchanged, and forwards the envelope', async () => {
-  shellNative.writeHosts.mockResolvedValue({ ok: false, error: 'admin-denied' });
+  shellNative.writeHosts.mockResolvedValue({
+    ok: false,
+    error: 'admin-denied',
+  });
   useDomainStore.setState({
     committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE] },
     stagedSchedules: null,
@@ -3649,9 +3849,10 @@ test('a newer schedule draft staged during an in-flight Apply is retained, not c
 
   let resolveFirst: ((v: WriteResult) => void) | null = null;
   shellNative.writeHosts.mockImplementation(
-    () => new Promise<WriteResult>((res) => {
-      resolveFirst = res;
-    }),
+    () =>
+      new Promise<WriteResult>((res) => {
+        resolveFirst = res;
+      })
   );
 
   const p = useDomainStore.getState().apply();
@@ -3694,9 +3895,10 @@ test('a newer DOMAIN draft staged during an in-flight Apply is retained while th
 
   let resolveFirst: ((v: WriteResult) => void) | null = null;
   shellNative.writeHosts.mockImplementation(
-    () => new Promise<WriteResult>((res) => {
-      resolveFirst = res;
-    }),
+    () =>
+      new Promise<WriteResult>((res) => {
+        resolveFirst = res;
+      })
   );
 
   const p = useDomainStore.getState().apply();
@@ -3868,7 +4070,10 @@ test('stageScheduleUpsert APPENDS a new schedule onto the clean committed list (
 
 test('stageScheduleUpsert REPLACES the same-id schedule in place when editing', () => {
   useDomainStore.setState({
-    committed: { ...DEFAULT_CONFIG, schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE] },
+    committed: {
+      ...DEFAULT_CONFIG,
+      schedules: [FOCUS_SCHEDULE, EVENINGS_SCHEDULE],
+    },
   });
 
   const result = useDomainStore.getState().stageScheduleUpsert({
@@ -3984,9 +4189,10 @@ test('stageScheduleUpsert produces a NEW array reference mid-Apply so the runnin
 
   let resolveFirst: ((v: WriteResult) => void) | null = null;
   shellNative.writeHosts.mockImplementation(
-    () => new Promise<WriteResult>((res) => {
-      resolveFirst = res;
-    }),
+    () =>
+      new Promise<WriteResult>((res) => {
+        resolveFirst = res;
+      })
   );
 
   // The in-flight Apply captures `stagedSchedules: null` (clean schedule
@@ -4061,8 +4267,8 @@ test('stageScheduleRemove removes a committed schedule and stages a new draft (c
   expect(
     stagedScheduleChangeCount(
       useDomainStore.getState().stagedSchedules!,
-      useDomainStore.getState().committed.schedules,
-    ),
+      useDomainStore.getState().committed.schedules
+    )
   ).toBe(1);
 });
 
@@ -4095,8 +4301,8 @@ test('stageScheduleRemove removes from a multi-edit staged schedule draft', () =
   expect(
     stagedScheduleChangeCount(
       useDomainStore.getState().stagedSchedules!,
-      useDomainStore.getState().committed.schedules,
-    ),
+      useDomainStore.getState().committed.schedules
+    )
   ).toBe(2);
 });
 
@@ -4248,7 +4454,7 @@ const dayBase = new Date(
   12,
   0,
   0,
-  0,
+  0
 );
 
 function fiveFourHhmm(d: Date): string {
@@ -4260,7 +4466,7 @@ function fiveFourHhmm(d: Date): string {
 /** A schedule window covering `[dayBase, dayBase + minutes)` on dayBase's weekday. */
 function makeFiveFourSchedule(
   minutes: number,
-  overrides: Partial<Schedule> = {},
+  overrides: Partial<Schedule> = {}
 ): Schedule {
   const end = new Date(dayBase.getTime() + minutes * 60_000);
   return {
@@ -4355,7 +4561,7 @@ test('5.4 action — applyStatus flips running -> idle around the hosts write', 
     () =>
       new Promise<WriteResult>((resolve) => {
         resolveWrite = resolve;
-      }),
+      })
   );
 
   jest.setSystemTime(tOpen);
@@ -4426,7 +4632,11 @@ test('5.4 trigger — two schedule flips in one tick coalesce into ONE write', a
   jest.useFakeTimers();
   // A [12:00, 12:30) on x.com and B [12:30, 13:00) on y.com: at 12:30 A ends
   // and B starts in the same tick — one hosts write, one generic toast.
-  const a = makeFiveFourSchedule(30, { id: 'sa', name: 'A', domains: ['x.com'] });
+  const a = makeFiveFourSchedule(30, {
+    id: 'sa',
+    name: 'A',
+    domains: ['x.com'],
+  });
   const bEnd = new Date(dayBase.getTime() + 60 * 60_000);
   const b: Schedule = {
     id: 'sb',
@@ -4470,7 +4680,10 @@ test('5.4 — a denied transition write advances the baseline and never retries'
   driveClock(tBefore);
   await flushMicrotasks();
 
-  shellNative.writeHosts.mockResolvedValueOnce({ ok: false, error: 'admin-denied' });
+  shellNative.writeHosts.mockResolvedValueOnce({
+    ok: false,
+    error: 'admin-denied',
+  });
   jest.setSystemTime(tOpen);
   driveClock(tOpen);
   await flushMicrotasks();
@@ -4546,7 +4759,9 @@ test('5.4 — a committed change refreshes the baseline silently (no write)', as
 
   // A committed-changing path (here: an Apply-equivalent setState with a NEW
   // config object carrying the same effective lines).
-  seedFiveFourConfig([makeFiveFourSchedule(60, { id: 's-2', name: 'Renamed' })]);
+  seedFiveFourConfig([
+    makeFiveFourSchedule(60, { id: 's-2', name: 'Renamed' }),
+  ]);
   const config2 = useDomainStore.getState().committed;
 
   jest.setSystemTime(tLater);
@@ -4631,7 +4846,9 @@ test('5.4 action — a committed change before the queue-run refreshes the basel
 
   // An Apply-equivalent committed change: a NEW config object (as an Apply
   // would leave behind), landing BEFORE the action's queue-run.
-  seedFiveFourConfig([makeFiveFourSchedule(60, { id: 's-2', name: 'Renamed' })]);
+  seedFiveFourConfig([
+    makeFiveFourSchedule(60, { id: 's-2', name: 'Renamed' }),
+  ]);
   const config2 = useDomainStore.getState().committed;
 
   const result = await useDomainStore
@@ -4748,14 +4965,10 @@ test('5.4 action — a malformed change object still writes successfully with th
   // the baseline, so the write proceeds — and the malformed change (null
   // started, missing ended) must survive toast selection.
   jest.setSystemTime(dayBase.getTime());
-  const result = await useDomainStore
-    .getState()
-    .applyScheduleTransitions({
-      started: null,
-      ended: undefined,
-    } as unknown as Parameters<
-      ReturnType<typeof useDomainStore.getState>['applyScheduleTransitions']
-    >[0]);
+  const result = await useDomainStore.getState().applyScheduleTransitions({
+    started: null,
+    ended: undefined,
+  } as unknown as Parameters<ReturnType<typeof useDomainStore.getState>['applyScheduleTransitions']>[0]);
 
   expect(result).toStrictEqual({ ok: true });
   expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);

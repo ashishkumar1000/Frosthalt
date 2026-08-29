@@ -5,6 +5,10 @@
 #import <ReactCommon/RCTTurboModule.h>
 #import <string.h> // strcmp
 
+// Story 6.4 — exposes the @objc(WindowPersistence) class (WindowPersistence.swift)
+// so the launch-time native restore can be wired here.
+#import "Frosthalt-Swift.h"
+
 // App-level TurboModules live in this target (e.g. NativeConfigStore.mm). Their
 // Obj-C class interfaces are private to the .mm that implements them (no public
 // header), so we resolve them at runtime by name via NSClassFromString instead
@@ -21,8 +25,18 @@
   // They will be passed down to the ViewController used by React Native.
   self.initialProps = @{};
   self.dependencyProvider = [RCTAppDependencyProvider new];
-  
-  return [super applicationDidFinishLaunching:notification];
+
+  // Story 6.4 — the launch-time NATIVE window restore (the spec's Always
+  // constraint: "called from applicationDidFinishLaunching AFTER super").
+  // `super` has already created + keyed the RN main window
+  // (loadReactNativeWindow:) — the window is on screen, but has not painted,
+  // so the setFrame inside `attachShared()` lands in the same launch tick
+  // with no default-then-jump flash. JS never restores a frame (the Never
+  // clause); the persisted frame read happens in WindowPersistence.swift via
+  // the ConfigStoreFile read helper.
+  [super applicationDidFinishLaunching:notification];
+
+  [WindowPersistence attachShared];
 }
 
 - (NSURL *)sourceURLForBridge:(RCTBridge *)bridge
@@ -90,6 +104,12 @@
     // at JS import time. Same pattern as NativeConfigStore/NativeShellRunner
     // above.
     Class cls = NSClassFromString(@"NativeMenuBarModule");
+    return cls ? (id<RCTModuleProvider>)[cls new] : nil;
+  } else if (strcmp(name, "NativeWindow") == 0) {
+    // Story 6.4 — the Window TurboModule (frame persistence/zoom/capture).
+    // Without this branch `TurboModuleRegistry.getEnforcing('NativeWindow')`
+    // throws at JS import time. Same pattern as the three branches above.
+    Class cls = NSClassFromString(@"NativeWindowModule");
     return cls ? (id<RCTModuleProvider>)[cls new] : nil;
   }
   return nil;

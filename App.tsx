@@ -16,6 +16,11 @@
  * native calls dispatch onto the serial main queue in call order, so the menu
  * is guaranteed to be built before the first badge push renders into it (the
  * effect's own FIFO order mirrors 6.2's).
+ *
+ * Story 6.4 adds `startWindowFrameSync()` to the same effect — the installed-
+ * once subscriber that hands native the min/max + standard size rules and
+ * subscribes the `onWindowFrameChanged` -> `commitWindowFrame` path
+ * (restore itself is native + launch-time, deliberately not here).
  */
 
 import { useEffect } from 'react';
@@ -25,6 +30,7 @@ import { Shell } from './src/components/Shell';
 import { initializeMenuBar } from './src/native/menuBar';
 import { startMenuBarMirror } from './src/domain/menuBarMirror';
 import { startMenuBarActions } from './src/domain/menuBarActions';
+import { startWindowFrameSync } from './src/domain/windowFrame';
 
 function App() {
   const isDarkMode = useColorScheme() === 'dark';
@@ -33,6 +39,7 @@ function App() {
     initializeMenuBar();
     startMenuBarMirror();
     startMenuBarActions();
+    startWindowFrameSync();
   }, []);
 
   return (

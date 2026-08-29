@@ -49,10 +49,40 @@ export interface Schedule {
   domains: string[];
 }
 
+/**
+ * The persisted main-window frame (Story 6.4). `{x, y, width, height}` are
+ * numbers in the coordinates the app's own window lives in (AppKit screen
+ * coordinates, bottom-left origin) — the same numbers native captures on a
+ * resize/move and applies at launch. Restoration is NATIVE (launch-time, in
+ * `WindowPersistence`), so this type is the persisted shape only: JS never
+ * applies the frame to a window (Never clause — no JS-driven restore).
+ *
+ * consumers normalise through `src/domain/windowFrame.ts`
+ * (`normaliseWindowFrame`): a stored value with wrong types, non-finite or
+ * non-positive width/height is corrupt — treated as ABSENT for writing and
+ * null at read, never a config rejection (the per-field-defensive precedent
+ * of `Schedule.domains` above).
+ */
+export interface WindowFrame {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** App-level settings (non-block-affecting; commits directly per AD-6). */
 export interface Settings {
   /** Off until the MenuBar TurboModule is wired in Epic 6. */
   menuBarEnabled: boolean;
+  /**
+   * The last persisted main-window frame (Story 6.4), or `null` when never
+   * persisted (pre-6.4 configs and the DEFAULT — missing is also treated as
+   * never-persisted, one-shot migration off RN's own autosave). COMMITTED
+   * through the direct-commit path (`commitWindowFrame`, the first `settings`
+   * writer — never the staged-Apply pipeline, never /etc/hosts). READ is
+   * per-field defensive: only `normaliseWindowFrame` decides validity.
+   */
+  windowFrame?: WindowFrame | null;
 }
 
 /** A running focus session persisted as an absolute epoch (AD-7). */
@@ -92,6 +122,9 @@ export const DEFAULT_CONFIG: Config = deepFreezeConfig({
   schedules: [],
   settings: {
     menuBarEnabled: false,
+    // Story 6.4 — never persisted until a validated frame is committed; null
+    // (and an absent field) both mean "no frame on record".
+    windowFrame: null,
   },
   activeTimer: null,
   // `passwordHash` intentionally unset — no password set until Epic 3.

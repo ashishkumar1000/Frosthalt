@@ -45,6 +45,18 @@ jest.mock('../src/native/specs/NativeMenuBarSpec', () => ({
   },
 }));
 
+// Story 6.4 — App mount now also calls `startWindowFrameSync()`, which
+// imports NativeWindowSpec (and `src/native/window.ts`). Mock it the same way
+// (see windowFrame.test.ts for real coverage of the wiring); this file only
+// needs the transitive import to resolve.
+jest.mock('../src/native/specs/NativeWindowSpec', () => ({
+  __esModule: true,
+  default: {
+    configureWindow: jest.fn(() => ({ ok: true })),
+    onWindowFrameChanged: jest.fn(() => ({ remove: jest.fn() })),
+  },
+}));
+
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import App from '../App';

@@ -33,9 +33,10 @@ jest.mock('../src/native/specs/NativeMenuBarSpec', () => {
   };
 });
 
-// App also transitively imports the other two native specs (Blocklist ->
-// domain store -> configStore / shellRunner) — mock them the same way the
-// other App-mounting suites do, so the import resolves.
+// App also transitively imports the other native specs (Blocklist ->
+// domain store -> configStore / shellRunner; Story 6.4 adds NativeWindowSpec
+// via `startWindowFrameSync()`) — mock them the same way the other
+// App-mounting suites do, so the import resolves.
 jest.mock('../src/native/specs/NativeConfigStoreSpec', () => ({
   __esModule: true,
   default: {
@@ -52,10 +53,23 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
   },
 }));
 
+jest.mock('../src/native/specs/NativeWindowSpec', () => ({
+  __esModule: true,
+  default: {
+    configureWindow: jest.fn(() => ({ ok: true })),
+    onWindowFrameChanged: jest.fn(() => ({ remove: jest.fn() })),
+  },
+}));
+
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import App from '../App';
-import { initializeMenuBar, setMenuBarBadge, quitApp } from '../src/native/menuBar';
+import {
+  initializeMenuBar,
+  setMenuBarBadge,
+  quitApp,
+} from '../src/native/menuBar';
+import { WINDOW_RULES } from '../src/domain/windowFrame';
 import type {
   MenuBarBadgeState,
   MenuBarResult,
@@ -71,6 +85,15 @@ type NativeMenuBarMock = {
 };
 const native = require('../src/native/specs/NativeMenuBarSpec')
   .default as unknown as NativeMenuBarMock;
+
+// Story 6.4 — the window sync shares this mount effect. Captured here so the
+// App-mount test can prove the mount (not some other wiring) drove it.
+type NativeWindowMock = {
+  configureWindow: jest.Mock;
+  onWindowFrameChanged: jest.Mock;
+};
+const windowNative = require('../src/native/specs/NativeWindowSpec')
+  .default as unknown as NativeWindowMock;
 
 beforeEach(() => {
   native.initialize.mockReset();
@@ -123,7 +146,7 @@ test('setMenuBarBadge surfaces a native { ok: false, error } result untouched', 
       state: 'free',
       buttonTitle: 'Free',
       rowTitle: 'Free · no active timer',
-    }),
+    })
   ).toEqual({ ok: false, error: 'boom' });
 });
 
@@ -170,6 +193,17 @@ test('mounting App calls the native initialize() exactly once and registers the 
   // handler) — App never subscribes to it.
   expect(native.onShowWindow).not.toHaveBeenCalled();
 
+  // Story 6.4 — the SAME mount effect must run `startWindowFrameSync()`: the
+  // window constants reach native from the domain (WINDOW_RULES verbatim —
+  // the single-source rule) and the frame emitter is subscribed. This file
+  // only mounts App once, so the absolute counts are the mount's doing; if
+  // the App.tsx call is ever deleted, this assertion fails the suite (the
+  // per-module wiring tests in windowFrame.test.ts capture the module-load
+  // install and cannot see an App-mount regression).
+  expect(windowNative.configureWindow).toHaveBeenCalledTimes(1);
+  expect(windowNative.configureWindow).toHaveBeenCalledWith(WINDOW_RULES);
+  expect(windowNative.onWindowFrameChanged).toHaveBeenCalledTimes(1);
+
   await ReactTestRenderer.act(() => {
     testRenderer.unmount();
   });
@@ -180,4 +214,6 @@ test('mounting App calls the native initialize() exactly once and registers the 
   expect(native.initialize).toHaveBeenCalledTimes(1);
   expect(native.onQuickStart).toHaveBeenCalledTimes(1);
   expect(native.onQuit).toHaveBeenCalledTimes(1);
+  expect(windowNative.configureWindow).toHaveBeenCalledTimes(1);
+  expect(windowNative.onWindowFrameChanged).toHaveBeenCalledTimes(1);
 });

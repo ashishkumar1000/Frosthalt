@@ -83,9 +83,13 @@
  */
 
 import { create } from 'zustand';
-import type { Config, Domain, Schedule } from '../config/types';
+import type { Config, Domain, Schedule, WindowFrame } from '../config/types';
 import { readConfig, writeConfig } from '../config/configStore';
-import { hashPassword, GATE_MAX_ATTEMPTS, GATE_THROTTLE_MS } from '../config/password';
+import {
+  hashPassword,
+  GATE_MAX_ATTEMPTS,
+  GATE_THROTTLE_MS,
+} from '../config/password';
 import { normaliseDomain, normaliseTime } from './normalise';
 import { runApply } from './apply';
 import { effectiveHostsLines } from './effectiveBlocklist';
@@ -479,6 +483,35 @@ export interface DomainState {
   setPassword: (pw: string) => Promise<WriteResult>;
 
   /**
+   * Persist the main-window frame (Story 6.4). Non-block-affecting direct
+   * config commit (AD-6): builds
+   * `{...committed, settings: {...committed.settings, windowFrame: frame}}`
+   * and writes it to `config.json` via `writeConfig` — the FIRST `settings`
+   * writer, NEVER the staged-Apply pipeline, NEVER /etc/hosts. The frame is
+   * validated by the domain layer (`windowFrame.ts` `normaliseWindowFrame`)
+   * BEFORE this action is called; the store trusts its caller's envelope —
+   * validation does NOT live here (this file must not import `windowFrame.ts`,
+   * which imports this store — the no-cycle rule), so the interface taking a
+   * fully-formed `WindowFrame` is the documented contract. The `settings`
+   * spread preserves `menuBarEnabled` (and any future settings field).
+   *
+   * Exact `setPassword` discipline (the spec's Always constraint): the write
+   * is sequenced through the SAME serialized `enqueue` (never overlapping an
+   * in-flight Apply's `writeConfig`); `committed` is re-read INSIDE the
+   * enqueue at run time, not captured at call time — a debounced frame event
+   * that runs after an Apply commits preserves the Apply's domains. Fires
+   * `writeConfig` ONLY, `applyStatus` never flipped, no toast, no prompt —
+   * a frame save must be invisible. On `ok` the `committed` state advances to
+   * the new config; on failure `committed` is left unchanged and the error
+   * envelope is returned (the fire-and-forget caller drops it — a frame save
+   * that fails simply leaves the last persisted frame in place).
+   *
+   * Never rejects (the enqueue body is fully guarded); callers still
+   * `.catch()` defensively, as every fire-and-forget trigger does.
+   */
+  commitWindowFrame: (frame: WindowFrame) => Promise<WriteResult>;
+
+  /**
    * Reconcile `/etc/hosts` to the recomputed blocklist after the clock
    * trigger observed a schedule boundary crossing (Story 5.4). The ONE
    * privileged write a live transition produces — hosts-ONLY (the
@@ -507,7 +540,9 @@ export interface DomainState {
    * Never rejects (the enqueue body is fully guarded); the caller may still
    * `.catch()` defensively, as every fire-and-forget trigger does.
    */
-  applyScheduleTransitions: (change: ScheduleTransitionChange) => Promise<WriteResult>;
+  applyScheduleTransitions: (
+    change: ScheduleTransitionChange
+  ) => Promise<WriteResult>;
 
   // ----- Story 3.2 — the reusable password gate (runtime-only state) -----
   //
@@ -643,7 +678,7 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     // reference from the snapshot the running Apply captured, so the success
     // handler retains it rather than clobbering it.
     const next = base.map((d, i) =>
-      i === idx ? { ...d, alwaysOn: !d.alwaysOn } : d,
+      i === idx ? { ...d, alwaysOn: !d.alwaysOn } : d
     );
     // Clean-revert: if the resulting draft equals committed.domains (same
     // hostnames + alwaysOn, order), clear `staged` to `null`. This mirrors
@@ -710,7 +745,7 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     // a different reference from the snapshot the running Apply captured, so
     // the success handler retains it rather than clobbering it.
     const next = base.map((s, i) =>
-      i === idx ? { ...s, enabled: !s.enabled } : s,
+      i === idx ? { ...s, enabled: !s.enabled } : s
     );
     // Clean-revert: if the resulting draft equals committed.schedules (same
     // ids + all fields, order-agnostic — `scheduleDraftEqualsCommitted`
@@ -765,10 +800,9 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     // Weekdays: keep only valid 0-6 integer codes, de-duplicated, ascending —
     // a hand-built draft with duplicates or out-of-range codes is coerced
     // rather than trusted.
-    const weekdays = (
-      Array.isArray(raw.weekdays) ? raw.weekdays : []
-    ).filter((d): d is Schedule['weekdays'][number] =>
-      Number.isInteger(d) && d >= 0 && d <= 6,
+    const weekdays = (Array.isArray(raw.weekdays) ? raw.weekdays : []).filter(
+      (d): d is Schedule['weekdays'][number] =>
+        Number.isInteger(d) && d >= 0 && d <= 6
     );
     const dedupedWeekdays = [...new Set(weekdays)].sort((a, b) => a - b);
     if (dedupedWeekdays.length === 0) {
@@ -794,7 +828,7 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
       ...new Set(
         rawDomains
           .map((d) => (typeof d === 'string' ? normaliseDomain(d) : null))
-          .filter((d): d is string => d != null),
+          .filter((d): d is string => d != null)
       ),
     ];
     if (domains.length === 0) {
@@ -899,9 +933,7 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
           },
           staged: s.staged === stagedSnapshot ? null : s.staged,
           stagedSchedules:
-            s.stagedSchedules === schedulesSnapshot
-              ? null
-              : s.stagedSchedules,
+            s.stagedSchedules === schedulesSnapshot ? null : s.stagedSchedules,
           applyStatus: 'idle',
           lastResult: result,
         }));
@@ -1033,6 +1065,48 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     });
   },
 
+  commitWindowFrame: (frame) => {
+    // Story 6.4 — the first `settings` writer. An exact `setPassword` clone
+    // (the spec pins the discipline): serialized `enqueue`, run-time
+    // `committed` re-read, `writeConfig` ONLY, no `applyStatus` flip, no
+    // hosts write, no toast/prompt. Validation is the CALLER's job
+    // (`windowFrame.ts` normalises at event time before dispatch) — this
+    // action is the persistence mechanics only, and this file must not
+    // import `windowFrame.ts` (which imports this store — no cycles).
+    //
+    // The `settings` object is SPREAD (never mutated in place) and every
+    // other settings key — `menuBarEnabled` today — survives; the rest of
+    // the config spreads through from the run-time re-read, so a
+    // debounced frame write queued behind an Apply lands on the Apply's
+    // just-committed config, never on a stale call-time snapshot.
+    return enqueue(async () => {
+      const committed = get().committed;
+      const nextConfig: Config = {
+        ...committed,
+        settings: {
+          ...committed.settings,
+          windowFrame: frame,
+        },
+      };
+      // Throw-safety: NO try/catch is added — `writeConfig` is a never-throw
+      // port (configStore.ts catches both its own serialization errors and a
+      // throwing native seam into `{ok:false, error}`), so this run body
+      // cannot throw and the returned promise never rejects. This is exactly
+      // setPassword's discipline, mirrored verbatim; wrapping only THIS
+      // action would diverge the two, and the fire-and-forget caller in
+      // windowFrame.ts already swallows defensively.
+      const result = writeConfig(nextConfig);
+      if (result.ok) {
+        // Advance committed to the new config (carrying the frame). On
+        // failure, leave committed unchanged (the last persisted frame
+        // stays on record) and return the error envelope — the
+        // fire-and-forget caller drops it.
+        set({ committed: nextConfig });
+      }
+      return result;
+    });
+  },
+
   // ----- Story 4.2 — `stageStartTimer` (the timed-session engine swap) -----
 
   stageStartTimer: ({ durationMs, selected }) => {
@@ -1050,10 +1124,16 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     // `WriteResult` envelope so the caller sees `{ok:false, error}` and the
     // UI can branch on it without unwrapping a thrown error.
     if (!Number.isFinite(durationMs) || durationMs <= 0) {
-      return Promise.resolve({ ok: false, error: 'invalid-duration' } as WriteResult);
+      return Promise.resolve({
+        ok: false,
+        error: 'invalid-duration',
+      } as WriteResult);
     }
     if (!(selected instanceof Set) || selected.size === 0) {
-      return Promise.resolve({ ok: false, error: 'empty-selection' } as WriteResult);
+      return Promise.resolve({
+        ok: false,
+        error: 'empty-selection',
+      } as WriteResult);
     }
     // Engine swap from 4.1's per-domain `alwaysOn` flips. The serialized run
     // body mirrors `setPassword`'s run-time re-read of `committed` (race-
@@ -1139,7 +1219,10 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
           applyStatus: 'idle',
           lastResult: { ok: false, error: `hosts-throw:${String(err)}` },
         });
-        return { ok: false, error: `hosts-throw:${String(err)}` } as WriteResult;
+        return {
+          ok: false,
+          error: `hosts-throw:${String(err)}`,
+        } as WriteResult;
       }
     });
   },
@@ -1221,7 +1304,10 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
             committed: nextConfig,
             applyStatus: 'idle',
             lastResult: result,
-            toast: { message: 'Session ended. Domains unblocked.', tone: 'info' },
+            toast: {
+              message: 'Session ended. Domains unblocked.',
+              tone: 'info',
+            },
           });
         } else {
           // Hosts denied (or hard OS error) -> `committed.activeTimer` INTACT
@@ -1254,7 +1340,10 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
             tone: 'error',
           },
         });
-        return { ok: false, error: `hosts-throw:${String(err)}` } as WriteResult;
+        return {
+          ok: false,
+          error: `hosts-throw:${String(err)}`,
+        } as WriteResult;
       }
     });
   },
@@ -1323,7 +1412,10 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
             applyStatus: 'idle',
             lastResult: result,
             toast: {
-              message: transitionToastCopy({ started: startedNames, ended: endedNames }),
+              message: transitionToastCopy({
+                started: startedNames,
+                ended: endedNames,
+              }),
               tone: 'info',
             },
           });
@@ -1430,7 +1522,7 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
             toast: {
               message: endEarlySuccessToast(
                 active.selectedDomains,
-                nextConfig.domains,
+                nextConfig.domains
               ),
               tone: 'info',
             },
@@ -1467,7 +1559,10 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
             tone: 'error',
           },
         });
-        return { ok: false, error: `hosts-throw:${String(err)}` } as WriteResult;
+        return {
+          ok: false,
+          error: `hosts-throw:${String(err)}`,
+        } as WriteResult;
       }
     });
   },
@@ -1583,9 +1678,14 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
  * forbids changing the timer slice's state shape, and the trigger only needs
  * this one boolean.
  */
-function sliceExpiredParked(s: { endEpochMs: number | null; nowMs: number }): boolean {
+function sliceExpiredParked(s: {
+  endEpochMs: number | null;
+  nowMs: number;
+}): boolean {
   return (
-    s.endEpochMs != null && Number.isFinite(s.endEpochMs) && s.nowMs >= s.endEpochMs
+    s.endEpochMs != null &&
+    Number.isFinite(s.endEpochMs) &&
+    s.nowMs >= s.endEpochMs
   );
 }
 
@@ -1606,10 +1706,13 @@ function sliceExpiredParked(s: { endEpochMs: number | null; nowMs: number }): bo
 // superseding session presents a future `endEpochMs`).
 useTimerStore.subscribe((state, prev) => {
   if (sliceExpiredParked(state) && !sliceExpiredParked(prev)) {
-    void useDomainStore.getState().expireTimer().catch(() => {
-      // Defensive — the enqueue body never rejects, but a fire-and-forget
-      // trigger must never surface an unhandled rejection.
-    });
+    void useDomainStore
+      .getState()
+      .expireTimer()
+      .catch(() => {
+        // Defensive — the enqueue body never rejects, but a fire-and-forget
+        // trigger must never surface an unhandled rejection.
+      });
   }
 });
 
@@ -1749,7 +1852,9 @@ function evaluateScheduleTransitions(nowMs: number): void {
   // while still writing the combined payload once.)
   const started: string[] = [];
   const ended: string[] = [];
-  const schedules = Array.isArray(committed.schedules) ? committed.schedules : [];
+  const schedules = Array.isArray(committed.schedules)
+    ? committed.schedules
+    : [];
   const prevDate = new Date(transitionPrevTickMs);
   for (const schedule of schedules) {
     const was = isScheduleActive(schedule, prevDate);
@@ -1813,8 +1918,8 @@ function enqueue(run: () => Promise<WriteResult>): Promise<WriteResult> {
   // `next` (success or failure); only the internal scheduling chain is
   // normalised.
   runChain = next.then(
-    () => ({ ok: true }) as WriteResult,
-    () => ({ ok: false }) as WriteResult,
+    () => ({ ok: true } as WriteResult),
+    () => ({ ok: false } as WriteResult)
   );
   return next;
 }
@@ -1859,7 +1964,9 @@ function endEarlySuccessToast(selected: string[], domains: Domain[]): string {
   if (lifted === 0) {
     return 'Session ended.';
   }
-  return `Session ended. ${lifted} ${lifted === 1 ? 'domain' : 'domains'} unblocked.`;
+  return `Session ended. ${lifted} ${
+    lifted === 1 ? 'domain' : 'domains'
+  } unblocked.`;
 }
 
 /**

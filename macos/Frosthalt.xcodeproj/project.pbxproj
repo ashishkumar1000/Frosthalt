@@ -21,6 +21,8 @@
 		FFCC000300000000000000C3 /* MenuBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000100000000000000C1 /* MenuBar.swift */; };
 		FFCC000400000000000000C4 /* NativeMenuBar.mm in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000200000000000000C2 /* NativeMenuBar.mm */; };
 		FFCC000600000000000000C6 /* SecureTextFieldFix.mm in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000500000000000000C5 /* SecureTextFieldFix.mm */; };
+		FFCC000800000000000000C8 /* WindowPersistence.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000700000000000000C7 /* WindowPersistence.swift */; };
+		FFCC000A00000000000000CA /* NativeWindow.mm in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000900000000000000C9 /* NativeWindow.mm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -47,6 +49,8 @@
 		FFCC000100000000000000C1 /* MenuBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBar.swift; sourceTree = "<group>"; };
 		FFCC000200000000000000C2 /* NativeMenuBar.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NativeMenuBar.mm; sourceTree = "<group>"; };
 		FFCC000500000000000000C5 /* SecureTextFieldFix.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = SecureTextFieldFix.mm; sourceTree = "<group>"; };
+		FFCC000700000000000000C7 /* WindowPersistence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPersistence.swift; sourceTree = "<group>"; };
+		FFCC000900000000000000C9 /* NativeWindow.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NativeWindow.mm; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -87,6 +91,8 @@
 				FFCC000100000000000000C1 /* MenuBar.swift */,
 				FFCC000200000000000000C2 /* NativeMenuBar.mm */,
 				FFCC000500000000000000C5 /* SecureTextFieldFix.mm */,
+				FFCC000700000000000000C7 /* WindowPersistence.swift */,
+				FFCC000900000000000000C9 /* NativeWindow.mm */,
 				5142014B2437B4B30078DB4F /* AppDelegate.h */,
 				5142014C2437B4B30078DB4F /* AppDelegate.mm */,
 				514201512437B4B40078DB4F /* Assets.xcassets */,
@@ -363,6 +369,8 @@
 				FFCC000300000000000000C3 /* MenuBar.swift in Sources */,
 				FFCC000400000000000000C4 /* NativeMenuBar.mm in Sources */,
 				FFCC000600000000000000C6 /* SecureTextFieldFix.mm in Sources */,
+				FFCC000800000000000000C8 /* WindowPersistence.swift in Sources */,
+				FFCC000A00000000000000CA /* NativeWindow.mm in Sources */,
 				5142014D2437B4B30078DB4F /* AppDelegate.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
