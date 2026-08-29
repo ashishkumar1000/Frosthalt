@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-14-2026 00:19
-last_updated: 08-29-2026  # 6-1 in-review
+last_updated: 08-29-2026  # 6-2 done, 6-3 next
 
 project: Frosthalt
 project_key: NOKEY
@@ -81,8 +81,8 @@ development_status:
   epic-5-retrospective: optional
 
   epic-6: in-progress
-  6-1-menubar-turbomodule-nsstatusitem-nsmenu: review
-  6-2-menu-bar-badge-mirror-and-countdown: backlog
+  6-1-menubar-turbomodule-nsstatusitem-nsmenu: done
+  6-2-menu-bar-badge-mirror-and-countdown: done
   6-3-menu-bar-quick-start-show-window-and-quit-actions: backlog
   6-4-window-size-position-persistence-and-restoration: backlog
   6-5-quit-with-confirm-and-close-to-menu-bar-keyboard-bindings: backlog

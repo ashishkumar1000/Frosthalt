@@ -106,4 +106,35 @@ RCT_EXPORT_MODULE(NativeMenuBar)
   return [self.swiftImpl initialize];
 }
 
+// setBadgeState: (Story 6.2) — the live badge mirror.
+//
+// SIGNATURE (crash lesson, 6.2 verification): the param is the CODEGEN'D C++
+// struct `JS::NativeMenuBarSpec::MenuBarBadgeState &` — exactly what the
+// generated <NativeMenuBarSpecSpec> protocol declares — NOT an `NSDictionary *`.
+// Because `MenuBarBadgeState` is a NAMED object type (not a primitive/array
+// like ConfigStore's `writeConfig:(NSString *)` or ShellRunner's
+// `writeHosts:(NSArray *)`), codegen installs a per-arg converter
+// (`setMethodArgConversionSelector(... JS_NativeMenuBarSpec_MenuBarBadgeState:)`)
+// and the TurboModule runtime then packs the struct POINTER into the
+// NSInvocation argument slot. Declaring `(NSDictionary *)` here compiles
+// (ObjC never enforces signatures at runtime) but makes ARC treat that C++
+// struct pointer as a strong ObjC object — objc_storeStrong dereferences a
+// non-object address and the app segfaults on the first push. The runtime
+// derives the method signature from OUR compiled method, so this file must
+// mirror the generated protocol signature verbatim.
+//
+// The struct's accessors (`state()` / `buttonTitle()` / `rowTitle()`) are
+// `RCTBridgingToString` reads over the JS-side dictionary — nil-tolerant, no
+// throwing validation — and are coalesced to `@""` so a dictionary literal
+// can never get a nil insert; Swift's `as? String` reads map empty back to
+// the same fail-safe defaults (unknown state -> red).
+- (NSDictionary *)setBadgeState:(JS::NativeMenuBarSpec::MenuBarBadgeState &)badge
+{
+  return [self.swiftImpl setBadgeState:@{
+    @"state": badge.state() ?: @"",
+    @"buttonTitle": badge.buttonTitle() ?: @"",
+    @"rowTitle": badge.rowTitle() ?: @"",
+  }];
+}
+
 @end

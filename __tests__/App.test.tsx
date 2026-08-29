@@ -28,11 +28,14 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 // Story 6.1 — App now calls `initializeMenuBar()` on mount, which imports
 // NativeMenuBarSpec. Mock it the same way (see menuBar.test.ts for real
 // coverage of the wrapper + mount-once behavior); this file only needs the
-// transitive import to resolve.
+// transitive import to resolve. Story 6.2 — App also starts the domain
+// mirror, whose initial push calls `setBadgeState`; it needs to resolve too
+// (the mirror-test suite owns the push coverage).
 jest.mock('../src/native/specs/NativeMenuBarSpec', () => ({
   __esModule: true,
   default: {
     initialize: jest.fn(() => ({ ok: true })),
+    setBadgeState: jest.fn(() => ({ ok: true })),
     onQuickStart: jest.fn(),
     onShowWindow: jest.fn(),
     onQuit: jest.fn(),

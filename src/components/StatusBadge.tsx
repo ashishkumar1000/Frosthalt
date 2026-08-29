@@ -10,19 +10,17 @@
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { statusFill, tokens, type StatusKey } from '../theme/tokens';
-
-const STATUS_LABELS: Record<StatusKey, string> = {
-  free: 'Free',
-  amber: 'Blocking',
-  blocked: 'Blocked',
-};
+import { badgeStateLabels } from '../domain/badgeState';
 
 export interface StatusBadgeProps {
   status: StatusKey;
 }
 
 export function StatusBadge({ status }: StatusBadgeProps): React.ReactElement | null {
-  const label = STATUS_LABELS[status];
+  // Since Story 6.2 the label words come from the domain's single-source
+  // `badgeStateLabels` (the menu-bar mirror reads the same map), so the two
+  // badge renderers can never show different words for the same state.
+  const label = badgeStateLabels[status];
 
   // Defensive: a status with no label renders nothing. The badge is never
   // decorative — there is no neutral/default fill. (TS types `label` as string

@@ -9,7 +9,10 @@
  * normalising on the way back.
  */
 
-import NativeMenuBar, { MenuBarResult } from './specs/NativeMenuBarSpec';
+import NativeMenuBar, {
+  MenuBarBadgeState,
+  MenuBarResult,
+} from './specs/NativeMenuBarSpec';
 
 /**
  * Builds the app's one NSStatusItem + NSMenu, idempotently (a second call is
@@ -18,4 +21,14 @@ import NativeMenuBar, { MenuBarResult } from './specs/NativeMenuBarSpec';
  */
 export function initializeMenuBar(): MenuBarResult {
   return NativeMenuBar.initialize();
+}
+
+/**
+ * Story 6.2 — renders the live badge mirror (button title + first menu row).
+ * Forwards the payload untouched and returns the `{ ok, error? }` envelope:
+ * all derivation lives in the domain mirror (`src/domain/menuBarMirror.ts`),
+ * which is the only intended caller (once per actual state change).
+ */
+export function setMenuBarBadge(badge: MenuBarBadgeState): MenuBarResult {
+  return NativeMenuBar.setBadgeState(badge);
 }

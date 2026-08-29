@@ -838,12 +838,17 @@ test('only the header, the Timer surface, the slice itself and the 4.5 expiry tr
   // slice's STATE TRANSITION, never `nowMs` per tick, so the tick's re-render
   // blast radius is unchanged; the allowlist entry is a conscious widening
   // (the spec's Design Notes: "Why the trigger lives in store.ts (not a
-  // component)"). Story 6.2's menu bar will JOIN this allowlist when it
-  // subscribes — updating the list should be a conscious act, not a silent
-  // widening of the tick's blast radius.
+  // component)"). Story 6.2's menu bar mirror has now JOINED this allowlist
+  // as designed — it holds its own refcounted slot and reads the derived
+  // triple (deduped, no native call on churn), the slice's designed THIRD
+  // subscriber (Timer 4.3 + StatusHeader 4.4 + menu bar 6.2); it never
+  // re-renders anything per tick (native push only, deduped), so the tick's
+  // re-render blast radius is still exactly the two components above.
+  // Updating this list stays a conscious act, not a silent widening.
   expect(found.sort()).toEqual([
     'src/components/StatusHeader.tsx',
     'src/components/Timer.tsx',
+    'src/domain/menuBarMirror.ts',
     'src/domain/store.ts',
     'src/domain/timerStore.ts',
   ]);

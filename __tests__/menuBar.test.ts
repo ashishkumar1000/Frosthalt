@@ -17,6 +17,7 @@
 jest.mock('../src/native/specs/NativeMenuBarSpec', () => {
   const mock = {
     initialize: jest.fn(),
+    setBadgeState: jest.fn(),
     onQuickStart: jest.fn(),
     onShowWindow: jest.fn(),
     onQuit: jest.fn(),
@@ -49,11 +50,15 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import App from '../App';
-import { initializeMenuBar } from '../src/native/menuBar';
-import type { MenuBarResult } from '../src/native/specs/NativeMenuBarSpec';
+import { initializeMenuBar, setMenuBarBadge } from '../src/native/menuBar';
+import type {
+  MenuBarBadgeState,
+  MenuBarResult,
+} from '../src/native/specs/NativeMenuBarSpec';
 
 type NativeMenuBarMock = {
   initialize: jest.Mock;
+  setBadgeState: jest.Mock;
   onQuickStart: jest.Mock;
   onShowWindow: jest.Mock;
   onQuit: jest.Mock;
@@ -63,6 +68,7 @@ const native = require('../src/native/specs/NativeMenuBarSpec')
 
 beforeEach(() => {
   native.initialize.mockReset();
+  native.setBadgeState.mockReset();
 });
 
 // ---------------------------------------------------------------------------
@@ -82,6 +88,36 @@ test('initializeMenuBar surfaces a native { ok: false, error } result untouched'
   native.initialize.mockReturnValue({ ok: false, error: 'boom' });
 
   expect(initializeMenuBar()).toEqual({ ok: false, error: 'boom' });
+});
+
+// ---------------------------------------------------------------------------
+// setMenuBarBadge() — Story 6.2 badge-mirror forwarding
+// ---------------------------------------------------------------------------
+
+test('setMenuBarBadge forwards the payload to the native setBadgeState() and returns its result', () => {
+  const result: MenuBarResult = { ok: true };
+  native.setBadgeState.mockReturnValue(result);
+  const badge: MenuBarBadgeState = {
+    state: 'blocked',
+    buttonTitle: '25:00',
+    rowTitle: 'Blocked · 25:00',
+  };
+
+  expect(setMenuBarBadge(badge)).toBe(result);
+  expect(native.setBadgeState).toHaveBeenCalledTimes(1);
+  expect(native.setBadgeState).toHaveBeenCalledWith(badge);
+});
+
+test('setMenuBarBadge surfaces a native { ok: false, error } result untouched', () => {
+  native.setBadgeState.mockReturnValue({ ok: false, error: 'boom' });
+
+  expect(
+    setMenuBarBadge({
+      state: 'free',
+      buttonTitle: 'Free',
+      rowTitle: 'Free · no active timer',
+    }),
+  ).toEqual({ ok: false, error: 'boom' });
 });
 
 // ---------------------------------------------------------------------------

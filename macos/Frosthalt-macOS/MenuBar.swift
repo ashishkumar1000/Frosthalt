@@ -26,10 +26,12 @@
 //  event directly — this class knows nothing about TurboModule/JSI. The
 //  Obj-C++ bridge (NativeMenuBar.mm) sets these closures once, right after
 //  instantiating the singleton, to call the codegen-generated
-//  `emitOnQuickStart` / `emitOnShowWindow` / `emitOnQuit` on itself. No live
-//  badge/countdown wiring (6.2) or click-handling logic beyond firing the
-//  closure (6.3) happens here — emitted events may stay unlistened in this
-//  story.
+//  `emitOnQuickStart` / `emitOnShowWindow` / `emitOnQuit` on itself. Since
+//  Story 6.2 the class also renders the LIVE badge mirror
+//  (`setBadgeState(_:)`): the button's attributed title + the first menu
+//  row's text, painted from strings JS derived — this class does no
+//  derivation of its own. No click-handling logic beyond firing the closure
+//  (6.3) happens here — emitted events may stay unlistened.
 //
 //  Glued into the Obj-C++ TurboModule (NativeMenuBar.mm) via the
 //  Xcode-generated "<product>-Swift.h" header, same as ConfigStore.swift /
@@ -67,6 +69,61 @@ final class MenuBar: NSObject {
 
   private var statusItem: NSStatusItem?
 
+  /// The disabled first menu row — held so `setBadgeState(_:)` can swap its
+  /// title for the live badge/countdown text (Story 6.2) without rebuilding
+  /// the menu. Main-thread only, like everything it touches.
+  private var badgeRow: NSMenuItem?
+
+  // MARK: - setBadgeState(_:) (Story 6.2)
+
+  /// Renders the live badge mirror: the status-item button's attributed
+  /// title (text + badge-state foreground color) and the first menu row's
+  /// title. A DUMB renderer — all derivation (badge word, countdown text,
+  /// which state) happened in JS (the domain mirror); this class only maps
+  /// the `state` key to an NSColor and paints the strings it was handed.
+  ///
+  /// Main-thread dispatched, fire-and-forget, always `{ ok: true }` — same
+  /// contract as `initialize()`. The payload's fields are read defensively:
+  /// a missing/junk value keeps the current text rather than crashing (and
+  /// an unknown `state` fails toward blocked/red, mirroring the JS
+  /// derivation's fail-safe direction).
+  @objc
+  func setBadgeState(_ badge: [String: Any]) -> [String: Any] {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else {
+        return
+      }
+      let state = badge["state"] as? String
+      let buttonTitle = badge["buttonTitle"] as? String
+      let rowTitle = badge["rowTitle"] as? String
+
+      if let button = self.statusItem?.button, let buttonTitle = buttonTitle {
+        button.attributedTitle = NSAttributedString(
+          string: buttonTitle,
+          attributes: [.foregroundColor: Self.badgeColor(for: state)]
+        )
+      }
+      if let rowTitle = rowTitle {
+        self.badgeRow?.title = rowTitle
+      }
+    }
+    return ["ok": true]
+  }
+
+  /// The badge-state foreground color for the status-item title. The SAME
+  /// NSColor semantic names the JS `tokens.status` map uses
+  /// (`systemGreenColor` / `systemOrangeColor` / `systemRedColor`), so the
+  /// menu-bar mirror adapts to light/dark identically to the in-window pill
+  /// fill. An unknown/missing key fails toward red — the over-blocking
+  /// fail-safe the JS `computeBadgeState` already carries.
+  private static func badgeColor(for state: String?) -> NSColor {
+    switch state {
+    case "free": return .systemGreen
+    case "amber": return .systemOrange
+    default: return .systemRed
+    }
+  }
+
   // MARK: - initialize()
 
   /// Idempotently builds the status item + menu skeleton. The actual
@@ -94,16 +151,21 @@ final class MenuBar: NSObject {
     }
     isInitialized = true
 
-    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    // Story 6.2: `variableLength` — the item's title is now LIVE TEXT (the
+    // countdown while a session runs), which does not fit the fixed square
+    // width 6.1 used for its static placeholder title.
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     // No status-item icon asset exists yet — plain text title fallback
-    // (Ask First boundary: confirm before adding new asset files).
+    // (Ask First boundary: confirm before adding new asset files). 6.2's
+    // `setBadgeState(_:)` replaces this with the live mirror text + color on
+    // the first push; this is only what shows before that lands.
     item.button?.title = "Frosthalt"
 
     let menu = NSMenu()
 
-    // 1. Disabled placeholder label row. 6.2 swaps this item's title for the
-    // live Zustand-driven badge/countdown text; the item itself (and its
-    // disabled state) doesn't change here.
+    // 1. Disabled badge/countdown label row. Since 6.2 its title carries the
+    // LIVE mirror text (the `badgeRow` reference is held above); the item
+    // itself (and its disabled state) never changes.
     let placeholder = NSMenuItem(
       title: "Free · no active timer",
       action: nil,
@@ -111,6 +173,7 @@ final class MenuBar: NSObject {
     )
     placeholder.isEnabled = false
     menu.addItem(placeholder)
+    self.badgeRow = placeholder
 
     // 2. Separator.
     menu.addItem(NSMenuItem.separator())

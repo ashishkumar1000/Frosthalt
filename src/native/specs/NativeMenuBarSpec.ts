@@ -14,10 +14,11 @@
  * the item), a separator, then "Start 25-min focus" / "Show window" / "Quit".
  * `initialize()` builds that skeleton once, on the main thread, guarded by a
  * private native `isInitialized` flag — a second call is a no-op that still
- * returns `{ ok: true }`. Live badge/countdown content (6.2) and actual click
- * handling in JS (6.3) are out of scope here: each actionable item fires its
- * matching `EventEmitter<void>` with no payload, and it is fine for no JS
- * listener to exist yet.
+ * returns `{ ok: true }`. Story 6.2 adds `setBadgeState` — the live badge /
+ * countdown mirror (all derivation stays in JS, native just renders the final
+ * strings + color). Actual click handling in JS (6.3) stays out of scope:
+ * each actionable item fires its matching `EventEmitter<void>` with no
+ * payload, and it is fine for no JS listener to exist yet.
  *
  * Every native method returns the uniform `{ ok, error? }` envelope over JSI,
  * matching the two existing native modules' convention.
@@ -44,6 +45,31 @@ export type MenuBarResult = {
   error?: string;
 };
 
+/**
+ * The live badge mirror payload (Story 6.2). All derivation happens in JS (the
+ * domain mirror, `src/domain/menuBarMirror.ts` — the SAME Zustand slices the
+ * in-window StatusHeader reads); native is a dumb renderer of the final
+ * strings plus a color key:
+ *
+ * - `state`        — which badge-state color to paint the status-item title
+ *                    with (`systemGreen` / `systemOrange` / `systemRed`, the
+ *                    same NSColor names `tokens.status` maps). Native fails
+ *                    toward blocked/red on an unknown value, mirroring
+ *                    `computeBadgeState`'s fail-safe direction.
+ * - `buttonTitle`  — the status-item button's title: the live `mm:ss` while a
+ *                    session runs, else the badge label word.
+ * - `rowTitle`     — the disabled first menu row's title:
+ *                    `"{label} · {mm:ss | 'no active timer'}"`.
+ *
+ * Declared as a `type` alias (not an interface) for codegen compatibility,
+ * same as `MenuBarResult`.
+ */
+export type MenuBarBadgeState = {
+  state: 'free' | 'amber' | 'blocked';
+  buttonTitle: string;
+  rowTitle: string;
+};
+
 export interface Spec extends TurboModule {
   /**
    * Idempotently builds the one `NSStatusItem` + `NSMenu` (placeholder label
@@ -52,6 +78,16 @@ export interface Spec extends TurboModule {
    * is created — and both calls return `{ ok: true }`.
    */
   initialize(): MenuBarResult;
+
+  /**
+   * Renders the live badge mirror: paints the status-item button's attributed
+   * title with the `state` color + `buttonTitle` text, and swaps the disabled
+   * first menu row's title for `rowTitle`. Main-thread dispatched,
+   * fire-and-forget — always returns `{ ok: true }`. Safe before the build
+   * block has run only by main-queue FIFO ordering (App calls `initialize()`
+   * first); the nil-guard makes an out-of-order call a no-op, not a crash.
+   */
+  setBadgeState(badge: MenuBarBadgeState): MenuBarResult;
 
   /**
    * Fires with no payload when "Start 25-min focus" is clicked. Unlistened in

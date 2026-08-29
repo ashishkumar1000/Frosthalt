@@ -36,6 +36,18 @@ export const SCHEDULE_ENDING_SOON_MS = 10 * 60 * 1000;
 export type BadgeState = 'free' | 'amber' | 'blocked';
 
 /**
+ * The badge label words — the SINGLE SOURCE for both renderers of the badge
+ * (the in-window `StatusBadge` pill and the Story 6.2 menu-bar mirror), so
+ * the two surfaces can never show different words for the same state.
+ * Domain-owned on purpose: UI imports domain, never the reverse.
+ */
+export const badgeStateLabels: Record<BadgeState, string> = {
+  free: 'Free',
+  amber: 'Blocking',
+  blocked: 'Blocked',
+};
+
+/**
  * Derive the header badge status for `committed` at the injected `now`.
  *
  * - `free`    — no live timer session and no active schedule window.

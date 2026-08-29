@@ -30,7 +30,7 @@
  * `Pressable`, not a default-button binding); Esc cancels.
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Pressable,
   StyleSheet,
@@ -38,7 +38,6 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import type { TextInput as TextInputType } from 'react-native';
 import { useDomainStore } from '../domain/store';
 import { tokens } from '../theme/tokens';
 import { GATE_MAX_ATTEMPTS } from '../config/password';
@@ -73,10 +72,6 @@ export function PasswordGate({
   const [show, setShow] = useState(false);
   // The visible countdown value (ms remaining). `null` when not throttled.
   const [countdown, setCountdown] = useState<number | null>(null);
-  // Auto-focus the field on mount so the user can type immediately. The
-  // `.focus()` call is native-runtime (a no-op in the node jest env), so the
-  // tests do not assert focus — same caveat as the Shell's row-0 mount focus.
-  const fieldRef = useRef<TextInputType>(null);
 
   const now = Date.now();
   const throttled =
@@ -107,17 +102,29 @@ export function PasswordGate({
     return () => clearInterval(id);
   }, [gateThrottleUntil, clearGateThrottle]);
 
-  // Auto-focus the field on mount.
-  useEffect(() => {
-    fieldRef.current?.focus();
-  }, []);
-
+  // NO auto-focus on mount — deliberately (crash hotfix, found on the first
+  // real `pnpm macos` run of the 6.2 badge). Programmatic `.focus()` on a
+  // `secureTextEntry` field takes AppKit's `selectText:` path
+  // (`NSWindow makeFirstResponder:` -> `NSTextField selectText:` ->
+  // `NSCell selectWithFrame:...`), and macOS 12+ asserts INSIDE that path:
+  // "NSSecureTextFieldCell is not secure because the secure field editor's
+  // delegate must be an NSSecureTextField!" — react-native-macos's
+  // `RCTUISecureTextField` is a plain `NSTextField` subclass that only swaps
+  // in an `NSSecureTextFieldCell` (PR #612), so the assertion fires and the
+  // app SIGABRTs the moment the gate opens. The USER-CLICK edit path
+  // (`NSCell editWithFrame:...`) does NOT hit the assertion — typing into the
+  // secure SetPassword fields has always worked — so the gate is fully usable
+  // without auto-focus; the user just clicks the field first. Do NOT re-add
+  // `.focus()`/`autoFocus` here or on ANY `secureTextEntry` field on macOS
+  // (the plain-field mount focuses in Shell/ScheduleEditor are safe — the
+  // assertion is secure-editor-only).
+  //
   // If the gate mounts with a throttle timestamp already in the past (e.g. the
   // sheet was closed mid-throttle and re-opened after expiry, before the
   // countdown tick ran), clear it now so the user isn't shown "0 tries left".
   // `clearGateThrottle` is a guarded no-op when not throttled, and resets
   // attempts for 5 fresh tries when the timestamp is stale-but-present.
-  // Mount-only (mirrors the auto-focus effect's empty-deps pattern).
+  // Mount-only (empty-deps pattern).
   useEffect(() => {
     if (gateThrottleUntil != null && gateThrottleUntil <= Date.now()) {
       clearGateThrottle();
@@ -198,7 +205,6 @@ export function PasswordGate({
         <View style={styles.fieldGroup}>
           <View style={styles.row}>
             <TextInput
-              ref={fieldRef}
               value={entry}
               onChangeText={setEntry}
               secureTextEntry={!show}

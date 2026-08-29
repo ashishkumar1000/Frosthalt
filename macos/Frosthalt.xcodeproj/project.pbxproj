@@ -20,6 +20,7 @@
 		FFAA000400000000000000A4 /* NativeShellRunner.mm in Sources */ = {isa = PBXBuildFile; fileRef = FFAA000200000000000000A2 /* NativeShellRunner.mm */; };
 		FFCC000300000000000000C3 /* MenuBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000100000000000000C1 /* MenuBar.swift */; };
 		FFCC000400000000000000C4 /* NativeMenuBar.mm in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000200000000000000C2 /* NativeMenuBar.mm */; };
+		FFCC000600000000000000C6 /* SecureTextFieldFix.mm in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000500000000000000C5 /* SecureTextFieldFix.mm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -45,6 +46,7 @@
 		FFAA000200000000000000A2 /* NativeShellRunner.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NativeShellRunner.mm; sourceTree = "<group>"; };
 		FFCC000100000000000000C1 /* MenuBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBar.swift; sourceTree = "<group>"; };
 		FFCC000200000000000000C2 /* NativeMenuBar.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NativeMenuBar.mm; sourceTree = "<group>"; };
+		FFCC000500000000000000C5 /* SecureTextFieldFix.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = SecureTextFieldFix.mm; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -84,6 +86,7 @@
 				FFAA000200000000000000A2 /* NativeShellRunner.mm */,
 				FFCC000100000000000000C1 /* MenuBar.swift */,
 				FFCC000200000000000000C2 /* NativeMenuBar.mm */,
+				FFCC000500000000000000C5 /* SecureTextFieldFix.mm */,
 				5142014B2437B4B30078DB4F /* AppDelegate.h */,
 				5142014C2437B4B30078DB4F /* AppDelegate.mm */,
 				514201512437B4B40078DB4F /* Assets.xcassets */,
@@ -359,6 +362,7 @@
 				FFAA000400000000000000A4 /* NativeShellRunner.mm in Sources */,
 				FFCC000300000000000000C3 /* MenuBar.swift in Sources */,
 				FFCC000400000000000000C4 /* NativeMenuBar.mm in Sources */,
+				FFCC000600000000000000C6 /* SecureTextFieldFix.mm in Sources */,
 				5142014D2437B4B30078DB4F /* AppDelegate.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
