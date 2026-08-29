@@ -18,6 +18,8 @@
 		FF97D5F23030E92B002B4D9A /* NativeConfigStore.mm in Sources */ = {isa = PBXBuildFile; fileRef = FF97D5F03030E92B002B4D9A /* NativeConfigStore.mm */; };
 		FFAA000300000000000000A3 /* ShellRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAA000100000000000000A1 /* ShellRunner.swift */; };
 		FFAA000400000000000000A4 /* NativeShellRunner.mm in Sources */ = {isa = PBXBuildFile; fileRef = FFAA000200000000000000A2 /* NativeShellRunner.mm */; };
+		FFCC000300000000000000C3 /* MenuBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000100000000000000C1 /* MenuBar.swift */; };
+		FFCC000400000000000000C4 /* NativeMenuBar.mm in Sources */ = {isa = PBXBuildFile; fileRef = FFCC000200000000000000C2 /* NativeMenuBar.mm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -41,6 +43,8 @@
 		FF97D5F03030E92B002B4D9A /* NativeConfigStore.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NativeConfigStore.mm; sourceTree = "<group>"; };
 		FFAA000100000000000000A1 /* ShellRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellRunner.swift; sourceTree = "<group>"; };
 		FFAA000200000000000000A2 /* NativeShellRunner.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NativeShellRunner.mm; sourceTree = "<group>"; };
+		FFCC000100000000000000C1 /* MenuBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBar.swift; sourceTree = "<group>"; };
+		FFCC000200000000000000C2 /* NativeMenuBar.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NativeMenuBar.mm; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -78,6 +82,8 @@
 				FF97D5F03030E92B002B4D9A /* NativeConfigStore.mm */,
 				FFAA000100000000000000A1 /* ShellRunner.swift */,
 				FFAA000200000000000000A2 /* NativeShellRunner.mm */,
+				FFCC000100000000000000C1 /* MenuBar.swift */,
+				FFCC000200000000000000C2 /* NativeMenuBar.mm */,
 				5142014B2437B4B30078DB4F /* AppDelegate.h */,
 				5142014C2437B4B30078DB4F /* AppDelegate.mm */,
 				514201512437B4B40078DB4F /* Assets.xcassets */,
@@ -351,6 +357,8 @@
 				FF97D5F23030E92B002B4D9A /* NativeConfigStore.mm in Sources */,
 				FFAA000300000000000000A3 /* ShellRunner.swift in Sources */,
 				FFAA000400000000000000A4 /* NativeShellRunner.mm in Sources */,
+				FFCC000300000000000000C3 /* MenuBar.swift in Sources */,
+				FFCC000400000000000000C4 /* NativeMenuBar.mm in Sources */,
 				5142014D2437B4B30078DB4F /* AppDelegate.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -84,6 +84,13 @@
     // import time (verified on 1.4). Same pattern as NativeConfigStore above.
     Class cls = NSClassFromString(@"NativeShellRunnerModule");
     return cls ? (id<RCTModuleProvider>)[cls new] : nil;
+  } else if (strcmp(name, "NativeMenuBar") == 0) {
+    // Story 6.1 — the MenuBar TurboModule (NSStatusItem + NSMenu). Without
+    // this branch `TurboModuleRegistry.getEnforcing('NativeMenuBar')` throws
+    // at JS import time. Same pattern as NativeConfigStore/NativeShellRunner
+    // above.
+    Class cls = NSClassFromString(@"NativeMenuBarModule");
+    return cls ? (id<RCTModuleProvider>)[cls new] : nil;
   }
   return nil;
 }

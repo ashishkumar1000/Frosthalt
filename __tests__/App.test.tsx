@@ -25,6 +25,20 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
   },
 }));
 
+// Story 6.1 — App now calls `initializeMenuBar()` on mount, which imports
+// NativeMenuBarSpec. Mock it the same way (see menuBar.test.ts for real
+// coverage of the wrapper + mount-once behavior); this file only needs the
+// transitive import to resolve.
+jest.mock('../src/native/specs/NativeMenuBarSpec', () => ({
+  __esModule: true,
+  default: {
+    initialize: jest.fn(() => ({ ok: true })),
+    onQuickStart: jest.fn(),
+    onShowWindow: jest.fn(),
+    onQuit: jest.fn(),
+  },
+}));
+
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import App from '../App';
