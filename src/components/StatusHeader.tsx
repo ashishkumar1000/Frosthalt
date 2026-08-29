@@ -27,18 +27,41 @@
  * never calls `start` (refcount 0 when the Timer surface is unmounted).
  *
  * The countdown derives ONLY from the slice — the same `useLayoutEffect`
- * start/stop lifecycle pattern Timer.tsx uses, one `setInterval(1000)` total
- * (refcount-shared). `activeEndEpochMs` normalisation mirrors Timer.tsx
+ * start/stop lifecycle pattern Timer.tsx uses. Since Story 5.4 TWO drivers
+ * can run: the refcount-shared timer slice's `setInterval(1000)` (only while
+ * a session is live) plus the header's unconditional clock slice driver
+ * below. `activeEndEpochMs` normalisation mirrors Timer.tsx
  * exactly (`!= null && Number.isFinite`) so the header, the Timer surface
  * and the slice can never disagree about whether a session is live.
  *
- * The count is the EFFECTIVE blocked count — `effectiveBlocklist(committed).
- * length` — only the always-on domains actually enforced in `/etc/hosts` right
- * now (Story 2.3's pure helper filters `alwaysOn`, `effectiveBlocklist.ts`).
- * `committed` updates only on Apply success (`store.ts`), so the count
- * reflects what is enforced; staged edits do not move it until Applied. Badge
- * and count are sourced from the same applied state, so they can never
- * disagree (both move only on Apply success).
+ * The count is the EFFECTIVE blocked count — `effectiveBlocklist(committed,
+ * now).length` — the domains actually enforced in `/etc/hosts` right now
+ * (Story 2.3's pure helper; Story 5.3 added the active-schedule contribution,
+ * so the count now follows schedule windows too). `now` comes from the SCOPED
+ * `useClockStore` slice (Story 5.4) — the header is its ALWAYS-MOUNTED
+ * subscriber — so the count live-updates when a schedule window opens or
+ * closes while the app runs, not only on Apply success. `committed` updates
+ * only on Apply success, so a staged edit still does not move the count until
+ * Applied; a window boundary does. Badge and count are derived from the SAME
+ * inputs (committed + the same clock-mirror `now`), so they never disagree
+ * with each other — reconciling the disk payload to them is the transition
+ * trigger's job, not theirs.
+ *
+ * The badge is the Story 5.4 ramp derivation — the pure
+ * `computeBadgeState(committed, now)` (`badgeState.ts`): `free` with no live
+ * session/window, `blocked` while a session or an active schedule enforces,
+ * `amber` when the earliest active schedule ends within
+ * `SCHEDULE_ENDING_SOON_MS` (10 min) and its boundary would actually shrink
+ * the blocklist. The clock slice's `nowMs` drives it, so the badge ramps
+ * free→amber→blocked live across boundaries with no Apply in between (amber
+ * is schedule-scoped — a timer-only session never ambers, the 4-4 defer).
+ *
+ * This header also OWNS the CLOCK slice lifecycle (Story 5.4): an
+ * unconditional `useClockStore.start()` on mount / `stop()` on cleanup keeps
+ * the per-second clock driver alive for the app's whole life — the trigger
+ * that reconciles `/etc/hosts` across schedule boundaries lives in
+ * `store.ts` (the module-level `useClockStore` subscription) and only needs
+ * the ticks this lifecycle keeps flowing.
  *
  * Both numerals use `fontVariant: ['tabular-nums']` (the proven
  * `tokens.typography.countdown` pattern, `tokens.ts:120`) so digit width is
@@ -48,9 +71,12 @@
  * `AccessibilityInfo.announceForAccessibility` when the count changes, SKIPPING
  * the initial mount via a `useRef(true)` first-run guard. The app launches on
  * surface 0 = Blocklist, whose mount-announce (`Blocklist.tsx`) already speaks
- * the list on entry; a second announce on launch would double up. The count
- * changes only when `committed` changes (Apply success), so the announce fires
- * after an Apply commits.
+ * the list on entry; a second announce on launch would double up. Since
+ * Story 5.4 the count changes on Apply success AND on a schedule window
+ * boundary crossing (the clock tick recomputes the effective blocklist), so
+ * the announce fires after an Apply commits AND when a live boundary moves
+ * the blocklist — both are real blocklist changes a VoiceOver user should
+ * hear.
  *
  * The header deliberately announces NOTHING on countdown ticks or minute
  * rollovers (UX-DR17): the Timer surface owns the mount + per-minute
@@ -87,6 +113,8 @@ import { CountdownRing } from './CountdownRing';
 import { StatusBadge } from './StatusBadge';
 import { useDomainStore } from '../domain/store';
 import { effectiveBlocklist } from '../domain/effectiveBlocklist';
+import { computeBadgeState } from '../domain/badgeState';
+import { useClockStore } from '../domain/clockStore';
 import {
   useTimerStore,
   selectRemainingMs,
@@ -104,12 +132,31 @@ export interface StatusHeaderProps {
 
 export function StatusHeader({ onViewHosts }: StatusHeaderProps): React.ReactElement {
   const committed = useDomainStore((s) => s.committed);
-  // Memoized on `committed`: `effectiveBlocklist` walks + dedupes the domain
-  // list, and the live-session header re-renders once per SECOND — the count
-  // derivation must not re-run on every tick (it can only change when
-  // `committed` changes, i.e. on Apply success).
-  const count = useMemo(() => effectiveBlocklist(committed).length, [committed]);
+  // The clock slice (Story 5.4): the per-second wall-clock mirror. Subscribing
+  // here makes the count and the badge LIVE — a schedule window opening or
+  // closing re-renders this header subtree on the next tick without any
+  // `committed` change (before 5.4 both only moved on Apply success).
+  const nowMs = useClockStore((s) => s.nowMs);
+  // Memoized on `[committed, nowMs]` (Story 5.4): `effectiveBlocklist` walks +
+  // dedupes the domain list, and its schedule contribution is time-dependent —
+  // the injected `now` (derived from the clock slice's mirror, never a fresh
+  // `Date.now()` here) makes the count follow a window opening or closing
+  // while the app runs. The per-second tick re-renders this header subtree
+  // anyway during a live session, so the memo's job is only to keep the
+  // derivation out of unrelated renders; a boundary tick recomputes it.
+  const count = useMemo(
+    () => effectiveBlocklist(committed, new Date(nowMs)).length,
+    [committed, nowMs],
+  );
   const countLabel = `${count} ${count === 1 ? 'domain' : 'domains'}`;
+  // The badge ramp (Story 5.4): pure `computeBadgeState` from the same
+  // committed + clock-mirror `now` the count uses, so badge and count never
+  // disagree with each other (reconciling the disk to them is the transition
+  // trigger's job). Memoized on the same pair as `count`.
+  const badge = useMemo(
+    () => computeBadgeState(committed, new Date(nowMs)),
+    [committed, nowMs],
+  );
 
   // The scoped countdown slice. TWO numeric selectors (remaining for the
   // numeral, progress for the ring) — both change EVERY tick during a live
@@ -154,13 +201,30 @@ export function StatusHeader({ onViewHosts }: StatusHeaderProps): React.ReactEle
     };
   }, [activeEndEpochMs]);
 
+  // ----- Clock slice lifecycle (Story 5.4) -----
+  // An UNCONDITIONAL start on mount / stop on cleanup: the clock driver must
+  // run for the app's whole life (StatusHeader never unmounts, so the
+  // refcount never drops to zero in the running app) — its ticks feed BOTH
+  // the live count/badge re-renders above and the store-level transition
+  // trigger that reconciles /etc/hosts across a window boundary. The same
+  // useLayoutEffect phase as the timer slice above: the slice is current
+  // before first paint.
+  useLayoutEffect(() => {
+    useClockStore.getState().start();
+    return () => {
+      useClockStore.getState().stop();
+    };
+  }, []);
+
   // On-change VoiceOver announce (skip the initial mount). The app launches on
   // surface 0 = Blocklist, whose mount-announce (`Blocklist.tsx`) already
-  // speaks the list on entry; a second announce on launch would double up. The
-  // count changes only when `committed` changes (Apply success), so this fires
-  // after an Apply commits. The `useRef(true)` first-run guard skips the
-  // initial mount; every subsequent count change announces. Countdown ticks
-  // do NOT change `count`, so they never announce from here.
+  // speaks the list on entry; a second announce on launch would double up.
+  // Since Story 5.4 the count changes on Apply success AND on a schedule
+  // window boundary tick (a live boundary moving the effective blocklist is a
+  // real change a VoiceOver user should hear), so this fires after an Apply
+  // commits AND when a boundary crosses. The `useRef(true)` first-run guard
+  // skips the initial mount; every subsequent count change announces.
+  // Countdown ticks do NOT change `count`, so they never announce from here.
   const isFirstRun = useRef(true);
   useEffect(() => {
     if (isFirstRun.current) {
@@ -174,7 +238,7 @@ export function StatusHeader({ onViewHosts }: StatusHeaderProps): React.ReactEle
 
   return (
     <View style={styles.container}>
-      <StatusBadge status={hasActiveTimer ? 'blocked' : 'free'} />
+      <StatusBadge status={badge} />
       <Text style={styles.separator}>·</Text>
       <Text style={styles.count}>{countLabel}</Text>
       {hasActiveTimer ? (

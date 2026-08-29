@@ -68,6 +68,11 @@
  *     of `expireTimer`'s body with a LOOSER guard (an active session, no
  *     expiry requirement). See its JSDoc below; only the Timer surface calls
  *     it.
+ *   - `applyScheduleTransitions(change)` (Story 5.4) — the ONE hosts-only
+ *     write that reconciles `/etc/hosts` to the recomputed blocklist after
+ *     the clock trigger observes a schedule boundary crossing. Called by the
+ *     module-level `useClockStore` trigger below; see its JSDoc for the
+ *     skip-if-equal + one-attempt semantics.
  *
  * Serialization: a single in-flight Promise + a micro-queue of pending
  * `apply()` intents; the queue drains one-at-a-time, never in parallel. This
@@ -89,6 +94,8 @@ import type { DriftResult } from './drift';
 import { readHostsSection, writeHosts } from '../hosts/shellRunner';
 import type { WriteResult } from '../hosts/shellRunner';
 import { useTimerStore } from './timerStore';
+import { useClockStore } from './clockStore';
+import { isScheduleActive } from './scheduleEval';
 import { scheduleValueKey } from './stagedScheduleChangeCount';
 
 export type ApplyStatus = 'idle' | 'running';
@@ -113,6 +120,19 @@ const HOSTS_FAILURE_TOAST = "Couldn't update /etc/hosts. No changes made.";
 export interface ToastState {
   message: string;
   tone: 'info' | 'error';
+}
+
+/**
+ * The per-tick schedule boundary report (Story 5.4) the clock trigger hands
+ * to `applyScheduleTransitions`: the display names of the schedules that
+ * STARTED and ENDED between the previous tick and the observed one. Both
+ * lists populated (or more than one name in either) means two or more windows
+ * changed in one tick — the trigger still enqueues exactly ONE write, and the
+ * toast degrades to the generic copy.
+ */
+export interface ScheduleTransitionChange {
+  started: string[];
+  ended: string[];
 }
 
 /**
@@ -436,6 +456,37 @@ export interface DomainState {
    * envelope is returned for the UI to surface.
    */
   setPassword: (pw: string) => Promise<WriteResult>;
+
+  /**
+   * Reconcile `/etc/hosts` to the recomputed blocklist after the clock
+   * trigger observed a schedule boundary crossing (Story 5.4). The ONE
+   * privileged write a live transition produces — hosts-ONLY (the
+   * `restoreSection` precedent: config.json is canonical and unchanged by a
+   * window boundary, so `writeConfig` is never called and `committed` never
+   * changes), through the shared serialized queue (never concurrent with an
+   * Apply; one osascript prompt at a time).
+   *
+   * Body (through the shared `enqueue` only):
+   *   1. Queue-time re-read: `committed` and `effectiveHostsLines(committed)`
+   *      are recomputed AT RUN TIME (the established queue-time re-read rule),
+   *      never from the tick-time snapshot.
+   *   2. Skip-if-equal guard: when the recomputed lines equal the transition
+   *      baseline (a window closed while its domains stay covered, or the
+   *      observed diff was already superseded) the write is skipped ENTIRELY —
+   *      no port call, no admin prompt, no `applyStatus` flip, no toast, no
+   *      baseline change. Return `{ ok: false, error: 'no-transition' }`.
+   *   3. Otherwise flip `applyStatus: 'running'`, write the recomputed lines
+   *      (ONE admin prompt), and advance the transition baseline to the
+   *      recomputed `{ committed, lines }` on EVERY outcome (ok, deny, throw)
+   *      — one attempt per observed transition, no per-second retry/prompt
+   *      spam. Success raises the transition toast from `change`; deny/throw
+   *      raise `HOSTS_FAILURE_TOAST` ('error') — the drift banner + a user
+   *      Apply/Restore remain the recovery path.
+   *
+   * Never rejects (the enqueue body is fully guarded); the caller may still
+   * `.catch()` defensively, as every fire-and-forget trigger does.
+   */
+  applyScheduleTransitions: (change: ScheduleTransitionChange) => Promise<WriteResult>;
 
   // ----- Story 3.2 — the reusable password gate (runtime-only state) -----
   //
@@ -1168,6 +1219,101 @@ export const useDomainStore = create<DomainState>()((set, get) => ({
     set({ toast: null });
   },
 
+  applyScheduleTransitions: (change) => {
+    // Defensive normalisation: a direct (non-trigger) caller can hand over a
+    // malformed change (null / missing arrays). Normalising HERE means the
+    // toast-copy selection after a SUCCESSFUL write can never throw — a throw
+    // after the write would mislabel the success as `hosts-throw` with the
+    // failure toast. The trigger always passes well-formed arrays.
+    const startedNames = Array.isArray(change?.started) ? change.started : [];
+    const endedNames = Array.isArray(change?.ended) ? change.ended : [];
+    // Story 5.4 — the ONE hosts-only write a live transition needs. Hosts
+    // only (the `restoreSection` precedent above: config.json is canonical
+    // and unchanged by a window boundary, so `writeConfig` is NEVER called
+    // and `committed` never advances), routed through the shared serialized
+    // queue so a transition write can never run concurrent with an Apply,
+    // a timer start/expiry, or a Restore (one osascript prompt at a time).
+    return enqueue(async () => {
+      // Queue-time re-read + recompute (the established rule): the payload
+      // is derived from the committed AT RUN TIME, not from the tick-time
+      // snapshot — a boundary that crossed while this write sat queued is
+      // absorbed into the lines actually written.
+      const committed = get().committed;
+      const lines = effectiveHostsLines(committed);
+      if (transitionBaseline.lines == null) {
+        // No baseline yet (only reachable from a direct caller before any
+        // clock evaluation): set the baseline from this evaluation and skip —
+        // the same ZERO-write contract as the first evaluation after load.
+        transitionBaseline = { committedRef: committed, lines };
+        return { ok: false, error: 'no-transition' } as WriteResult;
+      }
+      if (transitionBaseline.committedRef !== committed) {
+        // A committed-changing path (an Apply, a timer start/expire/end-early,
+        // setPassword) settled after the detection tick, so the baseline is
+        // stale. That path already wrote hosts with its own run-time
+        // evaluation, so the disk payload matches a fresh evaluation of the
+        // CURRENT committed — refresh the baseline silently and skip (NO
+        // write, NO prompt, NO toast). The refresh is evaluated at this same
+        // run-time instant, so the next tick's recompute no-ops.
+        transitionBaseline = { committedRef: committed, lines };
+        return { ok: false, error: 'no-transition' } as WriteResult;
+      }
+      if (sameHostsLines(lines, transitionBaseline.lines)) {
+        // Skip-if-equal guard: the recomputed payload equals the baseline (a
+        // window closed while its domains stay covered, or the observed diff
+        // was already superseded). NO write, NO admin prompt, NO
+        // `applyStatus` flip, NO toast, NO baseline change.
+        return { ok: false, error: 'no-transition' } as WriteResult;
+      }
+      set({ applyStatus: 'running' });
+      try {
+        const result = await writeHosts(lines);
+        // The baseline advances on EVERY outcome (ok, deny, throw) — one
+        // attempt per observed transition; the next tick's recompute equals
+        // the baseline and no-ops, so a denial can never spam the OS prompt.
+        transitionBaseline = { committedRef: committed, lines };
+        if (result.ok) {
+          set({
+            applyStatus: 'idle',
+            lastResult: result,
+            toast: {
+              message: transitionToastCopy({ started: startedNames, ended: endedNames }),
+              tone: 'info',
+            },
+          });
+        } else {
+          set({
+            applyStatus: 'idle',
+            lastResult: result,
+            toast: {
+              message: HOSTS_FAILURE_TOAST,
+              tone: 'error',
+            },
+          });
+        }
+        return result;
+      } catch (err) {
+        // Defensive — shellRunner's contract says the promise never rejects,
+        // but an unexpected throw must never leave `applyStatus ===
+        // 'running'` forever. Baseline still advances (single attempt).
+        const result: WriteResult = {
+          ok: false,
+          error: `hosts-throw:${String(err)}`,
+        };
+        transitionBaseline = { committedRef: committed, lines };
+        set({
+          applyStatus: 'idle',
+          lastResult: result,
+          toast: {
+            message: HOSTS_FAILURE_TOAST,
+            tone: 'error',
+          },
+        });
+        return result;
+      }
+    });
+  },
+
   // ----- Story 4.6 — `endEarly` (the password-gated early escape) -----
 
   endEarly: () => {
@@ -1418,6 +1564,187 @@ useTimerStore.subscribe((state, prev) => {
       // Defensive — the enqueue body never rejects, but a fire-and-forget
       // trigger must never surface an unhandled rejection.
     });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Story 5.4 — the live schedule-transition trigger (clock-driven).
+// ---------------------------------------------------------------------------
+
+/**
+ * The transition baseline: the payload lines /etc/hosts was last known to
+ * hold, plus the exact `committed` reference they were derived from. Module
+ * level (NOT store state) — it is pipeline bookkeeping, not UI state, and it
+ * must survive `committed` updates to do its comparison job.
+ *
+ *   - `committedRef` — a reference-equality sentinel. Any committed change
+ *     (an Apply, a timer start/expire/end-early, setPassword) refreshes the
+ *     baseline SILENTLY: every committed-changing path already wrote hosts
+ *     with its own run-time evaluation, and `setPassword` (the one exception)
+ *     cannot change hosts lines. The FIRST evaluation after module load sees
+ *     `committedRef == null` and only SETS the baseline — the mount/launch
+ *     invariant from 4.7: ZERO port writes at launch.
+ *   - `lines`        — `effectiveHostsLines(committed, atBaselineTime)`. A
+ *     tick whose recomputed lines differ from this is a live transition.
+ *
+ * `null`/`null` until the first clock evaluation runs (at mount, when
+ * StatusHeader starts the clock slice).
+ */
+let transitionBaseline: {
+  committedRef: Config | null;
+  lines: string[] | null;
+} = { committedRef: null, lines: null };
+
+/** The previous tick's `nowMs` — the window per-schedule flips are measured across. */
+let transitionPrevTickMs = 0;
+
+/**
+ * Payload equality for the baseline comparison: same length AND same line
+ * membership. Membership (not per-index order) because two schedule swaps in
+ * one tick can reorder equal-length payloads — a set-equal payload is still
+ * "no change" for the disk.
+ */
+function sameHostsLines(a: string[] | null, b: string[] | null): boolean {
+  if (a == null || b == null || a.length !== b.length) {
+    return false;
+  }
+  const pool = new Set(b);
+  for (const line of a) {
+    if (!pool.has(line)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** The schedule's display name for the toast copy, defensively defaulted. */
+function scheduleDisplayName(schedule: unknown): string {
+  const name = (schedule as { name?: unknown } | null)?.name;
+  return typeof name === 'string' && name.length > 0 ? name : 'schedule';
+}
+
+/**
+ * The pinned transition toast copy (Story 5.4 — no new toasts beyond these
+ * three strings): one schedule started / one schedule ended / anything else
+ * (two windows in one tick, or a lines-diff with no per-schedule flip)
+ * degrades to the generic copy.
+ */
+function transitionToastCopy(change: ScheduleTransitionChange): string {
+  if (change.started.length === 1 && change.ended.length === 0) {
+    return `Schedule "${change.started[0]}" started — domains now blocked.`;
+  }
+  if (change.ended.length === 1 && change.started.length === 0) {
+    return `Schedule "${change.ended[0]}" ended — domains unblocked.`;
+  }
+  return 'Schedule windows changed — blocklist updated.';
+}
+
+/**
+ * The per-tick transition evaluation (Story 5.4). Recomputes the effective
+ * hosts lines from the CURRENT committed at the tick's time and compares them
+ * against the baseline; a diff means a schedule boundary crossed — exactly
+ * ONE `applyScheduleTransitions` attempt is enqueued for it.
+ *
+ * Baseline rules (the spec's Always clauses):
+ *   - FIRST evaluation after load (baseline.committedRef == null): set the
+ *     baseline with ZERO port writes — the 4.7 mount/launch invariant.
+ *   - A changed `committed` refreshes the baseline silently — every
+ *     committed-changing path already wrote hosts at its own run time
+ *     (`setPassword`, the exception, cannot change hosts lines).
+ *   - Lines equal to the baseline: steady state, no write, the tick window
+ *     still advances so a later diff reports the right flip set.
+ *   - Lines differ: ONE fire-and-forget `applyScheduleTransitions` attempt
+ *     (the queue-time guard + the baseline advance make duplicates inert).
+ *
+ * The per-schedule flip lists are computed across the PREVIOUS tick's window
+ * (transitionPrevTickMs -> nowMs) so the toast names what actually crossed;
+ * the write itself still recomputes at queue-run time.
+ */
+function evaluateScheduleTransitions(nowMs: number): void {
+  const store = useDomainStore.getState();
+  const committed = store.committed;
+  const now = new Date(nowMs);
+
+  // First evaluation (or a store whose committed replaced the baseline's —
+  // e.g. a test reset): set/refresh the baseline silently. ZERO port calls —
+  // every committed-changing path already wrote hosts, and the first
+  // evaluation must not write at all (the 4.7 launch invariant).
+  if (transitionBaseline.committedRef !== committed) {
+    transitionBaseline = {
+      committedRef: committed,
+      lines: effectiveHostsLines(committed, now),
+    };
+    transitionPrevTickMs = nowMs;
+    return;
+  }
+
+  const lines = effectiveHostsLines(committed, now);
+
+  // Backwards-clock guard: an NTP correction can move `nowMs` BACKWARDS
+  // between ticks. The inverted prev/now window would feed the flip check a
+  // reversed interval (spurious started/ended names on a real diff), so reset
+  // the measurement window to this tick and proceed through the normal
+  // paths — an unchanged payload no-ops exactly as a forward steady tick
+  // does, and a real payload diff still writes (its flip lists come out empty
+  // because prev == now, so the toast degrades to the generic copy).
+  if (nowMs < transitionPrevTickMs) {
+    transitionPrevTickMs = nowMs;
+  }
+
+  if (sameHostsLines(lines, transitionBaseline.lines)) {
+    // Steady state — the common per-tick path. No write, no prompt, no toast.
+    transitionPrevTickMs = nowMs;
+    return;
+  }
+
+  // A transition: which schedules flipped between the previous tick and this
+  // one? (A multi-second jump — throttled timers, a sleeping machine — sees
+  // every boundary crossed in the gap and degrades to the generic toast
+  // while still writing the combined payload once.)
+  const started: string[] = [];
+  const ended: string[] = [];
+  const schedules = Array.isArray(committed.schedules) ? committed.schedules : [];
+  const prevDate = new Date(transitionPrevTickMs);
+  for (const schedule of schedules) {
+    const was = isScheduleActive(schedule, prevDate);
+    const isNow = isScheduleActive(schedule, now);
+    if (isNow && !was) {
+      started.push(scheduleDisplayName(schedule));
+    } else if (!isNow && was) {
+      ended.push(scheduleDisplayName(schedule));
+    }
+  }
+  transitionPrevTickMs = nowMs;
+
+  void store.applyScheduleTransitions({ started, ended }).catch(() => {
+    // Defensive — the enqueue body never rejects, but a fire-and-forget
+    // trigger must never surface an unhandled rejection.
+  });
+}
+
+// The transition trigger. A module-level subscription on the clock slice that
+// evaluates the effective blocklist on every REAL tick (a setState that
+// re-writes the same `nowMs` is a no-op) and enqueues ONE hosts-only write
+// when the recomputed payload differs from the baseline.
+//
+// Why here and not in a component: a transition is a privileged hosts write —
+// it belongs in the domain layer, exactly like the 4.5 expiry trigger beside
+// which it lives. The import is ONE-WAY (store -> clockStore; the clock slice
+// imports nothing from store), so there is no cycle.
+useClockStore.subscribe((state, prev) => {
+  if (state.nowMs === prev.nowMs) {
+    // Not a real tick (an identical re-write) — nothing to evaluate.
+    return;
+  }
+  // A throw in here (e.g. `effectiveHostsLines` choking on malformed data)
+  // would propagate into the clock driver's interval tick — an uncaught
+  // exception every second with the transition loop silently dead. Contain
+  // it: still advance the measurement window so the next good tick compares
+  // across a sane interval, and let the next tick recover.
+  try {
+    evaluateScheduleTransitions(state.nowMs);
+  } catch {
+    transitionPrevTickMs = state.nowMs;
   }
 });
 

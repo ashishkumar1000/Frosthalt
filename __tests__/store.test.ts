@@ -36,10 +36,12 @@ jest.mock('../src/native/specs/NativeShellRunnerSpec', () => ({
 
 import { useDomainStore } from '../src/domain/store';
 import { useTimerStore } from '../src/domain/timerStore';
+import { useClockStore } from '../src/domain/clockStore';
 import * as shellRunner from '../src/hosts/shellRunner';
+import * as effectiveBlocklistModule from '../src/domain/effectiveBlocklist';
 import { stagedChangeCount } from '../src/domain/stagedChangeCount';
 import { DEFAULT_CONFIG } from '../src/config/types';
-import type { Schedule } from '../src/config/types';
+import type { Config, Schedule, Weekday } from '../src/config/types';
 import {
   hashPassword,
   GATE_MAX_ATTEMPTS,
@@ -4020,4 +4022,545 @@ test('stageScheduleUpsert produces a NEW array reference mid-Apply so the runnin
     { hostname: 'social.com', alwaysOn: true },
   ]);
   expect(state.staged).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Story 5.4 — live schedule transitions: the module-level clock trigger
+// (`useClockStore.subscribe` -> `evaluateScheduleTransitions`) and the
+// `applyScheduleTransitions` action. The action recomputes
+// `effectiveHostsLines(committed, now)` at QUEUE-RUN time with `new Date()`,
+// so every test installs fake timers + `setSystemTime` to make that recompute
+// deterministic; ticks are driven by `useClockStore.setState({ nowMs })`
+// (no interval needed — the trigger fires on any `nowMs` change). Schedules
+// are built FROM a local-noon `Date` so the windows are timezone-independent.
+// ---------------------------------------------------------------------------
+
+const fiveFourProbe = new Date(1_756_000_000_000);
+const dayBase = new Date(
+  fiveFourProbe.getFullYear(),
+  fiveFourProbe.getMonth(),
+  fiveFourProbe.getDate(),
+  12,
+  0,
+  0,
+  0,
+);
+
+function fiveFourHhmm(d: Date): string {
+  const h = String(d.getHours()).padStart(2, '0');
+  const m = String(d.getMinutes()).padStart(2, '0');
+  return `${h}:${m}`;
+}
+
+/** A schedule window covering `[dayBase, dayBase + minutes)` on dayBase's weekday. */
+function makeFiveFourSchedule(
+  minutes: number,
+  overrides: Partial<Schedule> = {},
+): Schedule {
+  const end = new Date(dayBase.getTime() + minutes * 60_000);
+  return {
+    id: 's-5-4',
+    name: 'Deep Work',
+    weekdays: [((dayBase.getDay() + 6) % 7) as Weekday],
+    startTime: fiveFourHhmm(dayBase),
+    endTime: fiveFourHhmm(end),
+    enabled: true,
+    domains: ['x.com'],
+    ...overrides,
+  };
+}
+
+/** Seed a committed config carrying the given schedules and return it. */
+function seedFiveFourConfig(schedules: Schedule[]): Config {
+  const config: Config = {
+    ...DEFAULT_CONFIG,
+    domains: [],
+    schedules,
+    settings: { menuBarEnabled: false },
+    activeTimer: null,
+  };
+  useDomainStore.setState({ committed: config });
+  return config;
+}
+
+/** Drive the module-level clock trigger with a guaranteed-NEW nowMs value. */
+function driveClock(nowMs: number): void {
+  const prev = useClockStore.getState().nowMs;
+  useClockStore.setState({ nowMs: prev === nowMs ? nowMs + 1 : nowMs });
+}
+
+// I/O Matrix: "FIRST evaluation after load sets baseline with ZERO writes".
+test('5.4 trigger — the first tick sets the transition baseline and writes nothing', async () => {
+  jest.useFakeTimers();
+  const config = seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tBefore = dayBase.getTime() - 60_000; // 11:59 local — window not open
+  jest.setSystemTime(tBefore);
+
+  driveClock(tBefore);
+  await flushMicrotasks();
+
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(useDomainStore.getState().committed).toBe(config);
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// I/O Matrix: window opens -> exactly ONE hosts-only write + the pinned toast.
+test('5.4 trigger — a window opening queues ONE hosts-only write with the started toast', async () => {
+  jest.useFakeTimers();
+  const config = seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tBefore = dayBase.getTime() - 60_000;
+  const tOpen = dayBase.getTime();
+  jest.setSystemTime(tBefore);
+  driveClock(tBefore); // baseline: window closed, zero writes
+  await flushMicrotasks();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+
+  jest.setSystemTime(tOpen); // the run body recomputes at this wall clock
+  driveClock(tOpen); // the boundary tick
+  await flushMicrotasks();
+
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const lines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  expect(lines).toContain('0.0.0.0 x.com');
+  // Hosts-ONLY: config.json is canonical and is never written by a transition.
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  // committed never changes on a transition.
+  expect(useDomainStore.getState().committed).toBe(config);
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Schedule "Deep Work" started — domains now blocked.',
+    tone: 'info',
+  });
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// The applyStatus flip: 'running' while the write is in flight, 'idle' after.
+test('5.4 action — applyStatus flips running -> idle around the hosts write', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tBefore = dayBase.getTime() - 60_000;
+  const tOpen = dayBase.getTime();
+  jest.setSystemTime(tBefore);
+  driveClock(tBefore);
+  await flushMicrotasks();
+
+  let resolveWrite!: (r: WriteResult) => void;
+  shellNative.writeHosts.mockImplementationOnce(
+    () =>
+      new Promise<WriteResult>((resolve) => {
+        resolveWrite = resolve;
+      }),
+  );
+
+  jest.setSystemTime(tOpen);
+  driveClock(tOpen);
+  await flushMicrotasks(3);
+  expect(useDomainStore.getState().applyStatus).toBe('running');
+
+  resolveWrite({ ok: true });
+  await flushMicrotasks();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// I/O Matrix: window ends -> ONE write removing the lines + the ended toast.
+test('5.4 trigger — a window ending writes the shrink and shows the ended toast', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tMid = dayBase.getTime() + 30 * 60_000;
+  const tEnd = dayBase.getTime() + 60 * 60_000;
+  const tAfter = tEnd + 60_000;
+  jest.setSystemTime(tMid);
+  driveClock(tMid); // baseline set INSIDE the window
+  await flushMicrotasks();
+  shellNative.writeHosts.mockClear();
+
+  jest.setSystemTime(tAfter);
+  driveClock(tAfter);
+  await flushMicrotasks();
+
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const lines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  expect(lines).not.toContain('0.0.0.0 x.com');
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Schedule "Deep Work" ended — domains unblocked.',
+    tone: 'info',
+  });
+});
+
+// I/O Matrix: the boundary changes nothing -> skip entirely (no write/prompt/
+// toast/applyStatus, baseline unchanged so later ticks still work).
+test('5.4 trigger — a still-covered boundary skips without any write or toast', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  // x.com is ALSO always-on: the window opening changes no hosts lines.
+  const committedWithAlwaysOn: Config = {
+    ...useDomainStore.getState().committed,
+    domains: [{ hostname: 'x.com', alwaysOn: true }],
+  };
+  useDomainStore.setState({ committed: committedWithAlwaysOn });
+  const tBefore = dayBase.getTime() - 60_000;
+  const tOpen = dayBase.getTime();
+  jest.setSystemTime(tBefore);
+  driveClock(tBefore);
+  await flushMicrotasks();
+
+  jest.setSystemTime(tOpen);
+  driveClock(tOpen);
+  await flushMicrotasks();
+
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().committed).toBe(committedWithAlwaysOn);
+});
+
+// I/O Matrix: two windows flip in one tick -> ONE write + the generic toast.
+test('5.4 trigger — two schedule flips in one tick coalesce into ONE write', async () => {
+  jest.useFakeTimers();
+  // A [12:00, 12:30) on x.com and B [12:30, 13:00) on y.com: at 12:30 A ends
+  // and B starts in the same tick — one hosts write, one generic toast.
+  const a = makeFiveFourSchedule(30, { id: 'sa', name: 'A', domains: ['x.com'] });
+  const bEnd = new Date(dayBase.getTime() + 60 * 60_000);
+  const b: Schedule = {
+    id: 'sb',
+    name: 'B',
+    weekdays: [((dayBase.getDay() + 6) % 7) as Weekday],
+    startTime: fiveFourHhmm(new Date(dayBase.getTime() + 30 * 60_000)),
+    endTime: fiveFourHhmm(bEnd),
+    enabled: true,
+    domains: ['y.com'],
+  };
+  seedFiveFourConfig([a, b]);
+  const tMid = dayBase.getTime() + 29 * 60_000;
+  const tBoundary = dayBase.getTime() + 30 * 60_000;
+  jest.setSystemTime(tMid);
+  driveClock(tMid); // baseline: x.com only
+  await flushMicrotasks();
+  shellNative.writeHosts.mockClear();
+
+  jest.setSystemTime(tBoundary);
+  driveClock(tBoundary);
+  await flushMicrotasks();
+
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const lines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  expect(lines).not.toContain('0.0.0.0 x.com');
+  expect(lines).toContain('0.0.0.0 y.com');
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Schedule windows changed — blocklist updated.',
+    tone: 'info',
+  });
+});
+
+// One-attempt policy: an admin DENY advances the baseline — the next tick
+// must NOT retry (no prompt spam; drift banner owns the failure surface).
+test('5.4 — a denied transition write advances the baseline and never retries', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tBefore = dayBase.getTime() - 60_000;
+  const tOpen = dayBase.getTime();
+  jest.setSystemTime(tBefore);
+  driveClock(tBefore);
+  await flushMicrotasks();
+
+  shellNative.writeHosts.mockResolvedValueOnce({ ok: false, error: 'admin-denied' });
+  jest.setSystemTime(tOpen);
+  driveClock(tOpen);
+  await flushMicrotasks();
+
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: "Couldn't update /etc/hosts. No changes made.",
+    tone: 'error',
+  });
+
+  // The next tick recomputes the SAME lines as the (advanced) baseline -> skip.
+  jest.setSystemTime(tOpen + 30_000);
+  driveClock(tOpen + 30_000);
+  await flushMicrotasks();
+
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1); // no retry
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// One-attempt policy, throw path: the write THROWS -> envelope result, the
+// failure toast, applyStatus back to idle, baseline advanced (no retry).
+test('5.4 — a thrown hosts write advances the baseline, toasts, and never retries', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tBefore = dayBase.getTime() - 60_000;
+  const tOpen = dayBase.getTime();
+  jest.setSystemTime(tBefore);
+  driveClock(tBefore);
+  await flushMicrotasks();
+
+  const spy = jest
+    .spyOn(shellRunner, 'writeHosts')
+    .mockRejectedValue(new Error('osascript exploded'));
+  try {
+    jest.setSystemTime(tOpen);
+    driveClock(tOpen);
+    await flushMicrotasks();
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(useDomainStore.getState().lastResult).toStrictEqual({
+      ok: false,
+      error: 'hosts-throw:Error: osascript exploded',
+    });
+    expect(useDomainStore.getState().toast).toStrictEqual({
+      message: "Couldn't update /etc/hosts. No changes made.",
+      tone: 'error',
+    });
+    expect(useDomainStore.getState().applyStatus).toBe('idle');
+
+    // The next tick recomputes the SAME lines as the (advanced) baseline —
+    // no retry. (Asserted while the spy is still installed; the spy
+    // intercepts the store's shellRunner call, so the count lives on the spy.)
+    jest.setSystemTime(tOpen + 30_000);
+    driveClock(tOpen + 30_000);
+    await flushMicrotasks();
+    expect(spy).toHaveBeenCalledTimes(1); // no retry
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+// Design rule: a committed-changing path already wrote hosts, so a stale
+// baseline refreshes SILENTLY — the next tick writes nothing.
+test('5.4 — a committed change refreshes the baseline silently (no write)', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tMid = dayBase.getTime() + 30 * 60_000;
+  const tLater = dayBase.getTime() + 45 * 60_000;
+  jest.setSystemTime(tMid);
+  driveClock(tMid); // baseline set with config #1 (inside the window)
+  await flushMicrotasks();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+
+  // A committed-changing path (here: an Apply-equivalent setState with a NEW
+  // config object carrying the same effective lines).
+  seedFiveFourConfig([makeFiveFourSchedule(60, { id: 's-2', name: 'Renamed' })]);
+  const config2 = useDomainStore.getState().committed;
+
+  jest.setSystemTime(tLater);
+  driveClock(tLater);
+  await flushMicrotasks();
+
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(useDomainStore.getState().committed).toBe(config2);
+});
+
+// Action contract: skip-if-equal — a direct call whose queue-time recompute
+// equals the baseline returns no-transition and touches nothing.
+test('5.4 action — skip-if-equal returns no-transition with zero side effects', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tOpen = dayBase.getTime();
+  jest.setSystemTime(tOpen);
+  driveClock(tOpen); // baseline = the open-window lines
+  await flushMicrotasks();
+  shellNative.writeHosts.mockClear();
+  useDomainStore.setState({ toast: null });
+
+  const result = await useDomainStore
+    .getState()
+    .applyScheduleTransitions({ started: ['Deep Work'], ended: [] });
+
+  expect(result).toStrictEqual({ ok: false, error: 'no-transition' });
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// Action contract: a direct call with a real transition does the hosts-only
+// write itself — one write, the pinned toast, committed unchanged.
+test('5.4 action — a direct call writes hosts-only and toasts the started copy', async () => {
+  jest.useFakeTimers();
+  const config = seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tBefore = dayBase.getTime() - 60_000;
+  const tOpen = dayBase.getTime();
+  jest.setSystemTime(tBefore);
+  driveClock(tBefore); // baseline: window closed, lines without x.com
+  await flushMicrotasks();
+
+  // The action recomputes lines at QUEUE-RUN time with `new Date()` — move
+  // the wall clock into the window so the recompute sees the open window.
+  jest.setSystemTime(tOpen);
+  const result = await useDomainStore
+    .getState()
+    .applyScheduleTransitions({ started: ['Deep Work'], ended: [] });
+
+  expect(result).toStrictEqual({ ok: true });
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const lines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  expect(lines).toContain('0.0.0.0 x.com');
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().committed).toBe(config);
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Schedule "Deep Work" started — domains now blocked.',
+    tone: 'info',
+  });
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// --- Story 5.4 step-04 review patches (P1/P2/P3) ---
+
+// P1: the ACTION-side queue-race branch — a committed change landing BETWEEN
+// the detection tick and the action's queue-run (the exact shape of a
+// committed-changing path settling while a transition write sits queued).
+// Every sibling test keeps `committed` reference-identical across that gap;
+// this one does not.
+test('5.4 action — a committed change before the queue-run refreshes the baseline silently (no-transition)', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tBefore = dayBase.getTime() - 60_000;
+  jest.setSystemTime(tBefore);
+  driveClock(tBefore); // detection tick sets the baseline with config #1
+  await flushMicrotasks();
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+
+  // An Apply-equivalent committed change: a NEW config object (as an Apply
+  // would leave behind), landing BEFORE the action's queue-run.
+  seedFiveFourConfig([makeFiveFourSchedule(60, { id: 's-2', name: 'Renamed' })]);
+  const config2 = useDomainStore.getState().committed;
+
+  const result = await useDomainStore
+    .getState()
+    .applyScheduleTransitions({ started: [], ended: [] });
+
+  // Stale committedRef -> silent refresh, NO write, NO prompt, NO toast.
+  expect(result).toStrictEqual({ ok: false, error: 'no-transition' });
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+  expect(useDomainStore.getState().committed).toBe(config2);
+
+  // The baseline was refreshed (not left stale): a follow-up direct call
+  // whose queue-time recompute equals the refreshed baseline no-ops too.
+  const again = await useDomainStore
+    .getState()
+    .applyScheduleTransitions({ started: [], ended: [] });
+  expect(again).toStrictEqual({ ok: false, error: 'no-transition' });
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+});
+
+// P2: a backwards clock (NTP correction) must not drive a spurious write
+// from the inverted measurement window — with an unchanged payload it is a
+// plain steady tick (window reset, no write, no toast).
+test('5.4 — a backwards clock tick with an unchanged payload writes nothing', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tMid = dayBase.getTime() + 30 * 60_000; // inside the window
+  jest.setSystemTime(tMid);
+  driveClock(tMid); // baseline: window open, x.com lines
+  await flushMicrotasks();
+  shellNative.writeHosts.mockClear();
+  useDomainStore.setState({ toast: null });
+
+  // Jump the clock BACK, still inside the open window (payload unchanged).
+  // With the backwards guard the measurement window resets and the tick goes
+  // through the normal steady path — the same no-op a forward steady tick
+  // is: no write, no prompt, no toast, no spurious flip names.
+  jest.setSystemTime(dayBase.getTime() + 1 * 60_000);
+  driveClock(dayBase.getTime() + 1 * 60_000);
+  await flushMicrotasks();
+
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// P3: a throw inside the clock-trigger's evaluation must never escape into
+// the clock driver's interval tick (an uncaught exception per second with
+// the transition loop silently dead) — and the next good tick recovers.
+test('5.4 — a throwing evaluation is contained by the trigger and the next good tick recovers', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tOpen = dayBase.getTime();
+  jest.setSystemTime(tOpen);
+  driveClock(tOpen); // baseline set with the window open
+  await flushMicrotasks();
+  shellNative.writeHosts.mockClear();
+
+  // The simplest honest construction: spy the evaluator module so the
+  // trigger's own recompute throws (the same module-namespace spy the
+  // hosts-throw tests use for `shellRunner.writeHosts`).
+  const spy = jest
+    .spyOn(effectiveBlocklistModule, 'effectiveHostsLines')
+    .mockImplementation(() => {
+      throw new Error('eval exploded');
+    });
+  try {
+    expect(() => {
+      jest.setSystemTime(dayBase.getTime() + 61 * 60_000);
+      driveClock(dayBase.getTime() + 61 * 60_000); // past the window end
+    }).not.toThrow();
+    await flushMicrotasks();
+    // No write fired from the broken tick.
+    expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  } finally {
+    spy.mockRestore();
+  }
+
+  // The next GOOD tick recovers: the window has ended, the payload diff is
+  // real -> ONE hosts-only write. The flip lists are empty (the boundary
+  // crossed during the BROKEN tick, whose window was reset by the catch), so
+  // the toast degrades to the generic copy — exactly the documented
+  // multi-second-jump degradation.
+  jest.setSystemTime(dayBase.getTime() + 62 * 60_000);
+  driveClock(dayBase.getTime() + 62 * 60_000);
+  await flushMicrotasks();
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  const lines = shellNative.writeHosts.mock.calls[0][0] as string[];
+  expect(lines).not.toContain('0.0.0.0 x.com');
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Schedule windows changed — blocklist updated.',
+    tone: 'info',
+  });
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// P5 (step-04): a direct caller handing over a malformed change object must
+// not turn a SUCCESSFUL hosts write into a hosts-throw envelope — the change
+// is normalised before toast selection, so the write succeeds with the
+// generic copy.
+test('5.4 action — a malformed change object still writes successfully with the generic toast', async () => {
+  jest.useFakeTimers();
+  seedFiveFourConfig([makeFiveFourSchedule(60)]);
+  const tBefore = dayBase.getTime() - 60_000;
+  jest.setSystemTime(tBefore);
+  driveClock(tBefore); // baseline: window closed, lines without x.com
+  await flushMicrotasks();
+
+  // Queue-run with the wall clock inside the window: the lines differ from
+  // the baseline, so the write proceeds — and the malformed change (null
+  // started, missing ended) must survive toast selection.
+  jest.setSystemTime(dayBase.getTime());
+  const result = await useDomainStore
+    .getState()
+    .applyScheduleTransitions({
+      started: null,
+      ended: undefined,
+    } as unknown as Parameters<
+      ReturnType<typeof useDomainStore.getState>['applyScheduleTransitions']
+    >[0]);
+
+  expect(result).toStrictEqual({ ok: true });
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts.mock.calls[0][0]).toContain('0.0.0.0 x.com');
+  // The generic copy (no well-formed flip names to speak), NOT a failure
+  // toast and NOT a hosts-throw envelope from a post-write throw.
+  expect(useDomainStore.getState().toast).toStrictEqual({
+    message: 'Schedule windows changed — blocklist updated.',
+    tone: 'info',
+  });
+  expect(useDomainStore.getState().lastResult).toStrictEqual({ ok: true });
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
 });

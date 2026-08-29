@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-14-2026 00:19
-last_updated: 08-29-2026  # 5-3 done
+last_updated: 08-29-2026  # 5-4 done
 
 project: Frosthalt
 project_key: NOKEY
@@ -76,7 +76,7 @@ development_status:
   5-1-schedule-surface-with-enable-toggle-and-summary: done
   5-2-schedule-editor-sheet: done
   5-3-active-window-blocking-schedule-in-effective-blocklist: done
-  5-4-live-schedule-transitions-while-app-running: backlog
+  5-4-live-schedule-transitions-while-app-running: done
   5-5-schedule-enable-disable-and-removal-confirm-alert-not-passwo: backlog
   epic-5-retrospective: optional
 

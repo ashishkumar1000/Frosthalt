@@ -1945,9 +1945,10 @@ test('the status header shows the Blocked badge and a live mm:ss countdown while
   // Exactly 5 minutes remaining at the seeded clock -> "05:00".
   expect(text).toContain('05:00');
 
-  // The header owns the slice lifecycle: exactly ONE driver, mirroring the
-  // session end — and it ticks with the header mounted on surface 0.
-  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+  // The header owns the slice lifecycle: exactly ONE timer driver, mirroring
+  // the session end — and it ticks with the header mounted on surface 0.
+  // (Story 5.4 adds the header's unconditional clock driver: two intervals.)
+  expect(setIntervalSpy).toHaveBeenCalledTimes(2);
   expect(useTimerStore.getState().endEpochMs).toBe(
     1_756_000_000_000 + 5 * 60_000,
   );

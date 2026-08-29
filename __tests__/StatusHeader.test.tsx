@@ -31,6 +31,19 @@
  *     text content, so a static label would never speak the time) — and the
  *     header emits NO announce on ticks or minute rollovers (the Timer
  *     surface owns those, UX-DR17).
+ *
+ * Story 5.4 additions: the header now also OWNS the scoped clock slice
+ * (`useClockStore`) — an unconditional `start()` on mount / `stop()` on
+ * cleanup — and the badge/count are driven by the clock mirror:
+ *
+ *   - Mount starts the CLOCK driver too (one extra `setInterval` on top of
+ *     the timer slice's): the interval-count assertions below pin 2 during a
+ *     live session (timer + clock) and 1 with no session (clock only).
+ *   - The badge ramps across a schedule boundary while the app runs: driving
+ *     `useClockStore`'s `nowMs` through a window boundary flips the badge
+ *     Free -> Blocking(amber) -> Blocked with NO `committed` change and no
+ *     Apply — and the module-level transition trigger fires exactly ONE
+ *     hosts-only write (config.json never touched) for the same boundary.
  */
 
 jest.mock('../src/native/specs/NativeConfigStoreSpec', () => ({
@@ -55,10 +68,17 @@ import { AccessibilityInfo } from 'react-native';
 import { StatusHeader } from '../src/components/StatusHeader';
 import { Timer } from '../src/components/Timer';
 import { useDomainStore } from '../src/domain/store';
+import { useClockStore } from '../src/domain/clockStore';
 import { useTimerStore, selectRemainingMs } from '../src/domain/timerStore';
 import { tokens } from '../src/theme/tokens';
 import { DEFAULT_CONFIG } from '../src/config/types';
-import type { ActiveTimer, Config, Domain } from '../src/config/types';
+import type {
+  ActiveTimer,
+  Config,
+  Domain,
+  Schedule,
+  Weekday,
+} from '../src/config/types';
 
 const announceForAccessibility =
   AccessibilityInfo.announceForAccessibility as unknown as jest.Mock;
@@ -96,6 +116,18 @@ function findNumeral(
 /** Locates the CountdownRing instances by their `progress` prop. */
 function findRings(root: ReactTestRenderer.ReactTestInstance) {
   return root.findAll((node) => node.props && 'progress' in node.props);
+}
+
+/** Locates the StatusBadge by its `Status: ...` accessibility label. */
+function findBadge(
+  root: ReactTestRenderer.ReactTestInstance,
+): ReactTestRenderer.ReactTestInstance | undefined {
+  return root.findAll(
+    (node) =>
+      node.props &&
+      typeof node.props.accessibilityLabel === 'string' &&
+      node.props.accessibilityLabel.startsWith('Status:'),
+  )[0];
 }
 
 /** Locates the "View hosts" link by its contract props. */
@@ -156,9 +188,25 @@ afterEach(() => {
   useTimerStore.getState().stop();
   useTimerStore.setState({ nowMs: 0, endEpochMs: null, totalMs: null });
   // Reset the domain store to the empty baseline so no committed seed leaks.
+  // (This runs BEFORE the clock reset below: the store's module-level 5.4
+  // transition trigger reads `committed` on every clock-slice change, so the
+  // baseline must refresh against the clean config first.)
   ReactTestRenderer.act(() => {
-    useDomainStore.setState({ committed: { ...DEFAULT_CONFIG }, staged: null });
+    useDomainStore.setState({
+      committed: { ...DEFAULT_CONFIG },
+      staged: null,
+      // Story 5.4 — a boundary drive in one test can leave a transition
+      // toast behind; reset it so no toast leaks into the next test.
+      toast: null,
+    });
   });
+  // Story 5.4 — the same defensive reset for the scoped CLOCK slice: the
+  // header's mount holds one refcount slot, so unmount + spare stops force
+  // the module-level refcount back to 0 before the state reset. Against the
+  // clean DEFAULT_CONFIG committed these evaluations can never write.
+  useClockStore.getState().stop();
+  useClockStore.getState().stop();
+  useClockStore.setState({ nowMs: 0 });
   if (jest.isMockFunction(setTimeout)) {
     jest.useRealTimers();
   }
@@ -200,8 +248,10 @@ test('no active session renders the Epic-2 form and does NOT start the slice', (
   expect(findNumeral(testRenderer.root)).toBeUndefined();
   expect(findRings(testRenderer.root)).toHaveLength(0);
 
-  // The slice is NOT started by the header: no driver, no mirrored session.
-  expect(setIntervalSpy).not.toHaveBeenCalled();
+  // The TIMER slice is NOT started by the header: no mirrored session. (Since
+  // Story 5.4 the header's unconditional CLOCK driver IS installed at mount —
+  // exactly one interval on top of the timer slice's zero.)
+  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
   expect(useTimerStore.getState().endEpochMs).toBeNull();
   expect(selectRemainingMs(useTimerStore.getState())).toBe(0);
   expect(onViewHosts).not.toHaveBeenCalled();
@@ -236,9 +286,10 @@ test('a live session renders Blocked, the mm:ss countdown and the 16x16 ring; on
     '05:00',
   );
 
-  // The slice IS started by the header (exactly one driver) and mirrors the
-  // session end.
-  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+  // The slice IS started by the header and mirrors the session end. Two
+  // intervals total since Story 5.4: the timer slice's driver + the header's
+  // unconditional clock driver.
+  expect(setIntervalSpy).toHaveBeenCalledTimes(2);
   expect(useTimerStore.getState().endEpochMs).toBe(T + 5 * 60_000);
 
   // The 16x16 mini ring with the UX-DR5 colours: `status-blocked` track +
@@ -290,8 +341,9 @@ test('a malformed (NaN) endEpochMs renders the no-session form and never reaches
   expect(text).not.toContain('NaN');
   expect(findNumeral(testRenderer.root)).toBeUndefined();
 
-  // The slice never receives the malformed value: no driver, no mirror.
-  expect(setIntervalSpy).not.toHaveBeenCalled();
+  // The slice never receives the malformed value: no timer driver, no mirror
+  // (the clock driver's single mount interval is separate — Story 5.4).
+  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
   expect(useTimerStore.getState().endEpochMs).toBeNull();
 });
 
@@ -365,9 +417,10 @@ test('an expired-at-mount session renders Blocked + 00:00 with an empty ring, pa
   expect(ring).toBeDefined();
   expect(ring.props.progress).toBe(0);
 
-  // The slice parked immediately: NO tick loop was installed, and time
-  // passage changes nothing (the header re-renders once, not per-second).
-  expect(setIntervalSpy).not.toHaveBeenCalled();
+  // The slice parked immediately: no TIMER tick loop was installed (the
+  // clock driver's one mount interval is the only one — Story 5.4), and time
+  // passage changes the timer nothing.
+  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
   jest.advanceTimersByTime(5000);
   expect(selectRemainingMs(useTimerStore.getState())).toBe(0);
   expect(
@@ -471,10 +524,12 @@ test('the Timer surface and the header co-subscribe to ONE driver; unmounting th
     );
   });
 
-  // Refcount 2, ONE driver: two starts -> two setInterval calls total (the
-  // second start cleared the first driver before re-installing — at most
-  // one interval alive, ever), and NO clearInterval from a stop yet.
-  expect(setIntervalSpy).toHaveBeenCalledTimes(2);
+  // Refcount 2, ONE timer driver: two timer starts -> two timer setInterval
+  // calls (the second cleared the first before re-installing — at most one
+  // timer interval alive, ever). Story 5.4 adds the header's clock driver:
+  // a third setInterval call, with nothing to clear (the clock slice's first
+  // start finds no existing driver).
+  expect(setIntervalSpy).toHaveBeenCalledTimes(3);
   expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
   expect(useTimerStore.getState().endEpochMs).toBe(T + 5 * 60_000);
   expect(
@@ -690,7 +745,8 @@ test('a session expiring while the header is mounted parks the driver: numeral h
   expect(extractText(testRenderer.toJSON())).toContain('Blocked');
   expect(useTimerStore.getState().endEpochMs).toBe(end);
   const intervalsBeforePark = setIntervalSpy.mock.calls.length;
-  expect(intervalsBeforePark).toBe(1);
+  // The timer driver + the header's clock driver (Story 5.4).
+  expect(intervalsBeforePark).toBe(2);
 
   // Advance to (and just past) the end: the driver's tick observes
   // nowMs >= endEpochMs and SELF-PARKS, pinning nowMs AT the end so the
@@ -791,4 +847,192 @@ test('only the header, the Timer surface, the slice itself and the 4.5 expiry tr
     'src/domain/store.ts',
     'src/domain/timerStore.ts',
   ]);
+});
+// ---------------------------------------------------------------------------
+// Story 5.4 — the badge ramp + the live count across a schedule boundary,
+// driven by the scoped clock slice (no `committed` change, no Apply).
+// ---------------------------------------------------------------------------
+
+// A schedule window covering [noon54, noon54 + minutes) on noon54's weekday —
+// derived from the LOCAL clock so the tests are timezone-independent.
+const probe54 = new Date(T);
+const noon54 = new Date(
+  probe54.getFullYear(),
+  probe54.getMonth(),
+  probe54.getDate(),
+  12,
+  0,
+  0,
+  0,
+);
+
+function fiveFourHhmm(d: Date): string {
+  const h = String(d.getHours()).padStart(2, '0');
+  const m = String(d.getMinutes()).padStart(2, '0');
+  return `${h}:${m}`;
+}
+
+function makeFiveFourSchedule(minutes: number): Schedule {
+  const end = new Date(noon54.getTime() + minutes * 60_000);
+  return {
+    id: 's-header-5-4',
+    name: 'Deep Work',
+    weekdays: [((noon54.getDay() + 6) % 7) as Weekday],
+    startTime: fiveFourHhmm(noon54),
+    endTime: fiveFourHhmm(end),
+    enabled: true,
+    domains: ['x.com'],
+  };
+}
+
+function seedFiveFourCommitted(schedules: Schedule[]): void {
+  ReactTestRenderer.act(() => {
+    useDomainStore.setState({
+      committed: { ...DEFAULT_CONFIG, domains: [], schedules, activeTimer: null },
+      staged: null,
+      applyStatus: 'idle',
+      lastResult: null,
+      drift: null,
+    });
+  });
+}
+
+test('a schedule window opening live flips the badge Free -> Blocked, bumps the count, and fires ONE hosts-only write', async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(noon54.getTime() - 60_000); // 11:59 — window closed
+  const configNative = (
+    require('../src/native/specs/NativeConfigStoreSpec') as {
+      default: { writeConfig: jest.Mock };
+    }
+  ).default;
+  const shellNative = (
+    require('../src/native/specs/NativeShellRunnerSpec') as {
+      default: { writeHosts: jest.Mock };
+    }
+  ).default;
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+  seedFiveFourCommitted([makeFiveFourSchedule(60)]);
+
+  const testRenderer = renderHeader();
+  // Before the boundary: the Epic-2 Free form, 0 domains.
+  expect(findBadge(testRenderer.root)!.props.accessibilityLabel).toBe(
+    'Status: Free',
+  );
+  expect(extractText(testRenderer.toJSON())).toContain('0 domains');
+
+  // Drive the clock slice straight through the boundary (12:00): no
+  // `committed` change, no Apply — only the clock mirror moves.
+  // The inline drain loop is the per-file twin of store.test.ts's
+  // `flushMicrotasks(rounds)` helper — jest collects every __tests__ file as
+  // a suite, so the helper cannot be shared across files.
+  await ReactTestRenderer.act(async () => {
+    jest.setSystemTime(noon54.getTime());
+    useClockStore.setState({ nowMs: noon54.getTime() });
+    for (let i = 0; i < 8; i++) {
+      await Promise.resolve();
+    }
+  });
+
+  // The badge flipped live (the count's memo deps include nowMs) and the
+  // count followed the window with no Apply in between.
+  expect(findBadge(testRenderer.root)!.props.accessibilityLabel).toBe(
+    'Status: Blocked',
+  );
+  expect(extractText(testRenderer.toJSON())).toContain('1 domain');
+  expect(extractText(testRenderer.toJSON())).not.toContain('0 domains');
+  // The same boundary tick fired the store's transition trigger: exactly ONE
+  // hosts write, and config.json is NEVER touched by a transition.
+  expect(shellNative.writeHosts).toHaveBeenCalledTimes(1);
+  expect(shellNative.writeHosts.mock.calls[0][0]).toContain('0.0.0.0 x.com');
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+});
+
+test('ending-soon (amber) renders with NO write when the window is already reflected in /etc/hosts', async () => {
+  jest.useFakeTimers();
+  // Mount INSIDE the window (12:30): the header's first clock evaluation sets
+  // the transition baseline with the window already open — ZERO writes.
+  jest.setSystemTime(noon54.getTime() + 30 * 60_000);
+  const configNative = (
+    require('../src/native/specs/NativeConfigStoreSpec') as {
+      default: { writeConfig: jest.Mock };
+    }
+  ).default;
+  const shellNative = (
+    require('../src/native/specs/NativeShellRunnerSpec') as {
+      default: { writeHosts: jest.Mock };
+    }
+  ).default;
+  configNative.writeConfig.mockClear();
+  shellNative.writeHosts.mockClear();
+  seedFiveFourCommitted([makeFiveFourSchedule(60)]);
+
+  const testRenderer = renderHeader();
+  expect(extractText(testRenderer.toJSON())).toContain('Blocked');
+
+  // Zero-port-write at mount: the first clock evaluation only sets the
+  // baseline (the spec's FIRST-evaluation rule) — nothing is written.
+  // (Inline drain loop — the per-file twin of store.test.ts's
+  // `flushMicrotasks(rounds)`; see the boundary test above.)
+  await ReactTestRenderer.act(async () => {
+    for (let i = 0; i < 8; i++) {
+      await Promise.resolve();
+    }
+  });
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(configNative.writeConfig).not.toHaveBeenCalled();
+
+  // 12:55 — five minutes to the end, inside SCHEDULE_ENDING_SOON_MS, and the
+  // boundary would shrink the blocklist (x.com lifts at 13:00): amber.
+  await ReactTestRenderer.act(async () => {
+    jest.setSystemTime(noon54.getTime() + 55 * 60_000);
+    useClockStore.setState({ nowMs: noon54.getTime() + 55 * 60_000 });
+    for (let i = 0; i < 8; i++) {
+      await Promise.resolve();
+    }
+  });
+  expect(findBadge(testRenderer.root)!.props.accessibilityLabel).toBe(
+    'Status: Blocking',
+  );
+  expect(extractText(testRenderer.toJSON())).toContain('1 domain');
+  // No transition: the lines are unchanged from the baseline, so the trigger
+  // skipped entirely — no write, no prompt, no toast.
+  expect(shellNative.writeHosts).not.toHaveBeenCalled();
+  expect(useDomainStore.getState().toast).toBeNull();
+  expect(useDomainStore.getState().applyStatus).toBe('idle');
+});
+
+// ---------------------------------------------------------------------------
+// P11 (step-04) — the clock lifecycle's explicit unmount-refcount test: the
+// timer slice has one; the clock lifecycle's cleanup deserves the same pin.
+// ---------------------------------------------------------------------------
+
+test('unmounting the header releases its clock-driver slot: the driver clears, a spare stop is a true no-op', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(T);
+  const setIntervalSpy = jest.spyOn(globalThis, 'setInterval');
+  const clearIntervalSpy = jest.spyOn(globalThis, 'clearInterval');
+  seedState({});
+
+  const testRenderer = renderHeader();
+  // No session: the clock driver is the ONLY interval the mount installed.
+  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+  const clearsBefore = clearIntervalSpy.mock.calls.length;
+
+  // Unmount (the timer-slice unmount test's technique): the cleanup runs the
+  // clock slice's stop() — the header held the only slot, so refcount hits 0,
+  // the driver is cleared and the mirror parks at the wall clock.
+  ReactTestRenderer.act(() => {
+    testRenderer.unmount();
+  });
+  currentRenderer = null; // afterEach must not try to unmount again
+  expect(clearIntervalSpy).toHaveBeenCalledTimes(clearsBefore + 1);
+  expect(useClockStore.getState().nowMs).toBe(Date.now());
+
+  // The slot is GONE (not merely paused): a subsequent unpaired stop is a
+  // true no-op — no further clearInterval, no spurious mirror re-sync.
+  const parked = useClockStore.getState().nowMs;
+  useClockStore.getState().stop();
+  expect(clearIntervalSpy).toHaveBeenCalledTimes(clearsBefore + 1);
+  expect(useClockStore.getState().nowMs).toBe(parked);
 });

@@ -392,7 +392,9 @@ test('launch resume: a persisted FUTURE session re-arms the countdown from disk 
   // duration as the ring total (ring starts full — the documented 4.7 defer).
   expect(launch.useTimerStore.getState().endEpochMs).toBe(end);
   expect(launch.useTimerStore.getState().totalMs).toBe(5 * 60_000);
-  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+  // Two intervals since Story 5.4: the timer slice's re-arm driver + the
+  // header's unconditional clock driver.
+  expect(setIntervalSpy).toHaveBeenCalledTimes(2);
 
   // The countdown TICKS.
   ReactTestRenderer.act(() => {
@@ -589,8 +591,9 @@ test('launch with a malformed (string) endEpochMs: fail-safe — no crash, no sl
   expect(text).not.toContain('Blocked');
   expect(findNumeral(testRenderer.root)).toBeUndefined();
 
-  // The slice never started: no driver, no mirror, no park.
-  expect(setIntervalSpy).not.toHaveBeenCalled();
+  // The slice never started: no TIMER driver, no mirror, no park (the clock
+  // driver's single mount interval is separate — Story 5.4).
+  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
   expect(launch.useTimerStore.getState().endEpochMs).toBeNull();
 
   await drainQueue();
@@ -645,8 +648,9 @@ test('launch with a persisted null endEpochMs (the NaN-via-JSON variant): fail-s
   expect(text).not.toContain('Blocked');
   expect(findNumeral(testRenderer.root)).toBeUndefined();
 
-  // The slice never started: no driver, no mirror, no park.
-  expect(setIntervalSpy).not.toHaveBeenCalled();
+  // The slice never started: no TIMER driver, no mirror, no park (the clock
+  // driver's single mount interval is separate — Story 5.4).
+  expect(setIntervalSpy).toHaveBeenCalledTimes(1);
   expect(launch.useTimerStore.getState().endEpochMs).toBeNull();
 
   await drainQueue();
