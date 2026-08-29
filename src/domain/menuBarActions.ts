@@ -6,7 +6,7 @@
  * `menuBarMirror.ts`), not a React component: the menu-bar item clicks arrive
  * as native events and need a lifetime-long handler set, not a hook.
  * `startMenuBarActions()` (called once from `App.tsx`'s mount effect, right
- * after `initializeMenuBar()` / `startMenuBarMirror()`) subscribes to the two
+ * after `initializeMenuBar()` / `startMenuBarMirror()`) subscribes to the
  * actionable events and never returns.
  *
  *   - `onQuickStart` — "Start 25-min focus": reuses the EXISTING Epic 4 start
@@ -35,18 +35,44 @@
  *     listeners (the 6.1 contract).
  *
  *   - `onQuit` — "Quit": routes to the native `quitApp()` adapter so the
- *     termination decision lives in JS. STORY 6.5 FORWARD-REFERENCE: the
- *     quit-CONFIRM dialog (⌘Q with a live session, Esc to cancel) extends
- *     THIS handler — an unconditional quit stays correct until then; the
- *     handler below is where the confirm-before-quit lands.
+ *     quit ENTRY lives in JS. Since 6.5 this is not the destination — the
+ *     dispatched `NSApp.terminate` funnels through the native
+ *     `applicationShouldTerminate:` gate right back into `onQuitRequested`
+ *     below, one path shared with ⌘Q / Dock / the storyboard Quit item.
+ *
+ *   - `onQuitRequested` (Story 6.5) — the quit-confirm DECISION. Native has
+ *     already cancelled every un-confirmed quit and asks here. The gate is
+ *     live session ONLY (`committed.activeTimer != null` with a finite
+ *     `endEpochMs` — the Timer.tsx normalisation; `applyStatus === 'running'`
+ *     does NOT trigger the confirm — 6.3's apply pipeline writes hosts
+ *     atomically, so a mid-Apply quit leaves hosts consistent):
+ *
+ *       - no live session -> native `confirmQuit()` immediately: the
+ *         terminate resumes with no dialog and NO window fronting (⌘Q never
+ *         flashes the window to dismiss it).
+ *       - live session -> native `presentQuitConfirm()` (front the RN window
+ *         so the `Alert.alert` sheet — a sheet on that window — is visible
+ *         even when it was closed to the menu bar), then the repo's standard
+ *         two-button confirm `Alert.alert` (Blocklist.tsx / Schedule.tsx
+ *         shape): `Cancel` style `cancel` first, `Quit` style `destructive`.
+ *         Cancel/Esc (the native sheet maps Esc to the cancel button — no JS
+ *         keyboard listener) keeps the app alive; Quit resets the pending
+ *         guard and calls `confirmQuit()`.
+ *
+ *     A module-level staleness-windowed `quitDialogPendingSince` guard makes a
+ *     duplicate terminate
+ *     attempt while the dialog is open a no-op (no second dialog; the second
+ *     attempt simply cancels inside the gate) and the guard resets on BOTH
+ *     buttons, so the gate re-arms for a later ⌘Q.
  *
  * Dependency direction (the 6.2 rule): this module imports `store.ts` and the
  * native adapter one-way — `store.ts` does not import this, the UI never
  * imports it (`App.tsx` is the only starter), so there is no cycle.
  */
 
+import { Alert } from 'react-native';
 import NativeMenuBar from '../native/specs/NativeMenuBarSpec';
-import { quitApp } from '../native/menuBar';
+import { confirmQuit, presentQuitConfirm, quitApp } from '../native/menuBar';
 import { useDomainStore } from './store';
 import { PRESET_MINUTES } from './timerPresets';
 
@@ -102,6 +128,112 @@ function handleQuickStart(): void {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Quit gate (Story 6.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The quit-confirm confirm copy — plain and factual (state the situation and
+ * the choice; the epic-6 UX rule: no dramatization), in the two-button shape
+ * Blocklist.tsx / Schedule.tsx use.
+ */
+const QUIT_CONFIRM_TITLE = 'Quit Frosthalt?';
+const QUIT_CONFIRM_BODY =
+  'A focus session is running. The session ends if the app quits.';
+
+/**
+ * When the quit-confirm dialog went up, or null while it is down. A
+ * module-level STALENESS-WINDOWED GUARD (the mirror image of native's
+ * terminate flag): a second terminate attempt arriving mid-dialog (double
+ * ⌘Q) lands back in `handleQuitRequested` after the gate re-armed — within
+ * the window this makes that attempt a no-op (no second dialog, no double
+ * `confirmQuit()`), not a confirmation loop. Reset on BOTH buttons so the
+ * gate re-arms for whichever way the dialog closes.
+ *
+ * The window exists because the dialog is not guaranteed to end through a
+ * button: the sheet dies un-pressed if the window closes mid-dialog (⌘W) or
+ * the system dismisses it. A plain boolean would stay pending forever and
+ * every later quit would be a silent no-op — so a request arriving after
+ * `QUIT_DIALOG_STALE_MS` is treated as an orphaned guard: reset and
+ * re-show, never brick.
+ */
+const QUIT_DIALOG_STALE_MS = 10_000;
+let quitDialogPendingSince: number | null = null;
+
+/**
+ * The quit-requested handler — native has cancelled an un-confirmed quit and
+ * asked JS for the verdict. Reads the store via `useDomainStore.getState()`
+ * at EVENT time (never cached), decides confirm-vs-go:
+ *
+ *   - duplicate attempt mid-dialog (fresh request) -> no-op (the pending
+ *     guard);
+ *   - stale-pending (the dialog died without a button press) -> orphaned
+ *     guard: reset and re-show;
+ *   - no live session -> `confirmQuit()` directly: resume the terminate with
+ *     NO dialog and NO window fronting (no flash);
+ *   - live session -> `presentQuitConfirm()` (front the RN window — a sheet
+ *     on an ordered-out window is invisible) THEN the confirm `Alert.alert`.
+ *
+ * The gate is live session ONLY (`applyStatus === 'running'` is deliberately
+ * not a gate: 6.3's apply pipeline writes hosts atomically, so a mid-Apply
+ * quit cannot leave hosts torn — the 6.3 matrix).
+ */
+function handleQuitRequested(): void {
+  if (
+    quitDialogPendingSince != null &&
+    Date.now() - quitDialogPendingSince < QUIT_DIALOG_STALE_MS
+  ) {
+    return;
+  }
+  quitDialogPendingSince = null;
+  const { committed } = useDomainStore.getState();
+  // The SAME liveness normalisation Timer.tsx:191-196 applies
+  // (`activeTimer != null && Number.isFinite(endEpochMs)`), so a malformed
+  // persisted `endEpochMs` cannot hold an idle app hostage behind a confirm
+  // dialog (and never masks a live session as idle).
+  const rawEndEpochMs = committed.activeTimer?.endEpochMs ?? null;
+  const hasActiveTimer =
+    committed.activeTimer != null &&
+    rawEndEpochMs != null &&
+    Number.isFinite(rawEndEpochMs);
+  if (!hasActiveTimer) {
+    // No dialog, no window flash: set the confirm flag and resume the
+    // terminate natively.
+    confirmQuit();
+    return;
+  }
+  quitDialogPendingSince = Date.now();
+  // Front the window BEFORE the alert: the RN alert presents as a sheet on
+  // the RN window, which is invisible while that window is closed to the
+  // menu bar. (Deliberately SKIPPED on the no-timer path above.)
+  presentQuitConfirm();
+  Alert.alert(QUIT_CONFIRM_TITLE, QUIT_CONFIRM_BODY, [
+    // Cancel first, style 'cancel' — Esc maps to the native sheet's cancel
+    // button (the Blocklist/Schedule pattern): no new JS keyboard listener.
+    // NOT isPreferred — quitting is never the default (epic-6 a11y floor).
+    {
+      text: 'Cancel',
+      style: 'cancel',
+      onPress: () => {
+        quitDialogPendingSince = null;
+        // Cancelled: stay alive. The native gate already re-armed (its
+        // terminate was returned as cancelled), so a later ⌘Q re-asks.
+      },
+    },
+    {
+      text: 'Quit',
+      style: 'destructive',
+      onPress: () => {
+        quitDialogPendingSince = null;
+        // The confirmed terminate: flag set natively, then NSApp.terminate —
+        // the delegate consumes it and the 6.4 willTerminate frame flush
+        // still runs (confirmQuit never exits by force).
+        confirmQuit();
+      },
+    },
+  ]);
+}
+
 /** Installed-once guard: a second `startMenuBarActions()` is a no-op. */
 let started = false;
 
@@ -118,11 +250,16 @@ export function startMenuBarActions(): void {
   }
   started = true;
   NativeMenuBar.onQuickStart(handleQuickStart);
-  // Story 6.5 lands its confirm before this call site — today it is an
-  // unconditional quit (the store/apply pipeline's own atomicity leaves
-  // hosts consistent if an Apply is mid-run when the app exits). The body
-  // status must be `void` (the emitter's handler signature), so the
-  // `{ok,error?}` envelope is dropped — quit has no JS-side UI to report to.
+  // Story 6.5 — every un-confirmed quit (⌘Q, Dock, the storyboard Quit, and
+  // the `quitApp()` entry below all funnel through the native
+  // `applicationShouldTerminate:` gate) lands here; THIS is where the quit
+  // confirm decision lives.
+  NativeMenuBar.onQuitRequested(handleQuitRequested);
+  // The menu-bar "Quit" click is just a quit ENTRY: `quitApp()` dispatches
+  // `NSApp.terminate`, which rides the same gate into `onQuitRequested`
+  // above. The body status must be `void` (the emitter's handler signature),
+  // so the `{ok,error?}` envelope is dropped — quit has no JS-side UI to
+  // report to.
   NativeMenuBar.onQuit(() => {
     quitApp();
   });

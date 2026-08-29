@@ -91,14 +91,36 @@ export interface Spec extends TurboModule {
 
   /**
    * Quits the app: dispatches `NSApp.terminate(nil)` onto the main thread
-   * (Story 6.3). The JS "Quit" handler (`src/domain/menuBarActions.ts`) calls
-   * this — the decision to stay or go lives in JS so Story 6.5 can insert its
-   * confirm dialog before the call; by the time native sees `quit()` the
-   * decision is made. Fire-and-forget: the termination is dispatched (this
-   * method may be called from the JSI thread) and always returns
-   * `{ ok: true }` — no condition on this story's path makes it fail.
+   * (Story 6.3). Since Story 6.5 this is just a quit ENTRY: `NSApp.terminate`
+   * rides through `applicationShouldTerminate:` (AppDelegate.mm), which
+   * consults the JS-side quit gate (`onQuitRequested`) — the confirm decision
+   * lives in JS, exactly as 6.3 anticipated. Fire-and-forget: the termination
+   * is dispatched (this method may be called from the JSI thread) and always
+   * returns `{ ok: true }` — no condition on this story's path makes it fail.
    */
   quit(): MenuBarResult;
+
+  /**
+   * Story 6.5 — resumes a quit the native gate deferred: sets the native
+   * terminate-confirm flag and dispatches `NSApp.terminate(nil)` on the main
+   * thread, so the delegate's `applicationShouldTerminate:` sees the flag,
+   * consumes it (reset — the gate re-arms for the next attempt) and returns
+   * terminate. The ONLY sanctioned continuation of a quit, and the only
+   * caller is the `onQuitRequested` handler — the decision lives in JS, this
+   * is the "go" leg. Fire-and-forget, always `{ ok: true }` (never `exit()`:
+   * the 6.4 willTerminate frame flush must still run).
+   */
+  confirmQuit(): MenuBarResult;
+
+  /**
+   * Story 6.5 — fronts the main window so the JS `Alert.alert` confirm sheet
+   * (a sheet on the RN window) is visible even when the window was closed to
+   * the menu bar: activate + deminiaturize/order the main window front. MUST
+   * be called only when a dialog is about to show (the no-timer quit path
+   * skips it so ⌘Q never flashes the window). Fire-and-forget, main-thread
+   * dispatched, always `{ ok: true }`.
+   */
+  presentQuitConfirm(): MenuBarResult;
 
   /**
    * Fires with no payload when "Start 25-min focus" is clicked. Since 6.3
@@ -124,11 +146,23 @@ export interface Spec extends TurboModule {
   /**
    * Fires with no payload when "Quit" is clicked. Since 6.3 this is listened
    * by `startMenuBarActions()` (`src/domain/menuBarActions.ts`), which routes
-   * to the native `quit()` above — the quit DECISION lives in JS so Story
-   * 6.5's quit-confirm dialog extends that same JS handler (today the quit is
-   * unconditional once it reaches this event).
+   * to the native `quit()` above — a quit ENTRY: `NSApp.terminate` then runs
+   * the `applicationShouldTerminate:` gate, so the ⌘Q/Dock/menu-item paths
+   * all re-enter JS through `onQuitRequested` below.
    */
   readonly onQuit: CodegenTypes.EventEmitter<void>;
+
+  /**
+   * Story 6.5 — fires with no payload when `applicationShouldTerminate:`
+   * (AppDelegate.mm) defers an un-confirmed quit from ANY source (⌘Q, Dock,
+   * storyboard Quit, the JS `quit()` entry): native has already cancelled the
+   * terminate and asks JS for the verdict. The handler
+   * (`startMenuBarActions`) answers by source of truth: no live session →
+   * native `confirmQuit()` immediately (no dialog, no window fronting); a
+   * live session → native `presentQuitConfirm()` then the two-button
+   * `Alert.alert` (Cancel keeps the app alive; Quit → `confirmQuit()`).
+   */
+  readonly onQuitRequested: CodegenTypes.EventEmitter<void>;
 }
 
 /**

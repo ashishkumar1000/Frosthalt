@@ -39,6 +39,66 @@
   [WindowPersistence attachShared];
 }
 
+// Story 6.5 — close-to-menu-bar: closing the last window (⌘W / the red
+// close button) must NOT terminate the app. RN's default behavior terminates
+// on last-window-close; returning NO keeps the process (and any live timer,
+// plus the 6.1 status item — the surface the app "lives" on with the window
+// closed) alive. The window itself is merely closed, never destroyed: No
+// JS/React-tree teardown, state survives, and "Show window" re-fronts it.
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
+{
+  return NO;
+}
+
+// Story 6.5 — the single arbitration point for EVERY quit source (⌘Q, Dock
+// quit, the storyboard Quit item, and the JS `quit()` entry's dispatched
+// `NSApp.terminate`). Forwarding to the shared MenuBar Swift instance keeps
+// it on the same instance NativeMenuBar.mm wired the emitters + confirm flag
+// on (a separate instance would break the flag-based re-entrancy outright —
+// see the sharedInstance comment in MenuBar.swift). NOTE the Obj-C-visible
+// class name is `NativeMenuBar` (@objc(NativeMenuBar); `MenuBar` is the Swift
+// name, invisible to this file).
+//
+//   - quit already JS-confirmed -> MenuBar consumed the confirm flag, returns
+//     terminate (flag reset — the gate re-arms for the next attempt);
+//   - not confirmed -> MenuBar emits `onQuitRequested` to JS and cancels the
+//     terminate; JS answers with `confirmQuit()` (no live session — quit
+//     immediately, invisibly) or fronts the window + its own confirm Alert;
+//     a later confirm re-enters NSApp.terminate with the flag set.
+//   - fail-open: nil event closure (a quit before JS subscribes) -> MenuBar
+//     returns terminate — a quitting app is never bricked by a missing
+//     bridge.
+//
+// The Bool -> reply enum mapping is EXPLICIT and load-bearing:
+// NSApplicationTerminateReply's numeric values are inverted against Bool
+// (NSTerminateNow = 0, NSTerminateCancel = 1), so returning the raw BOOL
+// would cancel every confirmed quit and terminate every cancelled one.
+//
+// RN's base delegate (RCTAppDelegate.mm) implements NEITHER this selector nor
+// `applicationShouldTerminateAfterLastWindowClosed:` today; on an RN upgrade,
+// re-check whether a base implementation appeared and decide explicitly
+// whether to call super.
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender
+{
+  return [[NativeMenuBar sharedInstance] handleShouldTerminate]
+             ? NSTerminateNow
+             : NSTerminateCancel;
+}
+
+// Story 6.5 review — closes the loop on close-to-menu-bar. Before this story
+// a Dock click could never observe a closed-and-alive app (closing the window
+// quit it); now the app survives, and the standard macOS reopen contract
+// requires a Dock click to bring the window back — otherwise the only way
+// back is the status menu. Same fronting helper the "Show window" item and
+// the quit confirm use, so reopen behaves identically to them (including the
+// deminiaturize/autosave-scan fallbacks).
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender
+                    hasVisibleWindows:(BOOL)visibleFlag
+{
+  [WindowPersistence bringMainWindowToFront];
+  return YES;
+}
+
 - (NSURL *)sourceURLForBridge:(RCTBridge *)bridge
 {
   return [self bundleURL];

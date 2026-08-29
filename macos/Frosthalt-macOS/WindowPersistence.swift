@@ -95,6 +95,14 @@ final class WindowPersistence: NSObject, NSWindowDelegate {
   /// MUST match `maxHeight` in src/domain/windowFrame.ts (1440).
   private static let pinnedMaxHeight: CGFloat = 1440
 
+  /// The frame-autosave name RN's window template assigns the main window.
+  /// Looked up (never assigned) — resolution fallback in `attach()` and
+  /// `bringMainWindowToFront()` when neither mainWindow nor keyWindow
+  /// resolves. One constant, two lookups (the literal used to live in both
+  /// call sites); the comment in `attach()` explains why it is only cleared,
+  /// never re-registered.
+  private static let rctMainWindowAutosaveName = "RCTAppDelegateMainWindow"
+
   // MARK: - Shared singleton
 
   /// The one instance, created by the FIRST `attachShared()` (from
@@ -144,6 +152,45 @@ final class WindowPersistence: NSObject, NSWindowDelegate {
   @objc
   static func sharedInstance() -> WindowPersistence {
     resolveShared(attachIfCreated: false)
+  }
+
+  // MARK: - bringMainWindowToFront() (Story 6.5)
+
+  /// The shared "put the main window in front of the user" move, with ONE
+  /// implementation for both callers: MenuBar.swift's `handleShowWindow`
+  /// ("Show window") and its `presentQuitConfirm()` (before the JS quit
+  /// confirm — `Alert.alert` is a sheet on the RN window, which is invisible
+  /// while that window is `orderOut`, so the window must come front first,
+  /// and only then).
+  ///
+  /// Activation + the deminiaturize/order-front body that
+  /// `handleShowWindow` owned in 6.3, plus the same window resolution
+  /// `attach()` uses (a bare `NSApp.mainWindow` can be nil at the instant of
+  /// the call — after a ⌘W the RN window is ordered out but still resolvable
+  /// via its autosave-name scan). Main-thread dispatched, fire-and-forget,
+  /// nil-guarded: a no-window moment is an activation-only no-op, never a
+  /// crash. NOTE this deliberately does NOT interact with the frame-capture
+  /// observers — ordering a window front fires no move/resize notifications,
+  /// so nothing here can disturb 6.4's capture.
+  @objc
+  static func bringMainWindowToFront() {
+    DispatchQueue.main.async {
+      NSApp.activate(ignoringOtherApps: true)
+      let resolved =
+        NSApp.mainWindow
+        ?? NSApp.keyWindow
+        ?? NSApp.windows.first {
+          $0.frameAutosaveName == Self.rctMainWindowAutosaveName
+        }
+      guard let window = resolved else {
+        return
+      }
+      if window.isMiniaturized {
+        window.deminiaturize(nil)
+      } else {
+        window.makeKeyAndOrderFront(nil)
+      }
+    }
   }
 
   // MARK: - JS event forwarding (the MenuBar closure-bridging precedent)
@@ -240,7 +287,9 @@ final class WindowPersistence: NSObject, NSWindowDelegate {
     let resolved =
       NSApp.mainWindow
       ?? NSApp.keyWindow
-      ?? NSApp.windows.first { $0.frameAutosaveName == "RCTAppDelegateMainWindow" }
+      ?? NSApp.windows.first {
+        $0.frameAutosaveName == Self.rctMainWindowAutosaveName
+      }
     guard let window = resolved else {
       return
     }
@@ -250,7 +299,11 @@ final class WindowPersistence: NSObject, NSWindowDelegate {
     // persistence source (two persistence layers would fight — restore,
     // overwrite, resave on every move). Legacy `RCTAppDelegateMainWindow`
     // values already in NSUserDefaults are simply never read again.
-    window.frameAutosaveName = ""
+    // `frameAutosaveName` is a get-only Swift property on this SDK; the
+    // setter form is the `setFrameAutosaveName(_:)` call (Bool result — a
+    // failure to unset the legacy name is harmless, the stored value is
+    // simply never read again either way).
+    window.setFrameAutosaveName("")
 
     // One config read decides the restore branch. config.json is small
     // (Epic 1 bounds it) and the frame must land before the window is first
@@ -312,12 +365,15 @@ final class WindowPersistence: NSObject, NSWindowDelegate {
       object: window
     )
 
-    // Termination drains (6.4 review): NSSupportsSuddenTermination is on, so a
-    // frame captured but still sitting in the ~500 ms debounce when the user
-    // resizes then hits Cmd-Q would be LOST. Drain the pending item
-    // synchronously at willTerminate, and at the main window's willClose
-    // (which fires while the window still holds its final frame). No
-    // applicationShouldTerminate: / blocking dialog — that is 6.5 territory.
+    // Termination drains (6.4 review): a frame captured but still sitting in
+    // the ~500 ms debounce when the user resizes then hits Cmd-Q would be
+    // LOST. Drain the pending item synchronously at willTerminate, and at the
+    // main window's willClose (which fires while the window still holds its
+    // final frame). (Since 6.5, NSSupportsSuddenTermination is FALSE — the
+    // SIGKILL vector that would skip willTerminate entirely — but the drain
+    // still closes the ordinary lost-window case and must keep running.) The
+    // 6.5 applicationShouldTerminate: confirm lives in MenuBar.swift /
+    // AppDelegate.mm and does not interact with these observers.
     terminateObserver = NotificationCenter.default.addObserver(
       forName: NSApplication.willTerminateNotification,
       object: nil,

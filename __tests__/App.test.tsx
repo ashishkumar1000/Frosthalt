@@ -37,11 +37,16 @@ jest.mock('../src/native/specs/NativeMenuBarSpec', () => ({
     initialize: jest.fn(() => ({ ok: true })),
     setBadgeState: jest.fn(() => ({ ok: true })),
     quit: jest.fn(() => ({ ok: true })),
+    // Story 6.5 — the quit-gate methods the mount does not call directly,
+    // but the spec surface must resolve for the adapter import.
+    confirmQuit: jest.fn(() => ({ ok: true })),
+    presentQuitConfirm: jest.fn(() => ({ ok: true })),
     // Story 6.3 — App mount now also subscribes (startMenuBarActions), so
     // the emitters return a usable subscription shape (see menuBar.test.ts).
     onQuickStart: jest.fn(() => ({ remove: jest.fn() })),
     onShowWindow: jest.fn(() => ({ remove: jest.fn() })),
     onQuit: jest.fn(() => ({ remove: jest.fn() })),
+    onQuitRequested: jest.fn(() => ({ remove: jest.fn() })),
   },
 }));
 
@@ -61,8 +66,27 @@ import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import App from '../App';
 
+// The 6.5 App-mount assertion (the 6-4 assertion style): a created renderer
+// is retained so the mount (not some later re-render) is provably the caller.
+let testRenderer!: ReactTestRenderer.ReactTestRenderer;
+
 test('renders correctly', async () => {
   await ReactTestRenderer.act(() => {
-    ReactTestRenderer.create(<App />);
+    testRenderer = ReactTestRenderer.create(<App />);
   });
+
+  // Story 6.5 — the mount effect runs `startMenuBarActions()`, which
+  // subscribes the quit gate's JS arbitration exactly once: every quit
+  // source (⌘Q, Dock, both Quit items) routes through this one handler.
+  const native = require('../src/native/specs/NativeMenuBarSpec')
+    .default as { onQuitRequested: jest.Mock };
+  expect(native.onQuitRequested).toHaveBeenCalledTimes(1);
+
+  await ReactTestRenderer.act(() => {
+    testRenderer.unmount();
+  });
+
+  // Unmounting must not double-register (and the mount effect has no
+  // cleanup): still exactly one.
+  expect(native.onQuitRequested).toHaveBeenCalledTimes(1);
 });

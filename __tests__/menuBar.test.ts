@@ -5,6 +5,8 @@
  * suite covers the JS-testable half only:
  *   - `initializeMenuBar()` forwards to the native spec's `initialize()` and
  *     returns its `{ ok, error? }` envelope untouched.
+ *   - The other thin forwarders (`setMenuBarBadge` 6.2 / `quitApp` 6.3 /
+ *     `confirmQuit` + `presentQuitConfirm` 6.5) forward untouched too.
  *   - Mounting `<App/>` calls `initializeMenuBar()` (native `initialize()`)
  *     exactly once, on mount.
  *
@@ -19,6 +21,8 @@ jest.mock('../src/native/specs/NativeMenuBarSpec', () => {
     initialize: jest.fn(),
     setBadgeState: jest.fn(),
     quit: jest.fn(),
+    confirmQuit: jest.fn(),
+    presentQuitConfirm: jest.fn(),
     // Event emitters return a subscription whose `remove()` the runtime
     // would call on teardown; Story 6.3's App mount now SUBSCRIBES (the
     // `menuBarActions` handler), so these mocks return a usable
@@ -26,6 +30,7 @@ jest.mock('../src/native/specs/NativeMenuBarSpec', () => {
     onQuickStart: jest.fn(() => ({ remove: jest.fn() })),
     onShowWindow: jest.fn(() => ({ remove: jest.fn() })),
     onQuit: jest.fn(() => ({ remove: jest.fn() })),
+    onQuitRequested: jest.fn(() => ({ remove: jest.fn() })),
   };
   return {
     __esModule: true,
@@ -68,6 +73,8 @@ import {
   initializeMenuBar,
   setMenuBarBadge,
   quitApp,
+  confirmQuit,
+  presentQuitConfirm,
 } from '../src/native/menuBar';
 import { WINDOW_RULES } from '../src/domain/windowFrame';
 import type {
@@ -79,9 +86,12 @@ type NativeMenuBarMock = {
   initialize: jest.Mock;
   setBadgeState: jest.Mock;
   quit: jest.Mock;
+  confirmQuit: jest.Mock;
+  presentQuitConfirm: jest.Mock;
   onQuickStart: jest.Mock;
   onShowWindow: jest.Mock;
   onQuit: jest.Mock;
+  onQuitRequested: jest.Mock;
 };
 const native = require('../src/native/specs/NativeMenuBarSpec')
   .default as unknown as NativeMenuBarMock;
@@ -170,6 +180,40 @@ test('quitApp surfaces a native { ok: false, error } result untouched', () => {
 });
 
 // ---------------------------------------------------------------------------
+// confirmQuit() / presentQuitConfirm() — Story 6.5 quit-gate forwarding
+// ---------------------------------------------------------------------------
+
+test('confirmQuit forwards to the native confirmQuit() and returns its result', () => {
+  const result: MenuBarResult = { ok: true };
+  native.confirmQuit.mockReturnValue(result);
+
+  expect(confirmQuit()).toBe(result);
+  expect(native.confirmQuit).toHaveBeenCalledTimes(1);
+  expect(native.confirmQuit).toHaveBeenCalledWith();
+});
+
+test('confirmQuit surfaces a native { ok: false, error } result untouched', () => {
+  native.confirmQuit.mockReturnValue({ ok: false, error: 'boom' });
+
+  expect(confirmQuit()).toEqual({ ok: false, error: 'boom' });
+});
+
+test('presentQuitConfirm forwards to the native presentQuitConfirm() and returns its result', () => {
+  const result: MenuBarResult = { ok: true };
+  native.presentQuitConfirm.mockReturnValue(result);
+
+  expect(presentQuitConfirm()).toBe(result);
+  expect(native.presentQuitConfirm).toHaveBeenCalledTimes(1);
+  expect(native.presentQuitConfirm).toHaveBeenCalledWith();
+});
+
+test('presentQuitConfirm surfaces a native { ok: false, error } result untouched', () => {
+  native.presentQuitConfirm.mockReturnValue({ ok: false, error: 'boom' });
+
+  expect(presentQuitConfirm()).toEqual({ ok: false, error: 'boom' });
+});
+
+// ---------------------------------------------------------------------------
 // App mount — initializeMenuBar() + mirror/actions wiring called on mount
 // ---------------------------------------------------------------------------
 
@@ -183,12 +227,17 @@ test('mounting App calls the native initialize() exactly once and registers the 
 
   expect(native.initialize).toHaveBeenCalledTimes(1);
   // Story 6.3 — the mount effect also starts `startMenuBarActions()`, which
-  // subscribes quick-start + quit to the emitters exactly once. (App's mount
-  // effect additionally runs `startMenuBarMirror()`; a single mount calls
-  // each emitter once for the actions registration — the mirror's push
-  // exercise is owned by `menuBarMirror.test.ts`.)
+  // subscribes quick-start + quit (and, since 6.5, the quit-requested gate)
+  // to the emitters exactly once. (App's mount effect additionally runs
+  // `startMenuBarMirror()`; a single mount calls each emitter once for the
+  // actions registration — the mirror's push exercise is owned by
+  // `menuBarMirror.test.ts`.)
   expect(native.onQuickStart).toHaveBeenCalledTimes(1);
   expect(native.onQuit).toHaveBeenCalledTimes(1);
+  // Story 6.5 — the quit gate's JS arbitration is subscribed on the same
+  // mount (exactly once — a missed or doubled subscription would break the
+  // quit confirm for every ⌘Q/Dock/menu Quit attempt).
+  expect(native.onQuitRequested).toHaveBeenCalledTimes(1);
   // "Show window" is native-only (activation in MenuBar.swift's click
   // handler) — App never subscribes to it.
   expect(native.onShowWindow).not.toHaveBeenCalled();
@@ -214,6 +263,7 @@ test('mounting App calls the native initialize() exactly once and registers the 
   expect(native.initialize).toHaveBeenCalledTimes(1);
   expect(native.onQuickStart).toHaveBeenCalledTimes(1);
   expect(native.onQuit).toHaveBeenCalledTimes(1);
+  expect(native.onQuitRequested).toHaveBeenCalledTimes(1);
   expect(windowNative.configureWindow).toHaveBeenCalledTimes(1);
   expect(windowNative.onWindowFrameChanged).toHaveBeenCalledTimes(1);
 });

@@ -35,11 +35,34 @@ export function setMenuBarBadge(badge: MenuBarBadgeState): MenuBarResult {
 
 /**
  * Story 6.3 — quits the app (main-thread-dispatched `NSApp.terminate(nil)` in
- * the Swift impl). Forwards the payload-less call untouched and returns the
- * `{ ok, error? }` envelope: the quit DECISION lives in the caller (the domain
- * module's `onQuit` handler — Story 6.5 inserts its confirm dialog there), so
- * this stays a dumb one-line forwarder like the two wrappers above.
+ * the Swift impl). Since Story 6.5 this is just a quit ENTRY — the terminate
+ * rides through the native `applicationShouldTerminate:` gate, which defers
+ * any un-confirmed quit back to JS via `onQuitRequested`. Forwards the
+ * payload-less call untouched and returns the `{ ok, error? }` envelope: the
+ * quit DECISION lives in JS (`startMenuBarActions`), so this stays a dumb
+ * one-line forwarder like the two wrappers above.
  */
 export function quitApp(): MenuBarResult {
   return NativeMenuBar.quit();
+}
+
+/**
+ * Story 6.5 — the "go" leg of the quit confirm: sets the native terminate-
+ * confirm flag and dispatches `NSApp.terminate(nil)`, which the delegate
+ * consumes (flag reset — the gate re-arms). Called ONLY from the
+ * `onQuitRequested` handler (no-timer quit, or the dialog's Quit button);
+ * forwards untouched like the wrappers above.
+ */
+export function confirmQuit(): MenuBarResult {
+  return NativeMenuBar.confirmQuit();
+}
+
+/**
+ * Story 6.5 — fronts the main window (activate + deminiaturize/order front)
+ * so the JS confirm `Alert.alert` — a sheet on the RN window — is visible
+ * when the window was closed to the menu bar. Called only when a dialog is
+ * about to show; forwards untouched like the wrappers above.
+ */
+export function presentQuitConfirm(): MenuBarResult {
+  return NativeMenuBar.presentQuitConfirm();
 }
